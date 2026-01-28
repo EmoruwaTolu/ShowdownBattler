@@ -7,38 +7,42 @@ from poke_env.battle import MoveCategory
 from bot.model.ctx import EvalContext
 from bot.scoring.helpers import hp_frac, remaining_count
 from bot.scoring.pressure import estimate_opponent_pressure
+from bot.scoring.race import evaluate_race_for_move, DamageRace
+
 
 def _estimate_damage_from_opponent(opponent: Any, target: Any, battle: Any) -> float:
     """
     Estimate the damage opponent would deal to target.
-    Uses the same logic as status_score's team synergy.
+
+    NOTE:
+      - Primary path uses poke-env Gen9 damage calculator (battle identifiers).
+      - Falls back to opponent-pressure estimate if identifiers aren't available.
+      - Final fallback is conservative.
     """
     if opponent is None or target is None:
         return 0.25
-    
+
     try:
         from poke_env.calc.damage_calc_gen9 import calculate_damage
-        
-        # Find opponent's best move vs this target
+
         best_avg_damage = 0.0
-        
-        for move in opponent.moves.values():
+
+        for move in getattr(opponent, "moves", {}).values():
             if move is None:
                 continue
-            
+
             # Skip status moves
             if getattr(move, "category", None) == MoveCategory.STATUS:
                 continue
-            
+
+            # Get identifiers
+            opp_id = _get_pokemon_identifier(opponent, battle)
+            target_id = _get_pokemon_identifier(target, battle)
+            if opp_id is None or target_id is None:
+                continue
+
             try:
-                # Get identifiers
-                opp_id = _get_pokemon_identifier(opponent, battle)
-                target_id = _get_pokemon_identifier(target, battle)
-                
-                if opp_id is None or target_id is None:
-                    continue
-                
-                # Calculate damage
+                # Calculate damage (min/max roll)
                 min_dmg, max_dmg = calculate_damage(
                     attacker_identifier=opp_id,
                     defender_identifier=target_id,
@@ -46,23 +50,31 @@ def _estimate_damage_from_opponent(opponent: Any, target: Any, battle: Any) -> f
                     battle=battle,
                     is_critical=False,
                 )
-                
+
                 # Convert to fraction
-                target_max_hp = getattr(target, 'max_hp', None) or getattr(target, 'stats', {}).get('hp', 100)
+                target_max_hp = getattr(target, "max_hp", None) or getattr(target, "stats", {}).get("hp", 100)
+                if not target_max_hp or target_max_hp <= 0:
+                    continue
+
                 avg_dmg = (min_dmg + max_dmg) / 2.0
-                dmg_frac = avg_dmg / target_max_hp
-                
-                best_avg_damage = max(best_avg_damage, dmg_frac)
-                
+                dmg_frac = avg_dmg / float(target_max_hp)
+
+                best_avg_damage = max(best_avg_damage, float(dmg_frac))
+
             except Exception:
                 continue
-        
+
         if best_avg_damage > 0:
-            return best_avg_damage
-        else:
-            # Fallback to pressure estimate
-            return 0.25
-    
+            return float(best_avg_damage)
+
+        # Fallback: use pressure model with a temp ctx (damage into `target`)
+        try:
+            temp_ctx = EvalContext(me=target, opp=opponent, battle=battle, cache={})
+            pressure = estimate_opponent_pressure(battle, temp_ctx)
+            return float(getattr(pressure, "damage_to_me_frac", 0.35) or 0.35)
+        except Exception:
+            return 0.35
+
     except Exception:
         return 0.25
 
@@ -71,7 +83,7 @@ def _get_pokemon_identifier(pokemon: Any, battle: Any) -> Optional[str]:
     """Get battle identifier for a Pokemon."""
     if pokemon is None or battle is None:
         return None
-    
+
     # Check player's team
     try:
         for identifier, pkmn in battle.team.items():
@@ -79,7 +91,7 @@ def _get_pokemon_identifier(pokemon: Any, battle: Any) -> Optional[str]:
                 return identifier
     except Exception:
         pass
-    
+
     # Check opponent's team
     try:
         for identifier, pkmn in battle.opponent_team.items():
@@ -87,8 +99,9 @@ def _get_pokemon_identifier(pokemon: Any, battle: Any) -> Optional[str]:
                 return identifier
     except Exception:
         pass
-    
+
     return None
+
 
 def _matchup_score(mon: Any, opponent: Any, battle: Any) -> float:
     """
@@ -97,12 +110,12 @@ def _matchup_score(mon: Any, opponent: Any, battle: Any) -> float:
     """
     if mon is None or opponent is None:
         return 0.0
-    
+
     score = 0.0
-    
+
     # Defensive evaluation - how much damage does our mon take?
     damage_taken = _estimate_damage_from_opponent(opponent, mon, battle)
-    
+
     if damage_taken < 0.15:
         score += 40  # Walls opponent completely
     elif damage_taken < 0.25:
@@ -115,10 +128,10 @@ def _matchup_score(mon: Any, opponent: Any, battle: Any) -> float:
         score -= 40  # Near OHKO
     else:
         score -= 60  # OHKO'd
-    
+
     # Offensive evaluation - how much damage can our mon deal?
     damage_dealt = _estimate_damage_from_opponent(mon, opponent, battle)
-    
+
     if damage_dealt > 0.80:
         score += 40  # Threatens OHKO
     elif damage_dealt > 0.50:
@@ -127,20 +140,21 @@ def _matchup_score(mon: Any, opponent: Any, battle: Any) -> float:
         score += 10  # Decent damage
     elif damage_dealt < 0.15:
         score -= 20  # Can't threaten
-    
-    # Speed control
+
+    # Speed control (very light)
     try:
         mon_speed = (mon.base_stats or {}).get("spe", 80)
         opp_speed = (opponent.base_stats or {}).get("spe", 80)
-        
+
         if mon_speed >= opp_speed * 1.1:
             score += 15  # Outspeeds
         elif mon_speed <= opp_speed * 0.9:
             score -= 10  # Slower
     except Exception:
         pass
-    
-    return score
+
+    return float(score)
+
 
 def _danger_urgency(current_mon: Any, opponent: Any, battle: Any) -> float:
     """
@@ -149,10 +163,10 @@ def _danger_urgency(current_mon: Any, opponent: Any, battle: Any) -> float:
     """
     if current_mon is None or opponent is None:
         return 0.0
-    
+
     damage = _estimate_damage_from_opponent(opponent, current_mon, battle)
     hp = hp_frac(current_mon)
-    
+
     # Immediate danger levels
     if damage >= hp * 0.95:
         return 80  # OHKO - urgent!
@@ -175,9 +189,9 @@ def _switch_in_penalty(switch_target: Any, opponent: Any, battle: Any) -> float:
     """
     if switch_target is None or opponent is None:
         return 0.0
-    
+
     damage = _estimate_damage_from_opponent(opponent, switch_target, battle)
-    
+
     # Penalty scales with damage
     if damage >= 0.80:
         return 80  # Switch-in nearly dies
@@ -190,6 +204,7 @@ def _switch_in_penalty(switch_target: Any, opponent: Any, battle: Any) -> float:
     else:
         return 0   # Minimal damage
 
+
 def _setup_danger(mon: Any, opponent: Any, battle: Any, ctx: EvalContext) -> float:
     """
     Penalty if opponent can setup on mon.
@@ -197,17 +212,16 @@ def _setup_danger(mon: Any, opponent: Any, battle: Any, ctx: EvalContext) -> flo
     """
     if mon is None or opponent is None:
         return 0.0
-    
-    # Check if opponent has setup potential
+
     pressure = estimate_opponent_pressure(battle, ctx)
-    setup_prob = pressure.setup_prob
-    
+    setup_prob = float(getattr(pressure, "setup_prob", 0.0) or 0.0)
+
     if setup_prob < 0.3:
         return 0.0  # Opponent probably doesn't have setup
-    
+
     # Check if mon can threaten opponent (prevents setup)
     damage_dealt = _estimate_damage_from_opponent(mon, opponent, battle)
-    
+
     if damage_dealt > 0.60:
         return -15  # We threaten opponent, hard to setup
     elif damage_dealt > 0.40:
@@ -217,6 +231,7 @@ def _setup_danger(mon: Any, opponent: Any, battle: Any, ctx: EvalContext) -> flo
     else:
         return 30 * setup_prob  # Opponent can setup freely
 
+
 def _win_condition_value(switch_target: Any, battle: Any) -> float:
     """
     Bonus for preserving important Pokemon.
@@ -224,176 +239,297 @@ def _win_condition_value(switch_target: Any, battle: Any) -> float:
     """
     if switch_target is None:
         return 0.0
-    
+
     value = 0.0
-    
+
     # High HP Pokemon are more valuable
     hp = hp_frac(switch_target)
     if hp > 0.8:
         value += 10
-    
+
     # Don't risk your last Pokemon unnecessarily
     our_remaining = remaining_count(battle.team)
     if our_remaining <= 2:
         value += 20
-    
-    # TODO: Add setup sweeper detection
-    # If switch_target has setup moves + good speed/attack, add value
-    
-    return value
+
+    return float(value)
+
+
+def _best_race_for_mon_vs_opp(battle: Any, ctx: EvalContext, mon: Any, opp: Any) -> DamageRace:
+    """
+    One-step lookahead: evaluate whether `mon` can win the damage race vs `opp`
+    (using mon's best available damaging move).
+    """
+    if mon is None or opp is None:
+        return DamageRace(99.0, 99.0, "CLOSE", 0.0, 0)
+
+    best: Optional[DamageRace] = None
+    rank = {"WINNING": 2, "CLOSE": 1, "LOSING": 0}
+
+    for mv in (getattr(mon, "moves", None) or {}).values():
+        if mv is None:
+            continue
+        if getattr(mv, "category", None) == MoveCategory.STATUS:
+            continue
+
+        try:
+            r = evaluate_race_for_move(battle, ctx, mv, me_override=mon, opp_override=opp)
+        except TypeError:
+            r = evaluate_race_for_move(battle, ctx, mv)
+
+        if best is None:
+            best = r
+            continue
+
+        if rank.get(r.state, 1) > rank.get(best.state, 1):
+            best = r
+        elif rank.get(r.state, 1) == rank.get(best.state, 1):
+            if (r.tko_opp - r.ttd_me) < (best.tko_opp - best.ttd_me):
+                best = r
+
+    return best if best is not None else DamageRace(99.0, 99.0, "CLOSE", 0.0, 0)
+
 
 def score_switch(pokemon: Any, battle: Any, ctx: EvalContext) -> float:
     """
     Score switching to a specific Pokemon.
-    
-    Considers:
-    - Current matchup vs new matchup
-    - Danger level of staying in
-    - Damage taken on switch-in
-    - Setup opportunities/risks
-    - Win condition preservation
-    
-    Returns:
-        Score where higher = better switch
     """
-    if pokemon is None or pokemon.fainted:
+    if pokemon is None or getattr(pokemon, "fainted", False):
         return -999.0
-    
+
     current_mon = ctx.me
     opponent = ctx.opp
-    
+
     if current_mon is None or opponent is None:
-        # Fallback: mild preference for healthy switches
         return 10.0 * hp_frac(pokemon)
-    
-    # Don't switch to yourself
+
     if pokemon is current_mon:
         return -999.0
-    
-    # Matchup differential (is new matchup better?)
+
     current_matchup = _matchup_score(current_mon, opponent, battle)
     new_matchup = _matchup_score(pokemon, opponent, battle)
     matchup_diff = new_matchup - current_matchup
-    
-    # Danger urgency (do we NEED to switch?)
+
     danger = _danger_urgency(current_mon, opponent, battle)
-    
-    # Switch-in damage penalty (will switch take heavy damage?)
     switch_penalty = _switch_in_penalty(pokemon, opponent, battle)
-    
-    # Setup danger differential (Does the opponent setup easier against the mon we want to switch in)
+
     current_setup_risk = _setup_danger(current_mon, opponent, battle, ctx)
     new_setup_risk = _setup_danger(pokemon, opponent, battle, ctx)
     setup_diff = current_setup_risk - new_setup_risk
-    
-    # Win condition value
+
     preserve_value = _win_condition_value(pokemon, battle)
 
+    try:
+        now_race = _best_race_for_mon_vs_opp(battle, ctx, current_mon, opponent)
+        in_race = _best_race_for_mon_vs_opp(battle, ctx, pokemon, opponent)
+
+        if now_race.state in ("LOSING", "CLOSE") and in_race.state == "WINNING":
+            preserve_value += 2.5  # => +25 after *10
+        elif now_race.state == "LOSING" and in_race.state == "CLOSE":
+            preserve_value += 1.0  # => +10
+        elif now_race.state == "WINNING" and in_race.state == "LOSING":
+            preserve_value -= 1.5  # => -15
+    except Exception:
+        pass
+
     score = (
-        matchup_diff * 40         # Matchup improvement
-        + danger * 60            # Urgency to get out
-        - switch_penalty * 50    # Cost of switching in
-        + setup_diff * 25        # Setup opportunity/risk
-        + preserve_value * 10    # Preserve important mons
+        matchup_diff * 40
+        + danger * 10
+        - switch_penalty * 50
+        + setup_diff * 25
+        + preserve_value * 10
     )
-    
-    # ===== SPECIAL CASES =====
-    
-    # Regenerator bonus
-    if getattr(pokemon, "ability", None) == "regenerator":
-        score += 15  # Free healing
-    
-    # Intimidate bonus (if opponent is physical)
-    if getattr(pokemon, "ability", None) == "intimidate":
+
+    # Special cases
+    if str(getattr(pokemon, "ability", "")).lower() == "regenerator":
+        score += 15
+
+    if str(getattr(pokemon, "ability", "")).lower() == "intimidate":
         pressure = estimate_opponent_pressure(battle, ctx)
-        if pressure.physical_prob > 0.5:
-            score += 20 * pressure.physical_prob
-    
-    # Don't switch if you have a great attacking option
-    # (This should be handled by comparing with move scores, but add small penalty)
-    if danger < 40:  # Not in urgent danger
-        score -= 15  # Slight penalty for switching when not necessary
-    
-    # Endgame: be more conservative with switches
+        physical_prob = float(getattr(pressure, "physical_prob", 0.0) or 0.0)
+        if physical_prob > 0.5:
+            score += 20 * physical_prob
+
+    if danger < 40:
+        score -= 15
+
     our_remaining = remaining_count(battle.team)
     opp_remaining = remaining_count(battle.opponent_team)
     if our_remaining <= 2 and opp_remaining <= 2:
-        # In endgame, don't switch unless it's clearly better
         if matchup_diff < 20:
             score -= 20
-    
-    return score
+
+    # Optional debug (leave on for now; pivot no longer calls score_switch)
+    print(f"\n=== SWITCH DEBUG: {pokemon.species} ===")
+    print(f"Matchup: {matchup_diff:.1f} × 40 = {matchup_diff * 40:.1f}")
+    print(f"Danger: {danger:.1f} × 10 = {danger * 10:.1f}")
+    print(f"Penalty: {switch_penalty:.1f} × 50 = {-switch_penalty * 50:.1f}")
+    print(f"Total: {score:.1f}")
+
+    return float(score)
+
 
 def _slow_pivot_value(current_mon: Any, switch_target: Any, opponent: Any, battle: Any) -> float:
     """
-    Calculate the value of being able to slow pivot vs hard switch.
-    
-    Slow pivot is valuable when:
-    1. Current mon is slower than opponent
-    2. Switch target would take heavy damage on hard switch
-    3. Current mon can survive one hit
-    4. Switch target has better matchup
-    
-    Returns positive value if slow pivot would be beneficial.
+    Value of being able to slow pivot vs hard switch.
     """
     if current_mon is None or switch_target is None or opponent is None:
         return 0.0
-    
-    # Check speed relationship
+
     try:
         my_speed = (current_mon.base_stats or {}).get("spe", 80)
         opp_speed = (opponent.base_stats or {}).get("spe", 80)
         target_speed = (switch_target.base_stats or {}).get("spe", 80)
     except Exception:
         return 0.0
-    
-    # Only valuable if we're slower than opponent
+
     if my_speed >= opp_speed:
         return 0.0
-    
-    # Check if switch target would take heavy damage on hard switch
+
     switch_in_damage = _estimate_damage_from_opponent(opponent, switch_target, battle)
-    
     if switch_in_damage < 0.3:
-        return 0.0  # Switch-in doesn't care about free hit
-    
-    # Check if current mon can survive one hit (needed to execute slow pivot)
+        return 0.0
+
     my_hp = hp_frac(current_mon)
     damage_to_me = _estimate_damage_from_opponent(opponent, current_mon, battle)
-    
     if damage_to_me >= my_hp * 0.95:
-        return 0.0  # We die before pivoting
-    
-    # Check if switch target actually has a better matchup
+        return 0.0
+
     target_matchup = _matchup_score(switch_target, opponent, battle)
     if target_matchup < 20:
         return 0.0
-    
-    # Calculate slow pivot value based on damage avoided
+
     value = switch_in_damage * 80
-    
-    # Extra bonus if switch-in is fragile
+
     target_hp = hp_frac(switch_target)
     if target_hp < 0.6:
         value *= 1.3
-    
-    # Extra bonus if switch-in is faster than opponent
+
     if target_speed > opp_speed:
         value += 15
-    
-    # Scale by severity of damage avoided
+
     if switch_in_damage > 0.7:
-        value *= 1.4  # Avoiding near-OHKO
+        value *= 1.4
     elif switch_in_damage > 0.5:
-        value *= 1.2  # Avoiding 2HKO
-    
-    return value
+        value *= 1.2
+
+    return float(value)
+
+
+def _pivot_order(me: Any, opp: Any, move: Any) -> int:
+    """Determine effective move order for a pivot move.
+
+    Returns:
+      +1: we pivot before opponent acts (fast pivot)
+      -1: opponent acts before we pivot (slow pivot)
+       0: unclear / near tie
+
+    Uses base speed only with a small deadzone. Priority overrides speed.
+    """
+    if me is None or opp is None:
+        return 0
+
+    prio = int(getattr(move, "priority", 0) or 0)
+    if prio > 0:
+        return +1
+    if prio < 0:
+        return -1
+
+    try:
+        ms = float((getattr(me, "base_stats", None) or {}).get("spe", 80))
+        os = float((getattr(opp, "base_stats", None) or {}).get("spe", 80))
+    except Exception:
+        return 0
+
+    if ms >= os * 1.05:
+        return +1
+    if os >= ms * 1.05:
+        return -1
+    return 0
+
+
+def _fast_pivot_value(current_mon: Any, switch_target: Any, opponent: Any, battle: Any) -> float:
+    """Extra value of *fast* pivoting (we act first).
+
+    Fast pivot is valuable mainly when:
+      - staying in is dangerous (opponent threatens big damage / KO)
+      - and pivoting shifts that hit onto a much safer switch_target
+
+    Unlike slow pivot, it does NOT avoid the hit on the switch_target.
+    """
+    if current_mon is None or switch_target is None or opponent is None:
+        return 0.0
+
+    target_matchup = _matchup_score(switch_target, opponent, battle)
+    if target_matchup < 10:
+        return 0.0
+
+    my_hp = hp_frac(current_mon)
+    dmg_to_me = _estimate_damage_from_opponent(opponent, current_mon, battle)
+    dmg_to_target = _estimate_damage_from_opponent(opponent, switch_target, battle)
+
+    if dmg_to_me < 0.35 and dmg_to_me < my_hp * 0.75:
+        return 0.0
+
+    avoided = max(0.0, dmg_to_me - dmg_to_target)
+    if avoided < 0.12:
+        return 0.0
+
+    value = avoided * 90.0
+
+    if dmg_to_me >= my_hp * 0.95 and dmg_to_target < 0.70:
+        value += 25.0
+
+    danger = _danger_urgency(current_mon, opponent, battle)
+    if danger > 60:
+        value *= 1.25
+    elif danger > 40:
+        value *= 1.10
+
+    return float(value)
+
+
+def _switch_quality_for_pivot(current_mon: Any, target: Any, opponent: Any, battle: Any, ctx: EvalContext) -> float:
+    """
+    Small, bounded "is this a good mon to bring in AFTER a pivot" score.
+
+    IMPORTANT:
+      - Do NOT reuse score_switch() here: it includes urgency/preserve/endgame scaling
+        intended for HARD SWITCH decisions.
+      - This is only to measure follow-up quality.
+    """
+    if current_mon is None or target is None or opponent is None:
+        return 0.0
+
+    cur_match = _matchup_score(current_mon, opponent, battle)
+    new_match = _matchup_score(target, opponent, battle)
+    matchup_diff = new_match - cur_match
+
+    switch_penalty = _switch_in_penalty(target, opponent, battle)
+
+    try:
+        cur_setup = _setup_danger(current_mon, opponent, battle, ctx)
+        new_setup = _setup_danger(target, opponent, battle, ctx)
+        setup_diff = cur_setup - new_setup
+    except Exception:
+        setup_diff = 0.0
+
+    q = (matchup_diff * 1.0) - (switch_penalty * 0.8) + (setup_diff * 0.5)
+
+    return max(-60.0, min(60.0, float(q)))
+
 
 PIVOT_MOVES = {
-    "uturn", "voltswitch", "flipturn", "partingshot", 
-    "batonpass", "chillyreception", "shedtail",
-    "teleport",  # Gen 8+ teleport has negative priority and switches
+    "uturn",
+    "voltswitch",
+    "flipturn",
+    "partingshot",
+    "batonpass",
+    "chillyreception",
+    "shedtail",
+    "teleport",
 }
+
 
 def is_pivot_move(move: Any) -> bool:
     """Check if a move is a pivot move."""
@@ -404,61 +540,63 @@ def is_pivot_move(move: Any) -> bool:
 def pivot_move_bonus(move: Any, battle: Any, ctx: EvalContext) -> float:
     """
     Calculate bonus for pivot moves.
-    
-    Pivot moves = damage + switch, so they're special.
-    Slow pivot = being slower allows safe switch-in (avoids damage).
-    
-    This should be added to the move's damage score.
+
+    Pivot move bonus should be:
+      - modest, stable
+      - NOT derived from full hard-switch score
+      - include either fast OR slow pivot safety (mutually exclusive)
     """
     if not is_pivot_move(move):
         return 0.0
-    
+
     me = ctx.me
     opp = ctx.opp
-    
     if me is None or opp is None:
         return 0.0
-    
+
     bonus = 0.0
-    
-    # 1. Momentum bonus - you maintain tempo
+
+    # 1) Momentum
     bonus += 15.0
-    
-    # 2. Scout bonus - see opponent's response
+
+    # 2) Scout
     bonus += 10.0
-    
-    # 3. Evaluate best switch-in after pivot
-    best_switch_score = -999.0
+
+    # 3) Best follow-up switch-in quality (bounded; NOT score_switch)
+    best_q = -999.0
     best_switch_target = None
-    
+
     for teammate in battle.team.values():
         if teammate is None or teammate.fainted or teammate is me:
             continue
-        
-        switch_score = score_switch(teammate, battle, ctx)
-        if switch_score > best_switch_score:
-            best_switch_score = switch_score
+
+        q = _switch_quality_for_pivot(me, teammate, opp, battle, ctx)
+        if q > best_q:
+            best_q = q
             best_switch_target = teammate
-    
-    # Add fraction of best switch score
-    if best_switch_score > 0:
-        bonus += best_switch_score * 0.3
-    
-    # If we're slower, pivot lets switch-in come in AFTER opponent attacks
+
+    if best_q > 0:
+        bonus += best_q * 0.6  # capped at +36 due to q cap
+
+    # 4) Fast vs slow pivot value (mutually exclusive)
+    order = _pivot_order(me, opp, move)
     if best_switch_target is not None:
-        slow_pivot_value = _slow_pivot_value(me, best_switch_target, opp, battle)
-        bonus += slow_pivot_value
-    
-    # 5. Risk penalty - opponent hits you before you switch
+        if order == +1:
+            bonus += _fast_pivot_value(me, best_switch_target, opp, battle)
+        elif order == -1:
+            bonus += _slow_pivot_value(me, best_switch_target, opp, battle)
+
+    # 5) Risk penalty applies only when opponent acts before pivot (slow pivot)
     danger = _danger_urgency(me, opp, battle)
-    if danger > 60:
-        bonus -= 30  # Pivoting when in OHKO range is risky
-    elif danger > 40:
-        bonus -= 15  # Some risk
-    
-    # 6. Choice item synergy - pivot resets choice lock
+    if order == -1:
+        if danger > 60:
+            bonus -= 30
+        elif danger > 40:
+            bonus -= 15
+
+    # 6) Choice item synergy
     my_item = str(getattr(me, "item", "")).lower()
     if my_item in ["choiceband", "choicescarf", "choicespecs"]:
-        bonus += 20  # Pivot resets choice lock!
-    
-    return bonus
+        bonus += 20.0
+
+    return float(bonus)

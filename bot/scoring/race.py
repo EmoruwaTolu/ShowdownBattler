@@ -9,7 +9,6 @@ from bot.model.ctx import EvalContext
 from bot.scoring.damage_score import estimate_damage_fraction
 from bot.scoring.helpers import hp_frac
 
-from bot.scoring.pressure import estimate_opponent_pressure
 
 
 @dataclass(frozen=True)
@@ -19,6 +18,84 @@ class DamageRace:
     state: str              # "WINNING" | "LOSING" | "CLOSE"
     move_exp_dmg: float     # expected damage fraction (acc-weighted) for this move
     move_priority: int      # this move's priority
+
+
+@dataclass(frozen=True)
+class OppThreat:
+    best_exp_dmg_frac: float   # accuracy-weighted damage fraction into `target`
+    priority_prob: float       # rough probability opponent uses priority this turn
+    best_is_priority: bool     # whether best-damage option is priority
+    best_priority: int         # highest priority among threatening moves
+
+
+def estimate_opp_threat_into_target(
+    battle: Any,
+    *,
+    opp: Any,
+    target: Any,
+) -> OppThreat:
+    """
+    Estimate opponent's threat into a *specific target* using the same Gen9
+    damage calculator path as `estimate_damage_fraction`.
+
+    We take the maximum accuracy-weighted damage fraction over the opponent's
+    damaging moves.
+
+    This is suitable for:
+      - race evaluation (ttd_me for current mon or a prospective switch-in)
+      - basic priority risk shaping
+    """
+    if opp is None or target is None:
+        return OppThreat(0.25, 0.0, False, 0)
+
+    target_hp = max(0.01, float(hp_frac(target)))
+
+    best = 0.0
+    best_is_prio = False
+
+    prio_best = 0.0
+    prio_level = 0
+
+    for mv in (getattr(opp, "moves", None) or {}).values():
+        if mv is None:
+            continue
+        if getattr(mv, "category", None) == MoveCategory.STATUS:
+            continue
+
+        dmg = float(estimate_damage_fraction(mv, opp, target, battle))
+        acc = float(getattr(mv, "accuracy", 1.0) or 1.0)
+        acc = max(0.0, min(1.0, acc))
+        exp = dmg * acc
+
+        if exp > best:
+            best = exp
+            best_is_prio = (int(getattr(mv, "priority", 0) or 0) > 0)
+
+        pr = int(getattr(mv, "priority", 0) or 0)
+        if pr > 0:
+            prio_best = max(prio_best, exp)
+            prio_level = max(prio_level, pr)
+
+    # Priority probability proxy:
+    priority_prob = 0.0
+    if prio_best > 1e-9:
+        if prio_best >= target_hp * 0.95:
+            priority_prob = 0.80
+        elif prio_best >= target_hp * 0.60:
+            priority_prob = 0.45
+        else:
+            priority_prob = 0.15
+
+    # Fallback to conservative DPT if no damaging moves were usable
+    if best <= 1e-9:
+        best = 0.25
+
+    return OppThreat(
+        best_exp_dmg_frac=float(best),
+        priority_prob=float(priority_prob),
+        best_is_priority=bool(best_is_prio),
+        best_priority=int(prio_level),
+    )
 
 
 def _base_speed(mon: Any) -> float:
@@ -84,15 +161,29 @@ def _initiative_penalty(
     return pen
 
 
-def evaluate_race_for_move(battle: Any, ctx: EvalContext, move: Any) -> DamageRace:
-    """
-    Priority-aware, set-aware "race" evaluation for THIS move.
 
-    Goals:
-      - Treat "2HKO vs 2HKO but they're faster" as losing more reliably.
-      - Use set-aware pressure (setup/priority) for opponent damage-to-us estimate.
+def evaluate_race_for_move(
+    battle: Any,
+    ctx: EvalContext,
+    move: Any,
+    *,
+    me_override: Any | None = None,
+    opp_override: Any | None = None,
+) -> DamageRace:
     """
-    me, opp = ctx.me, ctx.opp
+    Priority-aware "race" evaluation for THIS move.
+
+    Changes:
+      A) `ttd_me` is computed from opponent's best expected damage INTO the
+         specific target (current mon or a prospective switch-in).
+      B) Priority risk is derived from opponent's actual priority move threat
+         into that target (not a generic pressure prior).
+
+    Pass `me_override` to evaluate a prospective switch-in vs the current opponent.
+    """
+    me = me_override if me_override is not None else ctx.me
+    opp = opp_override if opp_override is not None else ctx.opp
+
     if me is None or opp is None:
         return DamageRace(99.0, 99.0, "CLOSE", 0.0, 0)
 
@@ -111,10 +202,10 @@ def evaluate_race_for_move(battle: Any, ctx: EvalContext, move: Any) -> DamageRa
 
     tko_opp = 99.0 if exp_dmg <= 1e-9 else (opp_hp / exp_dmg)
 
-    # Opponent pressure: now set-aware (includes setup/priority likelihood)
-    pressure = estimate_opponent_pressure(battle, ctx)
-    opp_pressure = float(getattr(pressure, "damage_to_me_frac", 0.26))
-    opp_priority_p = float(getattr(pressure, "priority_prob", 0.15))
+    # A) Opponent threat into THIS target
+    threat = estimate_opp_threat_into_target(battle, opp=opp, target=me)
+    opp_pressure = float(threat.best_exp_dmg_frac)
+    opp_priority_p = float(threat.priority_prob)
 
     ttd_me = 99.0 if opp_pressure <= 1e-9 else (my_hp / opp_pressure)
 
@@ -128,13 +219,17 @@ def evaluate_race_for_move(battle: Any, ctx: EvalContext, move: Any) -> DamageRa
     if prio > 0:
         effective_order = +1
 
-    # Light "turn order" shaping (kept from your version)
+    # B) If opponent likely has priority, our "going first" is less reliable.
+    if effective_order == +1 and opp_priority_p >= 0.45:
+        effective_order = 0
+
+    # Light turn-order shaping
     if effective_order == -1:
         tko_opp += 0.55
     elif effective_order == +1:
         ttd_me += 0.55
 
-    # Stronger "tie-break" shaping for close races + opponent priority risk
+    # Tie-break shaping for close races + opponent priority risk
     tko_opp += _initiative_penalty(
         tko_opp=tko_opp,
         ttd_me=ttd_me,
@@ -147,11 +242,9 @@ def evaluate_race_for_move(battle: Any, ctx: EvalContext, move: Any) -> DamageRa
     one_hit_us = (opp_pressure + 1e-6) >= my_hp
 
     if one_hit_them and effective_order == -1:
-        # if we need to land a KO but likely move second, it's less reliable
         tko_opp += 1.10
 
     if one_hit_us and effective_order == +1:
-        # if we likely move first, we slightly "buy" a turn vs getting deleted
         ttd_me += 0.90
 
     # Decide state
