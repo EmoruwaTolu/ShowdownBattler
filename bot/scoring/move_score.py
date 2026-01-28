@@ -16,6 +16,7 @@ from bot.scoring.chip_score import chip_synergy_value
 
 from bot.scoring.pp_management import pp_conservation_penalty
 from bot.scoring.pressure import estimate_opponent_pressure
+from bot.scoring.switch_score import pivot_move_bonus
 
 
 def _recoil_penalty(move: Any, battle: Any, ctx: EvalContext) -> float:
@@ -262,6 +263,8 @@ def score_move(move: Any, battle: Any, ctx: EvalContext) -> float:
         damage_dealt_frac=dmg_frac,
         after_status=None,
     )
+
+    score += pivot_move_bonus(move, battle, ctx)
 
     # Penalty for weak chip on healthy targets
     if opp_hp > 0.8 and dmg_frac < 0.18:
