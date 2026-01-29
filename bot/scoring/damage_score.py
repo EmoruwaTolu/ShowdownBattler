@@ -1,48 +1,100 @@
-from typing import Any
+from __future__ import annotations
+from typing import Any, Optional, Tuple
 from poke_env.calc.damage_calc_gen9 import calculate_damage
 from poke_env.battle import MoveCategory
 
+def _safe_species(p: Any) -> str:
+    s = str(getattr(p, "species", "") or "").strip().lower()
+    # Sometimes poke-env has `species` vs `name` vs `pokemon_id`
+    if not s:
+        s = str(getattr(p, "name", "") or "").strip().lower()
+    return s
 
-def _get_pokemon_identifier(pokemon: Any, battle: Any) -> str:
+def _safe_hp_frac(p: Any) -> Optional[float]:
+    try:
+        hp = getattr(p, "current_hp", None)
+        mx = getattr(p, "max_hp", None)
+        if hp is None or mx is None or mx <= 0:
+            # some mocks only have `hp` inside stats
+            # if no reliable hp, return None
+            return None
+        return float(hp) / float(mx)
+    except Exception:
+        return None
+
+def _get_pokemon_identifier(pokemon: Any, battle: Any) -> Optional[str]:
     """
-    Get the battle identifier for a Pokemon (e.g., "p1: Gengar", "p2: Zacian").
-    
-    Returns:
-        Identifier string, or None if not found
+    Robustly get battle identifier for a Pokemon (e.g., "p1: Gengar", "p2: Zacian").
+
+    Strategy:
+      1) identity match (exact object)
+      2) species match within the same side (team / opponent_team), tie-break by HP fraction closeness
+      3) if still ambiguous, return the first species match on either side (rare; better than None)
     """
     if pokemon is None or battle is None:
         return None
-    
-    # Check player's team
-    try:
-        for identifier, pkmn in battle.team.items():
-            if pkmn is pokemon:
-                return identifier
-    except Exception as e:
-        print(f"Error checking player team: {e}")
-        pass
-    
-    # Check opponent's team
-    try:
-        for identifier, pkmn in battle.opponent_team.items():
-            if pkmn is pokemon:
-                return identifier
-    except Exception as e:
-        print(f"Error checking opponent team: {e}")
-        pass
-    
-    # DEBUG: If not found, print why
-    print(f"⚠️ Pokemon not found: {getattr(pokemon, 'species', 'unknown')}")
-    print(f"   Player team: {[f'{k}: {v.species}' for k, v in battle.team.items()]}")
-    print(f"   Opponent team: {[f'{k}: {v.species}' for k, v in battle.opponent_team.items()]}")
-    print(f"   Looking for id: {id(pokemon)}")
-    for k, v in battle.team.items():
-        print(f"   {k} id: {id(v)}, match: {v is pokemon}")
-    for k, v in battle.opponent_team.items():
-        print(f"   {k} id: {id(v)}, match: {v is pokemon}")
-    
-    return None
 
+    # Build candidate pools
+    team_items = []
+    opp_items = []
+    try:
+        team_items = list((getattr(battle, "team", None) or {}).items())
+    except Exception:
+        team_items = []
+    try:
+        opp_items = list((getattr(battle, "opponent_team", None) or {}).items())
+    except Exception:
+        opp_items = []
+
+    # 1) Exact identity match
+    for identifier, pkmn in team_items:
+        if pkmn is pokemon:
+            return identifier
+    for identifier, pkmn in opp_items:
+        if pkmn is pokemon:
+            return identifier
+
+    # Helper: choose best match by species + hp closeness
+    target_species = _safe_species(pokemon)
+    target_hp = _safe_hp_frac(pokemon)
+
+    def best_species_match(items: list[Tuple[str, Any]]) -> Optional[str]:
+        # Collect all same-species candidates
+        cands = [(ident, p) for ident, p in items if _safe_species(p) == target_species]
+        if not cands:
+            return None
+        if len(cands) == 1:
+            return cands[0][0]
+
+        # If we have hp info, choose closest hp fraction
+        if target_hp is not None:
+            scored = []
+            for ident, p in cands:
+                hp = _safe_hp_frac(p)
+                if hp is None:
+                    # unknown hp -> mild penalty so known hp wins
+                    scored.append((1.0, ident))
+                else:
+                    scored.append((abs(hp - target_hp), ident))
+            scored.sort(key=lambda t: t[0])
+            return scored[0][1]
+
+        # Otherwise, ambiguous: return first
+        return cands[0][0]
+
+    # 2) Prefer same-side match (if we can infer side from identifier-style, we can’t here)
+    # But we can still try team then opponent (this is usually correct for switch-ins you evaluate)
+    if target_species:
+        ident = best_species_match(team_items)
+        if ident is not None:
+            return ident
+        ident = best_species_match(opp_items)
+        if ident is not None:
+            return ident
+
+    # 3) As a final fallback, if species missing, try matching by name/id fields (rare)
+    # (If nothing works, return None)
+    return None
 
 def estimate_damage_fraction(move: Any, me: Any, opp: Any, battle: Any) -> float:
     """

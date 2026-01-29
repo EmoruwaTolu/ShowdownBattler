@@ -3,6 +3,8 @@ from __future__ import annotations
 from typing import Any, Optional
 
 from poke_env.battle import MoveCategory
+from poke_env.battle.side_condition import SideCondition
+from poke_env.battle.pokemon_type import PokemonType
 
 from bot.model.ctx import EvalContext
 from bot.scoring.helpers import hp_frac, remaining_count
@@ -103,6 +105,141 @@ def _get_pokemon_identifier(pokemon: Any, battle: Any) -> Optional[str]:
     return None
 
 
+def _type_multiplier(attack_type: PokemonType, defender: Any) -> float:
+    """Return type effectiveness multiplier for attack_type into defender."""
+    try:
+        types = []
+        t1 = getattr(defender, "type_1", None)
+        t2 = getattr(defender, "type_2", None)
+        if t1 is not None:
+            types.append(t1)
+        if t2 is not None and t2 != t1:
+            types.append(t2)
+        mult = 1.0
+        for dt in types:
+            mult *= float(attack_type.damage_multiplier(dt))
+        return float(mult)
+    except Exception:
+        return 1.0
+
+
+def _has_heavy_duty_boots(pokemon: Any) -> bool:
+    item = str(getattr(pokemon, "item", "") or "").lower()
+    return item in {"heavydutyboots", "heavy-dutyboots", "heavy-duty boots", "heavy_duty_boots"}
+
+
+def _hazard_damage_frac_on_entry(pokemon: Any, battle: Any) -> float:
+    """Estimate fraction of max HP lost on switch-in from damaging hazards on OUR side.
+
+    Includes:
+      - Stealth Rock (type effectiveness vs Rock)
+      - Spikes (1-3 layers)
+    Excludes:
+      - Toxic Spikes (status), Sticky Web (speed) for now
+    Ignores abilities (e.g., Levitate) for now, except Flying-type immunity to Spikes.
+    Heavy-Duty Boots => 0.
+    """
+    if pokemon is None or battle is None:
+        return 0.0
+    if _has_heavy_duty_boots(pokemon):
+        return 0.0
+
+    try:
+        side = getattr(battle, "side_conditions", None) or {}
+    except Exception:
+        side = {}
+
+    dmg = 0.0
+
+    # Stealth Rock: 1/8 * rock effectiveness
+    if SideCondition.STEALTH_ROCK in side:
+        dmg += (1.0 / 8.0) * _type_multiplier(PokemonType.ROCK, pokemon)
+
+    # Spikes: grounded only, layers: 1 => 1/8, 2 => 1/6, 3 => 1/4
+    layers = int(side.get(SideCondition.SPIKES, 0) or 0)
+    if layers > 0:
+        try:
+            t1 = getattr(pokemon, "type_1", None)
+            t2 = getattr(pokemon, "type_2", None)
+            is_flying = (t1 == PokemonType.FLYING) or (t2 == PokemonType.FLYING)
+        except Exception:
+            is_flying = False
+
+        if not is_flying:
+            layers = min(3, max(0, layers))
+            spikes_table = {1: 1.0/8.0, 2: 1.0/6.0, 3: 1.0/4.0}
+            dmg += spikes_table.get(layers, 0.0)
+
+    return float(max(0.0, min(1.0, dmg)))  # cap at 100%
+
+
+def _switch_total_damage_on_entry(switch_target: Any, opponent: Any, battle: Any) -> float:
+    """Total expected immediate damage fraction upon switching in: hazards + opponent's best hit."""
+    if switch_target is None or opponent is None:
+        return 0.0
+    hazard = _hazard_damage_frac_on_entry(switch_target, battle)
+    hit = _estimate_damage_from_opponent(opponent, switch_target, battle)
+    return float(hazard + hit)
+
+
+
+def _toxic_spikes_layers_on_our_side(battle: Any) -> int:
+    """Number of Toxic Spikes layers on OUR side (0-2)."""
+    if battle is None:
+        return 0
+    try:
+        side = getattr(battle, "side_conditions", None) or {}
+    except Exception:
+        side = {}
+    # Accept both enum and string keys for robustness
+    layers = 0
+    try:
+        layers = int(side.get(SideCondition.TOXIC_SPIKES, 0) or 0)
+    except Exception:
+        layers = 0
+    if layers == 0:
+        try:
+            layers = int(side.get("toxicspikes", 0) or 0)
+        except Exception:
+            layers = 0
+    return max(0, min(2, int(layers)))
+
+
+def _is_grounded(mon: Any) -> bool:
+    """Grounded proxy: not Flying-type. (Ignores Levitate for now.)"""
+    if mon is None:
+        return False
+    try:
+        t1 = getattr(mon, "type_1", None)
+        t2 = getattr(mon, "type_2", None)
+        return not ((t1 == PokemonType.FLYING) or (t2 == PokemonType.FLYING))
+    except Exception:
+        return True
+
+
+def _absorbs_toxic_spikes(mon: Any) -> bool:
+    """Poison-type grounded mons absorb Toxic Spikes on switch-in."""
+    if mon is None:
+        return False
+    if not _is_grounded(mon):
+        return False
+    try:
+        t1 = getattr(mon, "type_1", None)
+        t2 = getattr(mon, "type_2", None)
+        return (t1 == PokemonType.POISON) or (t2 == PokemonType.POISON)
+    except Exception:
+        return False
+
+
+def _toxic_spikes_absorb_bonus(mon: Any, battle: Any) -> float:
+    """Bonus for clearing Toxic Spikes by switching in a grounded Poison-type."""
+    layers = _toxic_spikes_layers_on_our_side(battle)
+    if layers <= 0:
+        return 0.0
+    if not _absorbs_toxic_spikes(mon):
+        return 0.0
+    # 1 layer: poison prevention; 2 layers: toxic prevention (bigger)
+    return float(20.0 + 10.0 * (layers - 1))
 def _matchup_score(mon: Any, opponent: Any, battle: Any) -> float:
     """
     Evaluate how good mon's matchup is against opponent.
@@ -319,6 +456,7 @@ def score_switch(pokemon: Any, battle: Any, ctx: EvalContext) -> float:
 
     preserve_value = _win_condition_value(pokemon, battle)
 
+    # Race improvement shaping (small)
     try:
         now_race = _best_race_for_mon_vs_opp(battle, ctx, current_mon, opponent)
         in_race = _best_race_for_mon_vs_opp(battle, ctx, pokemon, opponent)
@@ -340,6 +478,9 @@ def score_switch(pokemon: Any, battle: Any, ctx: EvalContext) -> float:
         + preserve_value * 10
     )
 
+
+    # Toxic Spikes absorption bonus (grounded Poison-types clear them on entry)
+    score += _toxic_spikes_absorb_bonus(pokemon, battle)
     # Special cases
     if str(getattr(pokemon, "ability", "")).lower() == "regenerator":
         score += 15
@@ -386,8 +527,10 @@ def _slow_pivot_value(current_mon: Any, switch_target: Any, opponent: Any, battl
     if my_speed >= opp_speed:
         return 0.0
 
-    switch_in_damage = _estimate_damage_from_opponent(opponent, switch_target, battle)
-    if switch_in_damage < 0.3:
+    hazard_damage = _hazard_damage_frac_on_entry(switch_target, battle)
+    opp_hit_on_switch = _estimate_damage_from_opponent(opponent, switch_target, battle)
+    total_hard_switch = hazard_damage + opp_hit_on_switch
+    if total_hard_switch < 0.3:
         return 0.0
 
     my_hp = hp_frac(current_mon)
@@ -399,7 +542,7 @@ def _slow_pivot_value(current_mon: Any, switch_target: Any, opponent: Any, battl
     if target_matchup < 20:
         return 0.0
 
-    value = switch_in_damage * 80
+    value = opp_hit_on_switch * 80
 
     target_hp = hp_frac(switch_target)
     if target_hp < 0.6:
@@ -408,9 +551,9 @@ def _slow_pivot_value(current_mon: Any, switch_target: Any, opponent: Any, battl
     if target_speed > opp_speed:
         value += 15
 
-    if switch_in_damage > 0.7:
+    if opp_hit_on_switch > 0.7:
         value *= 1.4
-    elif switch_in_damage > 0.5:
+    elif opp_hit_on_switch > 0.5:
         value *= 1.2
 
     return float(value)
@@ -467,17 +610,19 @@ def _fast_pivot_value(current_mon: Any, switch_target: Any, opponent: Any, battl
     my_hp = hp_frac(current_mon)
     dmg_to_me = _estimate_damage_from_opponent(opponent, current_mon, battle)
     dmg_to_target = _estimate_damage_from_opponent(opponent, switch_target, battle)
+    hazard_damage = _hazard_damage_frac_on_entry(switch_target, battle)
+    target_cost = dmg_to_target + hazard_damage
 
     if dmg_to_me < 0.35 and dmg_to_me < my_hp * 0.75:
         return 0.0
 
-    avoided = max(0.0, dmg_to_me - dmg_to_target)
+    avoided = max(0.0, dmg_to_me - target_cost)
     if avoided < 0.12:
         return 0.0
 
     value = avoided * 90.0
 
-    if dmg_to_me >= my_hp * 0.95 and dmg_to_target < 0.70:
+    if dmg_to_me >= my_hp * 0.95 and target_cost < 0.70:
         value += 25.0
 
     danger = _danger_urgency(current_mon, opponent, battle)
@@ -515,6 +660,11 @@ def _switch_quality_for_pivot(current_mon: Any, target: Any, opponent: Any, batt
         setup_diff = 0.0
 
     q = (matchup_diff * 1.0) - (switch_penalty * 0.8) + (setup_diff * 0.5)
+
+    # Clearing Toxic Spikes is strong utility; keep it bounded here.
+    layers = _toxic_spikes_layers_on_our_side(battle)
+    if layers > 0 and _absorbs_toxic_spikes(target):
+        q += 15.0 + 10.0 * (layers - 1)
 
     return max(-60.0, min(60.0, float(q)))
 

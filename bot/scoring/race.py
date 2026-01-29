@@ -118,13 +118,7 @@ def _speed_order(me: Any, opp: Any) -> int:
     return 0
 
 
-def _initiative_penalty(
-    *,
-    tko_opp: float,
-    ttd_me: float,
-    effective_order: int,
-    opp_priority_p: float,
-) -> float:
+def _initiative_penalty(*, tko_opp: float, ttd_me: float, effective_order: int, opp_priority_p: float) -> float:
     """
     Convert "moving second is bad" into a stable penalty.
 

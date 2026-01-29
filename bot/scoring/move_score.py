@@ -2,6 +2,7 @@ from typing import Any
 
 from poke_env.battle import MoveCategory
 
+from ShowdownBattler.bot.scoring.switch_score import pivot_move_bonus
 from bot.model.ctx import EvalContext
 from bot.scoring.damage_score import (
     estimate_damage_fraction,
@@ -16,7 +17,6 @@ from bot.scoring.chip_score import chip_synergy_value
 
 from bot.scoring.pp_management import pp_conservation_penalty
 from bot.scoring.pressure import estimate_opponent_pressure
-from bot.scoring.switch_score import pivot_move_bonus
 
 
 def _recoil_penalty(move: Any, battle: Any, ctx: EvalContext) -> float:
@@ -218,6 +218,240 @@ def _drain_move_bonus(move: Any, battle: Any, ctx: EvalContext) -> float:
     
     return bonus
 
+_ROCK_VS_TYPE = {
+    "normal": 1.0, "fire": 2.0, "water": 1.0, "electric": 1.0, "grass": 1.0,
+    "ice": 2.0, "fighting": 0.5, "poison": 1.0, "ground": 0.5, "flying": 2.0,
+    "psychic": 1.0, "bug": 2.0, "rock": 1.0, "ghost": 1.0, "dragon": 1.0,
+    "dark": 1.0, "steel": 0.5, "fairy": 1.0,
+}
+
+def _type_name(t: Any) -> str:
+    return str(t).split(".")[-1].strip().lower()
+
+def _has_boots(mon: Any) -> bool:
+    item = str(getattr(mon, "item", "") or "").lower()
+    return item in ("heavydutyboots", "heavy-duty boots", "heavy_duty_boots")
+
+def _is_grounded(mon: Any) -> bool:
+    # Simple grounded check (ignore Levitate for now; you can add later)
+    try:
+        types = getattr(mon, "types", None) or []
+        return not any(_type_name(t) == "flying" for t in types)
+    except Exception:
+        return True
+
+def _is_poison(mon: Any) -> bool:
+    try:
+        types = getattr(mon, "types", None) or []
+        return any(_type_name(t) == "poison" for t in types)
+    except Exception:
+        return False
+
+def _is_steel(mon: Any) -> bool:
+    try:
+        types = getattr(mon, "types", None) or []
+        return any(_type_name(t) == "steel" for t in types)
+    except Exception:
+        return False
+
+def _rock_multiplier(mon: Any) -> float:
+    """Stealth Rock multiplier based on mon's types."""
+    try:
+        types = getattr(mon, "types", None) or []
+        mult = 1.0
+        for t in types:
+            mult *= float(_ROCK_VS_TYPE.get(_type_name(t), 1.0))
+        return mult
+    except Exception:
+        return 1.0
+
+def _side_conds_for(mon: Any, battle: Any) -> dict:
+    """
+    Return side conditions dict for the side `mon` is on.
+    """
+    if battle is None or mon is None:
+        return {}
+    try:
+        if mon in battle.team.values():
+            return getattr(battle, "side_conditions", None) or {}
+        return getattr(battle, "opponent_side_conditions", None) or {}
+    except Exception:
+        return {}
+
+def _hazard_entry_damage_frac(mon: Any, battle: Any) -> float:
+    """
+    Approx entry damage fraction from SR + Spikes (no Toxic Spikes here).
+    Boots => 0.
+    """
+    if mon is None or battle is None:
+        return 0.0
+    if _has_boots(mon):
+        return 0.0
+
+    conds = _side_conds_for(mon, battle)
+    sr = int(conds.get("stealthrock", 0) or 0)
+    spikes = int(conds.get("spikes", 0) or 0)
+
+    dmg = 0.0
+
+    # Stealth Rock: 1/8 * rock effectiveness
+    if sr > 0:
+        dmg += (1.0 / 8.0) * _rock_multiplier(mon)
+
+    # Spikes: grounded only; 1 layer 1/8, 2 layers 1/6, 3 layers 1/4
+    if spikes > 0 and _is_grounded(mon):
+        if spikes == 1:
+            dmg += 1.0 / 8.0
+        elif spikes == 2:
+            dmg += 1.0 / 6.0
+        else:
+            dmg += 1.0 / 4.0
+
+    return float(max(0.0, dmg))
+
+def _toxic_spikes_burden(mon: Any, battle: Any) -> float:
+    """
+    Soft penalty for Toxic Spikes (status pressure), not direct damage.
+    Poison types absorb; Steel types immune; Boots ignore status on entry.
+    """
+    if mon is None or battle is None:
+        return 0.0
+    if _has_boots(mon):
+        return 0.0
+
+    conds = _side_conds_for(mon, battle)
+    ts = int(conds.get("toxicspikes", 0) or 0)
+    if ts <= 0:
+        return 0.0
+
+    if not _is_grounded(mon):
+        return 0.0
+
+    # Poison absorbs (good) -> no burden (we handle bonus separately in switch_score)
+    if _is_poison(mon):
+        return 0.0
+    # Steel immune
+    if _is_steel(mon):
+        return 0.0
+
+    # 1 layer = poison, 2 layers = toxic; treat toxic as higher long-run burden
+    return 0.14 if ts == 1 else 0.24
+
+def _sticky_web_burden(mon: Any, battle: Any) -> float:
+    """
+    Soft penalty for Sticky Web (speed control). Boots ignore; Flying not affected.
+    """
+    if mon is None or battle is None:
+        return 0.0
+    if _has_boots(mon):
+        return 0.0
+
+    conds = _side_conds_for(mon, battle)
+    web = int(conds.get("stickyweb", 0) or 0)
+    if web <= 0:
+        return 0.0
+    if not _is_grounded(mon):
+        return 0.0
+
+    return 0.10
+
+def _team_hazard_burden(battle: Any, *, our_side: bool) -> float:
+    """
+    Aggregate hazard burden for a side.
+    Returns a roughly normalized number in ~[0, 2].
+    """
+    if battle is None:
+        return 0.0
+
+    team = battle.team.values() if our_side else battle.opponent_team.values()
+    mons = [m for m in team if m is not None and not getattr(m, "fainted", False)]
+    if not mons:
+        return 0.0
+
+    total = 0.0
+    for m in mons:
+        total += _hazard_entry_damage_frac(m, battle)
+        total += _toxic_spikes_burden(m, battle)
+        total += _sticky_web_burden(m, battle)
+
+    # Mild normalization by alive count (still increases with larger teams, but not linearly)
+    avg = total / float(len(mons))
+    return float(min(2.0, total * 0.35 + avg * 0.65))
+
+def hazard_removal_value(move: Any, battle: Any, ctx: EvalContext) -> float:
+    """
+    Value of using a hazard-removal / hazard-control move this turn.
+
+    Scales with:
+      - how much hazards hurt our remaining team (boots-aware)
+      - (for Defog/Court Change) the downside of removing OUR hazards on opponent
+      - immediate survivability (don't waste a turn if we're getting deleted)
+    """
+    move_id = str(getattr(move, "id", "") or "").lower()
+    if move_id not in {"defog", "rapidspin", "mortalspin", "courtchange", "tidyup"}:
+        return 0.0
+
+    me, opp = ctx.me, ctx.opp
+    if me is None or opp is None:
+        return 0.0
+
+    our_burden = _team_hazard_burden(battle, our_side=True)
+    opp_burden = _team_hazard_burden(battle, our_side=False)
+
+    # If no relevant hazards, no value (Court Change can still be situational, but keep simple)
+    if our_burden < 0.05 and move_id != "courtchange":
+        return 0.0
+
+    # Base benefit: removing hazards from our side
+    net = our_burden
+
+    # Defog removes hazards on BOTH sides -> losing our hazard advantage
+    if move_id == "defog":
+        net = our_burden - 0.75 * opp_burden
+
+    # Court Change swaps hazards/screens -> benefit is roughly (our_burden - opp_burden)
+    if move_id == "courtchange":
+        net = our_burden - opp_burden
+
+    # Tidy Up removes hazards and boosts; give a small constant extra
+    tidy_bonus = 0.0
+    if move_id == "tidyup":
+        tidy_bonus = 12.0
+
+    # Success probability / blockers
+    success = 1.0
+    if move_id in {"rapidspin", "mortalspin"}:
+        # Rapid Spin fails vs Ghost; Mortal Spin still hits but may be blocked by Ghost interaction too
+        # Use a conservative reduction if opponent is Ghost-type
+        try:
+            opp_types = getattr(opp, "types", None) or []
+            if any(_type_name(t) == "ghost" for t in opp_types):
+                success = 0.25 if move_id == "rapidspin" else 0.55
+        except Exception:
+            pass
+
+    # Context: if we're about to die, spending a turn removing hazards is often bad
+    my_hp = hp_frac(me)
+    pressure = estimate_opponent_pressure(battle, ctx)
+    imminent = (pressure.damage_to_me_frac >= my_hp * 0.90)
+
+    context_mul = 1.0
+    if imminent:
+        context_mul *= 0.65
+    else:
+        # More valuable when we have more switching left
+        our_remaining = remaining_count(battle.team)
+        if our_remaining >= 4:
+            context_mul *= 1.12
+        elif our_remaining <= 2:
+            context_mul *= 0.92
+
+    # Convert net burden into score points (keep in same ballpark as other utility moves)
+    value = 120.0 * max(0.0, net) * success * context_mul + tidy_bonus
+
+    # Cap to prevent crazy spikes
+    return float(max(0.0, min(160.0, value)))
+
 
 def score_move(move: Any, battle: Any, ctx: EvalContext) -> float:
     """
@@ -232,7 +466,8 @@ def score_move(move: Any, battle: Any, ctx: EvalContext) -> float:
         return -100.0
 
     if move.category == MoveCategory.STATUS:
-        return score_status_move(move, battle, ctx)
+        # Status value + hazard control value
+        return score_status_move(move, battle, ctx) + hazard_removal_value(move, battle, ctx)
 
     dmg_frac = float(estimate_damage_fraction(move, me, opp, battle))
     opp_hp = hp_frac(opp)
@@ -264,8 +499,6 @@ def score_move(move: Any, battle: Any, ctx: EvalContext) -> float:
         after_status=None,
     )
 
-    score += pivot_move_bonus(move, battle, ctx)
-
     # Penalty for weak chip on healthy targets
     if opp_hp > 0.8 and dmg_frac < 0.18:
         score -= 8.0
@@ -278,8 +511,13 @@ def score_move(move: Any, battle: Any, ctx: EvalContext) -> float:
     
     # Apply self-destruct penalty (considers KO prob and opponent threat)
     score -= _self_destruct_penalty(move, battle, ctx, ko_prob)
-    
     # Apply drain move bonus
     score += _drain_move_bonus(move, battle, ctx)
+
+    # Hazard control (Rapid Spin / Mortal Spin etc.)
+    score += hazard_removal_value(move, battle, ctx)
+
+    # Pivot moves bonus (U-turn / Volt Switch etc.)
+    score += pivot_move_bonus(move, battle, ctx)
 
     return score
