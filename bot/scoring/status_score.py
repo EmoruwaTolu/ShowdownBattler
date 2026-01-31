@@ -1167,7 +1167,6 @@ def _burn_ko_threshold_value(
     
     # How many extra hits does burn give us?
     extra_hits = htk_with - htk_without
-    print("extra hits: " + str(extra_hits))
     
     # Scale by physical probability
     value = 0.0
