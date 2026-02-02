@@ -12,11 +12,6 @@ from bot.scoring.race import evaluate_race_for_move
 from bot.scoring.pressure import estimate_opponent_pressure
 from bot.scoring.chip_score import chip_synergy_value
 
-
-# ============================================================================
-# SECONDARY SCORING CONSTANTS
-# ============================================================================
-
 # Race state multipliers (reduced to avoid double-counting with TTD swing)
 RACE_LOSING_MULTIPLIER = 1.05   # Reduced from 1.12
 RACE_WINNING_MULTIPLIER = 0.95  # Reduced from 0.93
@@ -31,11 +26,6 @@ SYNERGY_WEIGHT_POISON = 0.40
 CHIP_WEIGHT_BURN_PARA = 0.35
 CHIP_WEIGHT_SLEEP_FREEZE = 0.20
 CHIP_WEIGHT_POISON = 0.25
-
-
-# ============================================================================
-# HELPER FUNCTIONS
-# ============================================================================
 
 def _parse_secondary_status(sec: Dict[str, Any]) -> Optional[Status]:
     s = sec.get("status", None)

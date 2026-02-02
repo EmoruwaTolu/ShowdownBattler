@@ -145,7 +145,7 @@ def chip_synergy_value(
     if after.is_faster and after.ko_prob > before.ko_prob:
         value += 4.0
 
-    # ---- Self follow-up priority (Scald -> Aqua Jet) ----
+    # Self follow-up priority (Scald -> Aqua Jet)
     pressure = estimate_opponent_pressure(battle, ctx)
     my_hp = hp_frac(me)
 
@@ -178,7 +178,7 @@ def chip_synergy_value(
         if best_prio_before < 0.25 and best_prio_after >= 0.90:
             value += 12.0
         
-        # ---- Role Preservation Bonus ----
+        # Role Preservation Bonus
         # If chip + priority keeps us alive vs dying to status, huge bonus!
         # This captures: "Scald -> Aqua Jet keeps Suicune alive" vs "Thunder Wave -> die"
         if best_prio_after > 0.5:
