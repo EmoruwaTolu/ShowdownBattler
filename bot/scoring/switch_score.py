@@ -725,8 +725,11 @@ def pivot_move_bonus(move: Any, battle: Any, ctx: EvalContext) -> float:
             best_q = q
             best_switch_target = teammate
 
-    if best_q > 0:
-        bonus += best_q * 0.6  # capped at +36 due to q cap
+    best_q = max(-60.0, min(60.0, best_q))
+    if best_q >= 0:
+        bonus += best_q * 0.5
+    else:
+        bonus += best_q * 1.0
 
     # 4) Fast vs slow pivot value (mutually exclusive)
     order = _pivot_order(me, opp, move)
