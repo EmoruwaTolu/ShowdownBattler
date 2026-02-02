@@ -46,7 +46,7 @@ def _get_pokemon_identifier(pokemon: Any, battle: Any) -> Optional[str]:
     except Exception:
         opp_items = []
 
-    # 1) Exact identity match
+    # Exact identity match
     for identifier, pkmn in team_items:
         if pkmn is pokemon:
             return identifier
@@ -82,7 +82,7 @@ def _get_pokemon_identifier(pokemon: Any, battle: Any) -> Optional[str]:
         # Otherwise, ambiguous: return first
         return cands[0][0]
 
-    # 2) Prefer same-side match (if we can infer side from identifier-style, we can’t here)
+    # Prefer same-side match (if we can infer side from identifier-style, we can’t here)
     # But we can still try team then opponent (this is usually correct for switch-ins you evaluate)
     if target_species:
         ident = best_species_match(team_items)
@@ -92,7 +92,7 @@ def _get_pokemon_identifier(pokemon: Any, battle: Any) -> Optional[str]:
         if ident is not None:
             return ident
 
-    # 3) As a final fallback, if species missing, try matching by name/id fields (rare)
+    # As a final fallback, if species missing, try matching by name/id fields (rare)
     # (If nothing works, return None)
     return None
 

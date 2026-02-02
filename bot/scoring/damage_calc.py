@@ -157,8 +157,6 @@ def _burn_ko_threshold_value(
     # Scale by physical probability
     value = 0.0
     
-    # === CRITICAL THRESHOLDS ===
-    
     if htk_without == 1:
         # OHKO → Survives
         if htk_with >= 2:

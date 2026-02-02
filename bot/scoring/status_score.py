@@ -31,11 +31,6 @@ from bot.model.opponent_model import get_opponent_set_distribution
 from bot.scoring.race import evaluate_race_for_move
 from bot.scoring.pressure import estimate_opponent_pressure
 
-
-# ============================================================================
-# STATUS SCORING CONSTANTS
-# ============================================================================
-
 # Base status values (intrinsic power of each status)
 BASE_STATUS_SLEEP = 55.0
 BASE_STATUS_PARALYSIS = 40.0
@@ -67,11 +62,6 @@ RACE_BASE_MODIFIER = 18.0  # Base amount for slight win/loss
 SYNERGY_WINCON_SETUP_MULT = 1.35
 SYNERGY_WINCON_BULK_MULT = 1.10
 SYNERGY_SECOND_BEST_WEIGHT = 0.5
-
-
-# ============================================================================
-# APPLICABILITY CHECKS
-# ============================================================================
 
 def move_inflicts_major_status(move: Any) -> Optional[Status]:
     st = getattr(move, "status", None)
@@ -204,7 +194,6 @@ def score_status_move(move: Any, battle: Any, ctx: EvalContext) -> float:
     raw -= tempo_risk(move, battle, ctx, pressure)
     raw -= _survival_penalty(move, battle, ctx, pressure)
 
-    # === IMPROVED RACE STATE MODIFIER ===
     # Scale modifier based on how much we're winning/losing
     
     mv = _best_damage_move(battle)
@@ -235,7 +224,7 @@ def score_status_move(move: Any, battle: Any, ctx: EvalContext) -> float:
         except Exception:
             pass
 
-    # === ACCURACY WITH PROPORTIONAL MISS COST ===
+    # ACCURACY WITH PROPORTIONAL MISS COST
     acc = float(getattr(move, "accuracy", 1.0) or 1.0)
     acc = max(0.0, min(1.0, acc))
     
@@ -243,11 +232,6 @@ def score_status_move(move: Any, battle: Any, ctx: EvalContext) -> float:
     final = acc * raw + (1.0 - acc) * (-miss_cost)
     
     return final
-
-
-# ============================================================================
-# CONSOLIDATED BURN SCORING
-# ============================================================================
 
 def _burn_total_value(battle: Any, ctx: EvalContext, pressure) -> float:
     """
@@ -257,11 +241,7 @@ def _burn_total_value(battle: Any, ctx: EvalContext, pressure) -> float:
     1. Halving physical attack damage (matchup dependent)
     2. Passive chip damage (1/16 HP per turn)
     3. Stopping physical setup sweepers
-    
-    This combines what was previously spread across:
-    - base_status_value (base + special attacker penalty + chip)
-    - near_term_payoff (physical matchup value + setup deterrent)
-    - long_term_value (horizon scaling + ongoing effects)
+
     """
     opp = ctx.opp
     if opp is None:
@@ -273,8 +253,6 @@ def _burn_total_value(battle: Any, ctx: EvalContext, pressure) -> float:
     phys_prob = pressure.physical_prob
     special_prob = 1.0 - phys_prob
     
-    # === MATCHUP-SPECIFIC VALUE ===
-    
     # Reduce value against special attackers (burn doesn't help much)
     value -= special_prob * 12.0
     
@@ -283,8 +261,6 @@ def _burn_total_value(battle: Any, ctx: EvalContext, pressure) -> float:
     value += 8.0  # Base near-term
     value += 14.0 * phys_prob  # Strong vs physical
     value -= 2.0 * special_prob  # Weak vs special
-    
-    # === CHIP DAMAGE VALUE ===
     
     # Passive burn damage over expected game length
     our_remaining = remaining_count(battle.team)
@@ -304,15 +280,11 @@ def _burn_total_value(battle: Any, ctx: EvalContext, pressure) -> float:
     chip_value = total_chip * BURN_CHIP_VALUE_MULTIPLIER
     value += chip_value
     
-    # === SETUP/PRESSURE DETERRENT ===
-    
     # Burn stops physical setup sweepers (DD, SD, etc.)
     setup_value = 6.0 * pressure.setup_prob  # near-term
     setup_value += 5.0 * pressure.setup_prob  # long-term
     value += setup_value * phys_prob  # Only matters vs physical sweepers
-    
-    # === LONG-TERM VALUE ===
-    
+
     # Ongoing benefit over multiple turns
     value += 3.5 * horizon
     value += 8.0 * phys_prob  # Additional long-term vs physical
@@ -341,11 +313,6 @@ def _burn_chip_damage_value(battle: Any, ctx: EvalContext) -> float:
     
     total_chip = BURN_CHIP_PER_TURN * expected_turns
     return total_chip * BURN_CHIP_VALUE_MULTIPLIER
-
-
-# ============================================================================
-# PARALYSIS SCORING
-# ============================================================================
 
 def _paralysis_speed_flip_value(me: Any, opp: Any, dist) -> float:
     """
@@ -404,11 +371,11 @@ def _paralysis_total_value(battle: Any, ctx: EvalContext, pressure, dist) -> flo
     
     slower = is_slower(me, opp)
     
-    # === SPEED FLIP VALUE ===
+    # SPEED FLIP VALUE 
     speed_flip_value = _paralysis_speed_flip_value(me, opp, dist)
     value += speed_flip_value
     
-    # === NEAR-TERM PAYOFF ===
+    # NEAR-TERM PAYOFF 
     
     # Base near-term value
     value += 10.0
@@ -422,7 +389,7 @@ def _paralysis_total_value(battle: Any, ctx: EvalContext, pressure, dist) -> flo
     # Setup deterrent (para helps vs setup sweepers)
     value += 10.0 * pressure.setup_prob
     
-    # === LONG-TERM VALUE ===
+    # LONG-TERM VALUE 
     
     our_remaining = remaining_count(battle.team)
     opp_remaining = remaining_count(battle.opponent_team)
@@ -441,22 +408,12 @@ def _paralysis_total_value(battle: Any, ctx: EvalContext, pressure, dist) -> flo
     
     return value
 
-
-# ============================================================================
-# OTHER STATUS VALUES
-# ============================================================================
-
 def _sleep_total_value() -> float:
     """Sleep value (very strong short-term, forces switch)."""
     # Near-term: 26.0
     # Long-term: 10.0
     # Base: 55.0
     return BASE_STATUS_SLEEP + 26.0 + 10.0
-
-
-# ============================================================================
-# ROLE PRESERVATION & SURVIVAL
-# ============================================================================
 
 def _survival_penalty(move: Any, battle: Any, ctx: EvalContext, pressure) -> float:
     """
@@ -518,11 +475,6 @@ def _survival_penalty(move: Any, battle: Any, ctx: EvalContext, pressure) -> flo
             return penalty
     
     return 0.0
-
-
-# ============================================================================
-# MAIN STATUS VALUE FUNCTION
-# ============================================================================
 
 def base_status_value(move: Any, battle: Any = None, ctx: EvalContext = None) -> float:
     """
@@ -694,14 +646,14 @@ def team_synergy_value(move: Any, battle: Any, ctx: EvalContext) -> float:
             # Get actual damage to ally using full pressure calculation
             damage_to_ally = _estimate_damage_to_ally(ally, opp, battle)
             
-            # === KO THRESHOLD VALUE (NEW!) ===
+            # KO THRESHOLD VALUE (NEW!)
             # Check if burn changes OHKO → 2HKO, 2HKO → 3HKO, etc.
             # This replaces the old generic dmg_reduction calculation
             ko_threshold_value = _burn_ko_threshold_value(
                 ally, opp, battle, damage_to_ally, phys_p
             )
             
-            # === SETUP DETERRENCE ===
+            # SETUP DETERRENCE 
             # This is independent of KO thresholds
             phys_setup_p = (
                 sum(w for c, w in dist if getattr(c, "is_physical", False) and getattr(c, "has_setup", False))
@@ -731,36 +683,6 @@ def team_synergy_value(move: Any, battle: Any, ctx: EvalContext) -> float:
             second = benefit
 
     return best + 0.5 * second
-
-def _burn_chip_damage_value(battle: Any, ctx: EvalContext) -> float:
-    """
-    Value of passive burn damage over expected remaining turns.
-    Burn deals 1/16 HP per turn.
-    """
-    opp = ctx.opp
-    if opp is None:
-        return 0.0
-    
-    # Estimate how many turns opponent will stay in
-    # Conservative since they might switch
-    our_remaining = remaining_count(battle.team)
-    opp_remaining = remaining_count(battle.opponent_team)
-    
-    # Longer games = more chip value
-    if opp_remaining >= 4 and our_remaining >= 4:
-        expected_turns = 3.0
-    elif opp_remaining >= 3:
-        expected_turns = 2.5
-    else:
-        expected_turns = 2.0
-    
-    # 1/16 HP per turn (6.25%)
-    chip_per_turn = 1.0 / 16.0
-    total_chip = chip_per_turn * expected_turns
-    
-    # Scale to scoring system (similar to damage value)
-    return total_chip * 85.0
-
 
 def _status_matchup_penalty(move: Any, battle: Any, ctx: EvalContext, pressure) -> float:
     """
@@ -1171,7 +1093,7 @@ def _burn_ko_threshold_value(
     # Scale by physical probability
     value = 0.0
     
-    # === CRITICAL THRESHOLDS ===
+    # CRITICAL THRESHOLDS 
     
     if htk_without == 1:
         # OHKO → Survives

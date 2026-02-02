@@ -706,13 +706,13 @@ def pivot_move_bonus(move: Any, battle: Any, ctx: EvalContext) -> float:
 
     bonus = 0.0
 
-    # 1) Momentum
+    # Momentum
     bonus += 15.0
 
-    # 2) Scout
+    # Scout
     bonus += 10.0
 
-    # 3) Best follow-up switch-in quality (bounded; NOT score_switch)
+    # Best follow-up switch-in quality (bounded; NOT score_switch)
     best_q = -999.0
     best_switch_target = None
 
@@ -731,7 +731,7 @@ def pivot_move_bonus(move: Any, battle: Any, ctx: EvalContext) -> float:
     else:
         bonus += best_q * 1.0
 
-    # 4) Fast vs slow pivot value (mutually exclusive)
+    # Fast vs slow pivot value (mutually exclusive)
     order = _pivot_order(me, opp, move)
     if best_switch_target is not None:
         if order == +1:
@@ -739,7 +739,7 @@ def pivot_move_bonus(move: Any, battle: Any, ctx: EvalContext) -> float:
         elif order == -1:
             bonus += _slow_pivot_value(me, best_switch_target, opp, battle)
 
-    # 5) Risk penalty applies only when opponent acts before pivot (slow pivot)
+    # Risk penalty applies only when opponent acts before pivot (slow pivot)
     danger = _danger_urgency(me, opp, battle)
     if order == -1:
         if danger > 60:
@@ -747,7 +747,7 @@ def pivot_move_bonus(move: Any, battle: Any, ctx: EvalContext) -> float:
         elif danger > 40:
             bonus -= 15
 
-    # 6) Choice item synergy
+    # Choice item synergy
     my_item = str(getattr(me, "item", "")).lower()
     if my_item in ["choiceband", "choicescarf", "choicespecs"]:
         bonus += 20.0
