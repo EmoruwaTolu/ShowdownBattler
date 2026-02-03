@@ -67,6 +67,11 @@ def move_inflicts_major_status(move: Any) -> Optional[Status]:
     st = getattr(move, "status", None)
     return st if st is not None else None
 
+def already_has_major_status(opp: Any) -> bool:
+    try:
+        return getattr(opp, "status", None) is not None
+    except Exception:
+        return False
 
 def major_status_is_applicable(status: Status, move: Any, opp: Any) -> bool:
     if opp is None:
@@ -175,6 +180,11 @@ def score_status_move(move: Any, battle: Any, ctx: EvalContext) -> float:
     opp = ctx.opp
     if opp is None:
         return -100.0
+    
+    # Hard punish wasting a major-status move into an already-statused target
+    major = move_inflicts_major_status(move)
+    if major is not None and already_has_major_status(opp):
+        return -120.0
 
     major = move_inflicts_major_status(move)
     if major is not None and not major_status_is_applicable(major, move, opp):
@@ -923,7 +933,6 @@ def _estimate_damage_to_ally(ally: Any, opp: Any, battle: Any) -> float:
                     continue
                 
                 try:
-                    # Use poke-env's ACTUAL damage calculator!
                     # Returns (min_damage, max_damage) as integers (HP lost)
                     min_dmg, max_dmg = calculate_damage(
                         attacker_identifier=opp_identifier,

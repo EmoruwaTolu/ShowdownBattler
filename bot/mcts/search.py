@@ -8,6 +8,7 @@ import random
 from bot.mcts.shadow_state import ShadowState, Action
 from bot.mcts.eval import evaluate_state
 
+
 @dataclass
 class MCTSConfig:
     num_simulations: int = 300
@@ -21,7 +22,25 @@ class MCTSConfig:
     # Action selection at root
     temperature: float = 0.0  # 0 => argmax visits
 
+    # Reproducibility
     seed: Optional[int] = None
+
+    # stochastic knobs (wired into ShadowState)
+    model_miss: bool = True
+    model_crit: bool = True
+    crit_chance: float = 1.0 / 24.0
+    crit_multiplier: float = 1.5
+    
+    # Hybrid expansion (explicit branching for critical moves)
+    use_hybrid_expansion: bool = False  # Start disabled
+    branch_low_accuracy: bool = True
+    low_accuracy_threshold: float = 0.85
+    branch_potential_ohko: bool = True
+    ohko_threshold: float = 0.80
+    branch_crit_matters: bool = True
+    crit_matters_min_normal: float = 0.60
+    min_branch_probability: float = 0.01 # Probability before we consider a branch
+
 
 class Node:
     __slots__ = ("state", "parent", "prior", "children", "N", "W")
@@ -109,9 +128,109 @@ def select_child(node: Node, c_puct: float) -> Tuple[Action, Node]:
             best_a = a
             best_child = child
 
-    return best_a, best_child  # type: ignore
+    return best_a, best_child
+
+def should_branch_move(move: Any, state: ShadowState, cfg: MCTSConfig) -> bool:
+    """
+    Decide whether a move should create multiple outcome branches.
+    Returns True for "critical" moves where we want explicit branching.
+    """
+    if move is None:
+        return False
+    
+    # Get move properties
+    accuracy = getattr(move, 'accuracy', 1.0) or 1.0
+    if accuracy > 1.0:
+        accuracy /= 100.0
+    accuracy = max(0.0, min(1.0, accuracy))
+    
+    # Check 1: Low accuracy moves
+    if cfg.branch_low_accuracy and accuracy < cfg.low_accuracy_threshold:
+        return True
+    
+    # Check 2: Potential OHKO scenarios
+    if cfg.branch_potential_ohko:
+        try:
+            with state._patched_status():
+                dmg_frac = float(state.dmg_fn(move, state.my_active, state.opp_active, state.battle))
+            
+            opp_hp = state.opp_active_hp()
+            if dmg_frac >= opp_hp * cfg.ohko_threshold:
+                return True
+        except Exception:
+            pass
+    
+    # Check 3: Crit matters (normal hit doesn't KO but crit does)
+    if cfg.branch_crit_matters:
+        try:
+            with state._patched_status():
+                dmg_frac = float(state.dmg_fn(move, state.my_active, state.opp_active, state.battle))
+            
+            opp_hp = state.opp_active_hp()
+            crit_dmg = dmg_frac * state.crit_multiplier
+            
+            if dmg_frac >= opp_hp * cfg.crit_matters_min_normal and crit_dmg >= opp_hp and dmg_frac < opp_hp:
+                return True
+        except Exception:
+            pass
+    
+    return False
+
+
+def create_move_branches(
+    state: ShadowState,
+    move: Any,
+    cfg: MCTSConfig,
+    base_rng: random.Random,
+) -> List[Tuple[float, ShadowState, str]]:
+    """
+    Create explicit branches for a move's possible outcomes.
+    Returns: List of (probability, next_state, outcome_label) tuples
+    """
+    accuracy = getattr(move, 'accuracy', 1.0) or 1.0
+    if accuracy > 1.0:
+        accuracy /= 100.0
+    accuracy = max(0.0, min(1.0, accuracy))
+    
+    crit_chance = state.crit_chance
+    
+    branches = []
+    
+    # Calculate probabilities
+    p_miss = 1.0 - accuracy
+    p_hit_crit = accuracy * crit_chance
+    p_hit_no_crit = accuracy * (1.0 - crit_chance)
+    
+    # Branch 1: Hit + Crit
+    if p_hit_crit >= cfg.min_branch_probability:
+        rng_crit = random.Random(hash((id(base_rng), "hit_crit")))
+        state_temp = state.with_forced_outcome(hit=True, crit=True)
+        next_state = state_temp.step(("move", move), rng=rng_crit)
+        branches.append((p_hit_crit, next_state, "hit+crit"))
+    
+    # Branch 2: Hit + No Crit
+    if p_hit_no_crit >= cfg.min_branch_probability:
+        rng_hit = random.Random(hash((id(base_rng), "hit_no_crit")))
+        state_temp = state.with_forced_outcome(hit=True, crit=False)
+        next_state = state_temp.step(("move", move), rng=rng_hit)
+        branches.append((p_hit_no_crit, next_state, "hit"))
+    
+    # Branch 3: Miss
+    if p_miss >= cfg.min_branch_probability:
+        rng_miss = random.Random(hash((id(base_rng), "miss")))
+        state_temp = state.with_forced_outcome(hit=False, crit=False)
+        next_state = state_temp.step(("move", move), rng=rng_miss)
+        branches.append((p_miss, next_state, "miss"))
+    
+    return branches
+
 
 def expand(node: Node, rng: random.Random, cfg: MCTSConfig, is_root: bool) -> None:
+    """
+    Expansion with hybrid approach:
+    - Critical moves create multiple outcome branches
+    - Routine moves use single-sample expansion
+    """
     if node.state.is_terminal():
         return
 
@@ -122,12 +241,49 @@ def expand(node: Node, rng: random.Random, cfg: MCTSConfig, is_root: bool) -> No
     priors = action_priors(node.state, actions)
     if is_root:
         priors = add_dirichlet_noise(priors, cfg.dirichlet_alpha, cfg.dirichlet_eps, rng)
-
+    
     for a in actions:
+        # Check if already expanded (handles both branched and non-branched)
         if a in node.children:
             continue
-        next_state = node.state.step(a)
-        node.children[a] = Node(next_state, parent=node, prior=priors.get(a, 1.0 / len(actions)))
+        
+        # For branched actions, check if any branch exists
+        base_action = (a[0], a[1]) if len(a) >= 2 else a
+        existing_branches = [k for k in node.children.keys() 
+                            if len(k) >= 2 and (k[0], k[1]) == (base_action[0], base_action[1])]
+        if existing_branches:
+            continue
+        
+        kind, obj = a
+        
+        # Decide: should we branch this move?
+        if cfg.use_hybrid_expansion and kind == "move" and should_branch_move(obj, node.state, cfg):
+            # CRITICAL MOVE: Create multiple outcome branches
+            branches = create_move_branches(node.state, obj, cfg, rng)
+            
+            base_prior = priors.get(a, 1.0 / len(actions))
+            
+            for prob, next_state, outcome_label in branches:
+                # Create unique action key: (kind, obj, outcome_label)
+                branch_action = (kind, obj, outcome_label)
+                
+                # Weight prior by probability
+                branch_prior = base_prior * prob
+                
+                node.children[branch_action] = Node(
+                    next_state,
+                    parent=node,
+                    prior=branch_prior
+                )
+        else:
+            # ROUTINE MOVE/SWITCH: Standard single-sample expansion
+            next_state = node.state.step(a, rng=rng)
+            node.children[a] = Node(
+                next_state,
+                parent=node,
+                prior=priors.get(a, 1.0 / len(actions))
+            )
+
 
 def evaluate_leaf(node: Node) -> float:
     """
@@ -143,11 +299,21 @@ def backup(node: Node, value: float) -> None:
         cur.W += value
         cur = cur.parent
 
+
 def action_name(a: Action) -> Tuple[str, str]:
-    kind, obj = a
+    kind = a[0]
+    obj = a[1]
+    outcome = a[2] if len(a) > 2 else None
+    
     if kind == "move":
-        return "move", str(getattr(obj, "id", "") or getattr(obj, "name", "") or "move")
-    return "switch", str(getattr(obj, "species", "") or getattr(obj, "name", "") or "switch")
+        name = str(getattr(obj, "id", "") or getattr(obj, "name", "") or "move")
+        if outcome:
+            name += f" [{outcome}]"
+        return "move", name
+    
+    name = str(getattr(obj, "species", "") or getattr(obj, "name", "") or "switch")
+    return "switch", name
+
 
 def search(
     *,
@@ -162,6 +328,7 @@ def search(
     status_threshold: float = 0.30,
     allow_switches: bool = True,
     return_stats: bool = False,
+    return_tree: bool = False,
 ) -> Union[Action, Tuple[Action, Dict[str, Any]]]:
     """
     Runs PUCT MCTS and returns best root action.
@@ -169,7 +336,7 @@ def search(
 
     allow_switches=False => only expands root with moves (still allows pivot-triggered switches inside rollouts).
     """
-    rng = random.Random(cfg.seed)
+    master_rng = random.Random(cfg.seed)
 
     root_state = ShadowState.from_battle(
         battle=battle,
@@ -180,18 +347,21 @@ def search(
         dmg_fn=dmg_fn,
         opp_tau=opp_tau,
         status_threshold=status_threshold,
+        model_miss=cfg.model_miss,
+        model_crit=cfg.model_crit,
+        crit_chance=cfg.crit_chance,
+        crit_multiplier=cfg.crit_multiplier,
+        debug=True
     )
     root = Node(root_state, parent=None, prior=1.0)
 
-    # Expand root once
-    expand(root, rng, cfg, is_root=True)
+    # Expand root once (using master_rng so it's reproducible)
+    expand(root, master_rng, cfg, is_root=True)
 
     # Optional: restrict root to moves only
     if not allow_switches and root.children:
         root.children = {a: n for a, n in root.children.items() if a[0] == "move"}
         if not root.children:
-            # If we removed everything, just re-expand with legal moves only by filtering actions
-            # simplest fallback: return first available move
             actions = root_state.legal_actions()
             moves = [a for a in actions if a[0] == "move"]
             if moves:
@@ -203,7 +373,11 @@ def search(
         return (picked, {"top": [], "sims": 0}) if return_stats else picked
 
     # Simulations
-    for _ in range(int(cfg.num_simulations)):
+    for sim_i in range(int(cfg.num_simulations)):
+        # Each rollout gets its own deterministic RNG stream (reproducible but different)
+        sim_seed = hash((cfg.seed, sim_i, "rollout")) if cfg.seed is not None else master_rng.getrandbits(64)
+        sim_rng = random.Random(sim_seed)
+
         node = root
         depth = 0
 
@@ -212,9 +386,9 @@ def search(
             _, node = select_child(node, cfg.c_puct)
             depth += 1
 
-        # Expansion (only if we stopped on an unexpanded node)
+        # Expansion (sample transitions with sim_rng the first time we expand this node)
         if not node.state.is_terminal() and depth < cfg.max_depth and not node.is_expanded():
-            expand(node, rng, cfg, is_root=False)
+            expand(node, sim_rng, cfg, is_root=False)
 
         # Evaluation
         value = evaluate_leaf(node)
@@ -241,12 +415,11 @@ def search(
 
     # Pick best action from root children
     if cfg.temperature and cfg.temperature > 1e-9:
-        # sample proportional to exp(visits / T)
         visits = [root.children[a].N for a in actions]
         m = max(visits)
         weights = [math.exp((v - m) / float(cfg.temperature)) for v in visits]
         z = sum(weights) or 1.0
-        r = rng.random() * z
+        r = master_rng.random() * z
         acc = 0.0
         picked = actions[-1]
         for a, w in zip(actions, weights):
@@ -257,9 +430,15 @@ def search(
     else:
         picked = max(actions, key=lambda a: root.children[a].N)
 
+    payload = {"top": rows[:10], "sims": int(cfg.num_simulations)}
+
+    if return_tree:
+        payload["root"] = root
+
     if return_stats:
-        return picked, {"top": rows[:10], "sims": int(cfg.num_simulations)}
+        return picked, payload
     return picked
+
 
 def mcts_pick_action(
     *,
@@ -274,10 +453,13 @@ def mcts_pick_action(
     include_switches: bool = True,
     opp_tau: float = 8.0,
     status_threshold: float = 0.30,
+    seed: Optional[int] = None,
+    model_miss: bool = True,
+    model_crit: bool = True,
+    crit_chance: float = 1.0 / 24.0,
+    crit_multiplier: float = 1.5,
 ) -> Tuple[Optional[Action], Optional[Dict[str, Any]]]:
-    """
-    Wrapper that matches your old pattern: returns (picked, stats).
-    """
+    
     cfg = MCTSConfig(
         num_simulations=int(iters),
         max_depth=int(max_depth),
@@ -285,7 +467,11 @@ def mcts_pick_action(
         dirichlet_alpha=0.0,
         dirichlet_eps=0.0,
         temperature=0.0,
-        seed=None,
+        seed=seed,
+        model_miss=model_miss,
+        model_crit=model_crit,
+        crit_chance=crit_chance,
+        crit_multiplier=crit_multiplier,
     )
 
     picked, stats = search(
@@ -302,3 +488,77 @@ def mcts_pick_action(
         return_stats=True,
     )
     return picked, stats
+
+
+def format_tree(
+    root: "Node",
+    *,
+    max_depth: int = 3,
+    top_k: int = 5,
+    show_state: bool = True,
+) -> str:
+    """
+    Pretty-print the MCTS tree from root.
+
+    max_depth: how many plies to print
+    top_k: print top_k children per node (by visits)
+    show_state: include (my_active vs opp_active, hp, status) snapshot
+    """
+    lines: List[str] = []
+
+    def snap(node: "Node") -> str:
+        if not show_state:
+            return ""
+        s = node.state
+        
+        try:
+            my = getattr(s.my_active, "species", "ME")
+            op = getattr(s.opp_active, "species", "OPP")
+            my_hp = s.my_hp.get(id(s.my_active), 1.0)
+            op_hp = s.opp_hp.get(id(s.opp_active), 1.0)
+            my_st = s.my_status.get(id(s.my_active))
+            op_st = s.opp_status.get(id(s.opp_active))
+
+            def st(x):
+                return "none" if x is None else str(x).split(".")[-1].lower()
+
+            base = f" [{my} {my_hp:.2f} {st(my_st)} vs {op} {op_hp:.2f} {st(op_st)}]"
+
+            if getattr(s, "debug", False) and getattr(s, "events", ()):
+                # show last 1–2 events only (prevents clutter)
+                ev = "; ".join(s.events[-2:])
+                base += f" | {ev}"
+
+            return base
+        except Exception:
+            return ""
+
+    def action_str(a: Action) -> str:
+        kind = a[0]
+        obj = a[1]
+        outcome = a[2] if len(a) > 2 else None 
+        if kind == "move":
+            return f"move {getattr(obj, 'id', getattr(obj, 'name', 'move'))}"
+        return f"switch {getattr(obj, 'species', getattr(obj, 'name', 'switch'))}"
+
+    def rec(node: "Node", depth: int, prefix: str):
+        kids = sorted(
+            node.children.items(),
+            key=lambda kv: (kv[1].N, kv[1].Q),
+            reverse=True,
+        )[:top_k]
+
+        for i, (a, child) in enumerate(kids):
+            branch = "└─" if i == len(kids) - 1 else "├─"
+            lines.append(
+                f"{prefix}{branch} {action_str(a):18s}  "
+                f"N={child.N:4d}  Q={child.Q:+.3f}  P={child.prior:.3f}"
+                f"{snap(child)}"
+            )
+            if depth + 1 < max_depth and child.children:
+                ext = "   " if i == len(kids) - 1 else "│  "
+                rec(child, depth + 1, prefix + ext)
+
+    lines.append(f"ROOT N={root.N} Q={root.Q:+.3f}{snap(root)}")
+    rec(root, 0, "")
+    return "\n".join(lines)

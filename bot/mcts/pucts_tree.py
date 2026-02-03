@@ -19,9 +19,7 @@ class BattleState:
     For selection/traversal, we only need:
       - legal_actions()
       - is_terminal()
-
-    Later (expansion), we will add:
-      - step(action) -> BattleState
+      
     """
     battle: Any
     ctx: Any  # EvalContext (your project type)

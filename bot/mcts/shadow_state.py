@@ -1,4 +1,3 @@
-# bot/mcts/shadow_state.py
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
@@ -9,7 +8,7 @@ import random
 
 from poke_env.battle import Status, MoveCategory
 
-from bot.scoring.helpers import hp_frac, is_fainted, is_slower
+from bot.scoring.helpers import hp_frac, is_fainted
 
 Action = Tuple[str, Any]  # ("move", Move) or ("switch", Pokemon)
 
@@ -23,25 +22,30 @@ def _clamp01(x: float) -> float:
     return max(0.0, min(1.0, float(x)))
 
 
-def _is_pivot_move(move: Any) -> bool:
+def is_pivot_move(move: Any) -> bool:
     mid = str(getattr(move, "id", "") or getattr(move, "name", "")).lower().replace(" ", "")
     return mid in {"voltswitch", "uturn", "flipturn", "partingshot"}
 
 
-def _move_priority(move: Any) -> int:
+def move_priority(move: Any) -> int:
     try:
         return int(getattr(move, "priority", 0) or 0)
     except Exception:
         return 0
 
 
-def _base_speed(p: Any, default: int = 80) -> float:
+def base_speed(p: Any, default: int = 80) -> float:
     try:
         return float((p.base_stats or {}).get("spe", default))
     except Exception:
         return float(default)
 
-def _status_infliction(move: Any) -> Optional[Tuple[Status, float]]:
+
+def status_infliction(move: Any) -> Optional[Tuple[Status, float]]:
+    """
+    Returns (status, probability) for the move's major status effect.
+    This is used by the forward model to apply *stochastic* procs.
+    """
     mid = str(getattr(move, "id", "") or getattr(move, "name", "")).lower().replace(" ", "")
 
     # Guaranteed
@@ -50,7 +54,7 @@ def _status_infliction(move: Any) -> Optional[Tuple[Status, float]]:
     if mid in {"thunderwave", "glare", "nuzzle"}:
         return (Status.PAR, 1.0)
 
-    # Common 30% procs (expand as needed)
+    # Common 30% procs
     burn_30 = {"lavaplume", "scald"}
     para_30 = {"bodyslam", "dragonbreath", "forcepalm", "discharge"}
 
@@ -62,32 +66,90 @@ def _status_infliction(move: Any) -> Optional[Tuple[Status, float]]:
     return None
 
 
-def _apply_expected_damage(
+def safe_accuracy(move: Any) -> float:
+    try:
+        acc = float(getattr(move, "accuracy", 1.0) or 1.0)
+    except Exception:
+        acc = 1.0
+    return max(0.0, min(1.0, acc))
+
+
+def apply_damage_with_crit(
+    *,
+    dmg_frac: float,
+    rng: random.Random,
+    model_crit: bool,
+    crit_chance: float,
+    crit_multiplier: float,
+    forced_crit: Optional[bool] = None,
+) -> Tuple[float, bool]:
+    dmg_frac = float(dmg_frac)
+    if not math.isfinite(dmg_frac):
+        dmg_frac = 0.0
+    dmg_frac = max(0.0, dmg_frac)
+
+    if not model_crit:
+        return dmg_frac, False
+    
+    # Check for forced crit outcome (for hybrid expansion)
+    if forced_crit is not None:
+        if forced_crit:
+            dmg_frac *= float(crit_multiplier)
+            return dmg_frac, True
+        else:
+            return dmg_frac, False
+
+    # Normal crit sampling
+    if rng.random() < float(crit_chance):
+        dmg_frac *= float(crit_multiplier)
+        return dmg_frac, True
+
+    return dmg_frac, False
+
+
+def apply_expected_damage(
     state: "ShadowState",
     move: Any,
     attacker: Any,
     defender: Any,
     defender_hp: float,
-) -> float:
+    *,
+    rng: random.Random,
+    hit: bool,
+) -> Tuple[float, bool]:
     """
     Use dmg_fn (estimate_damage_fraction) to get fraction of defender HP removed.
-    We patch statuses during the call so calculate_damage sees BRN/PAR.
-    No manual burn multiplier here (you confirmed calculate_damage handles it).
+    We patch statuses during the call so damage calc sees BRN/PAR.
+
+    Stochastic handling:
+      - if hit=False => no damage
+      - if model_crit => possible crit multiplier
     """
-    if move is None:
-        return defender_hp
+    if move is None or not hit:
+        return float(defender_hp), False
 
     try:
         with state._patched_status():
-            dmg = float(state.dmg_fn(move, attacker, defender, state.battle))
+            dmg_frac = float(state.dmg_fn(move, attacker, defender, state.battle))
     except Exception:
-        dmg = 0.25
+        dmg_frac = 0.25
+    
+    # Check for forced crit (for hybrid expansion)
+    forced_crit = getattr(state, '_forced_crit', None)
 
-    if not math.isfinite(dmg):
-        dmg = 0.25
+    dmg_frac, did_crit = apply_damage_with_crit(
+        dmg_frac=dmg_frac,
+        rng=rng,
+        model_crit=state.model_crit,
+        crit_chance=state.crit_chance,
+        crit_multiplier=state.crit_multiplier,
+        forced_crit=forced_crit,
+    )
 
-    dmg = max(0.0, dmg)
-    return max(0.0, defender_hp - dmg)
+    if did_crit:
+        state = state._log(f"CRIT {getattr(attacker,'species','att')}->{getattr(defender,'species','def')} via {getattr(move,'id','move')}")
+
+    return max(0.0, float(defender_hp) - float(dmg_frac)), did_crit
 
 
 @dataclass(frozen=True)
@@ -117,6 +179,14 @@ class ShadowState:
     opp_tau: float = 8.0
     status_threshold: float = 0.30
 
+    model_miss: bool = True
+    model_crit: bool = True
+    crit_chance: float = 1.0 / 24.0
+    crit_multiplier: float = 1.5
+
+    events: Tuple[str, ...] = ()
+    debug: bool = False
+
     @staticmethod
     def from_battle(
         *,
@@ -128,6 +198,11 @@ class ShadowState:
         dmg_fn: DamageFn,
         opp_tau: float = 8.0,
         status_threshold: float = 0.30,
+        model_miss: bool = True,
+        model_crit: bool = True,
+        crit_chance: float = 1.0 / 24.0,
+        crit_multiplier: float = 1.5,
+        debug: bool = False
     ) -> "ShadowState":
         me = ctx_me.me
         opp = ctx_me.opp
@@ -158,6 +233,11 @@ class ShadowState:
             dmg_fn=dmg_fn,
             opp_tau=opp_tau,
             status_threshold=status_threshold,
+            model_miss=model_miss,
+            model_crit=model_crit,
+            crit_chance=crit_chance,
+            crit_multiplier=crit_multiplier,
+            debug=bool(debug),
         )
 
     @contextmanager
@@ -173,6 +253,28 @@ class ShadowState:
         finally:
             my_p.status = old_my
             opp_p.status = old_opp
+    
+    def with_forced_outcome(self, hit: Optional[bool] = None, crit: Optional[bool] = None) -> "ShadowState":
+        """
+        Return a copy of this state with forced outcomes for the next move.
+        Used by hybrid expansion to create deterministic branches.
+        
+        Args:
+            hit: If set, force the next move to hit (True) or miss (False)
+            crit: If set, force the next move to crit (True) or not crit (False)
+        
+        Returns:
+            New ShadowState with forced outcomes set
+        """
+        new_state = replace(self)
+        
+        # Use object attributes to avoid issues with frozen dataclass
+        if hit is not None:
+            object.__setattr__(new_state, '_forced_hit', hit)
+        if crit is not None:
+            object.__setattr__(new_state, '_forced_crit', crit)
+        
+        return new_state
 
     def my_active_hp(self) -> float:
         return float(self.my_hp.get(id(self.my_active), 1.0))
@@ -190,15 +292,15 @@ class ShadowState:
         return all(v <= 0.0 for v in self.my_hp.values()) or all(v <= 0.0 for v in self.opp_hp.values())
 
     def _effective_speed(self, p: Any, side: str) -> float:
-        s = _base_speed(p)
+        s = base_speed(p)
         st = (self.my_status if side == "me" else self.opp_status).get(id(p))
         if st == Status.PAR:
             s *= 0.5
         return s
 
-    def _order_for_turn(self, my_action: Action, opp_action: Action) -> int:
-        mp = _move_priority(my_action[1]) if my_action[0] == "move" else 0
-        op = _move_priority(opp_action[1]) if opp_action[0] == "move" else 0
+    def _order_for_turn(self, my_action: Action, opp_action: Action, rng: random.Random) -> int:
+        mp = move_priority(my_action[1]) if my_action[0] == "move" else 0
+        op = move_priority(opp_action[1]) if opp_action[0] == "move" else 0
 
         if mp != op:
             return +1 if mp > op else -1
@@ -209,7 +311,8 @@ class ShadowState:
         if ms != os:
             return +1 if ms > os else -1
 
-        return +1 if random.random() < 0.5 else -1
+        # speed tie
+        return +1 if rng.random() < 0.5 else -1
 
     def legal_actions(self) -> List[Action]:
         actions: List[Action] = []
@@ -245,7 +348,7 @@ class ShadowState:
 
         return actions or [("move", None)]
 
-    def choose_opp_action(self) -> Action:
+    def choose_opp_action(self, rng: random.Random) -> Action:
         actions = self.legal_actions_opp()
         scores: List[float] = []
 
@@ -256,10 +359,10 @@ class ShadowState:
                 else:
                     scores.append(float(self.score_switch_fn(o, self.battle, self.ctx_opp)))
 
-        return self._softmax(actions, scores, self.opp_tau)
+        return self._softmax(actions, scores, self.opp_tau, rng)
 
     @staticmethod
-    def _softmax(actions: List[Action], scores: List[float], tau: float) -> Action:
+    def _softmax(actions: List[Action], scores: List[float], tau: float, rng: random.Random) -> Action:
         if not actions:
             return ("move", None)
         if len(actions) == 1:
@@ -271,9 +374,9 @@ class ShadowState:
         total = sum(exps)
 
         if total <= 0.0 or not math.isfinite(total):
-            return random.choice(actions)
+            return rng.choice(actions)
 
-        r = random.random() * total
+        r = rng.random() * total
         acc = 0.0
         for a, e in zip(actions, exps):
             acc += e
@@ -295,22 +398,54 @@ class ShadowState:
 
         return replace(self, my_hp=new_my_hp, opp_hp=new_opp_hp)
 
-    def step(self, my_action: Action) -> "ShadowState":
+    def _sample_hit(self, move: Any, rng: random.Random) -> bool:
+        # Check for forced outcome first (for hybrid expansion)
+        if hasattr(self, '_forced_hit'):
+            return self._forced_hit
+        
+        if not self.model_miss:
+            return True
+        if move is None:
+            return True
+
+        acc = getattr(move, "accuracy", 1.0)
+
+        if acc is None:
+            acc = 1.0
+
+        try:
+            acc = float(acc)
+        except Exception:
+            acc = 1.0
+
+        # handle % vs [0,1]
+        if acc > 1.0:
+            acc /= 100.0
+
+        acc = max(0.0, min(1.0, acc))
+        return rng.random() < acc
+
+
+    def step(self, my_action: Action, *, rng: random.Random) -> "ShadowState":
+        """
+        One full turn transition using the provided RNG stream.
+        This is what makes rollouts stochastic + reproducible.
+        """
         if self.is_terminal():
             return self
 
-        opp_action = self.choose_opp_action()
-        order = self._order_for_turn(my_action, opp_action)
+        opp_action = self.choose_opp_action(rng)
+        order = self._order_for_turn(my_action, opp_action, rng)
 
         s = self
         if order == +1:
-            s = s._apply_my_action(my_action)
+            s = s._apply_my_action(my_action, rng)
             if not s.is_terminal():
-                s = s._apply_opp_action(opp_action)
+                s = s._apply_opp_action(opp_action, rng)
         else:
-            s = s._apply_opp_action(opp_action)
+            s = s._apply_opp_action(opp_action, rng)
             if not s.is_terminal():
-                s = s._apply_my_action(my_action)
+                s = s._apply_my_action(my_action, rng)
 
         # End of full turn
         if not s.is_terminal():
@@ -318,11 +453,11 @@ class ShadowState:
 
         return replace(s, ply=s.ply + 1)
 
-    def _apply_my_action(self, action: Action) -> "ShadowState":
-        return self._apply_my_switch(action[1]) if action[0] == "switch" else self._apply_my_move(action[1])
+    def _apply_my_action(self, action: Action, rng: random.Random) -> "ShadowState":
+        return self._apply_my_switch(action[1]) if action[0] == "switch" else self._apply_my_move(action[1], rng)
 
-    def _apply_opp_action(self, action: Action) -> "ShadowState":
-        return self._apply_opp_switch(action[1]) if action[0] == "switch" else self._apply_opp_move(action[1])
+    def _apply_opp_action(self, action: Action, rng: random.Random) -> "ShadowState":
+        return self._apply_opp_switch(action[1]) if action[0] == "switch" else self._apply_opp_move(action[1], rng)
 
     def _apply_my_switch(self, new_mon: Any) -> "ShadowState":
         if new_mon is None or is_fainted(new_mon):
@@ -352,21 +487,38 @@ class ShadowState:
 
         return replace(self, my_active=new_mon, ctx_me=ctx_me, ctx_opp=ctx_opp)
 
-    def _apply_my_move(self, move: Any) -> "ShadowState":
-        new_hp = dict(self.opp_hp)
-        new_hp[id(self.opp_active)] = _apply_expected_damage(
-            self, move, self.my_active, self.opp_active, self.opp_active_hp()
+    def _apply_my_move(self, move: Any, rng: random.Random) -> "ShadowState":
+        s = self
+        hit = s._sample_hit(move, rng)
+
+        if not hit:
+            s = s._log(f"MISS me:{getattr(move,'id','move')}")
+
+        new_hp = dict(s.opp_hp)
+        new_hp[id(s.opp_active)], did_crit = apply_expected_damage(
+            s, move, s.my_active, s.opp_active, s.opp_active_hp(), rng=rng, hit=hit
         )
-        s = replace(self, opp_hp=new_hp)
+        s = replace(s, opp_hp=new_hp)
 
-        s = s._maybe_apply_status(move, "opp", s.opp_active)
+        if did_crit:
+            s = s._log(f"CRIT me:{getattr(move,'id','move')}")
 
-        if _is_pivot_move(move):
+        if hit:
+            s = s._maybe_apply_status(move, "opp", s.opp_active, rng)
+
+        if is_pivot_move(move) and hit:
             target = s._best_my_switch()
             if target is not None:
                 s = s._apply_my_switch(target)
+        
+        # Clear forced outcomes after use (for hybrid expansion)
+        if hasattr(s, '_forced_hit'):
+            object.__delattr__(s, '_forced_hit')
+        if hasattr(s, '_forced_crit'):
+            object.__delattr__(s, '_forced_crit')
 
         return s
+
 
     def _apply_opp_switch(self, new_mon: Any) -> "ShadowState":
         if new_mon is None or is_fainted(new_mon):
@@ -395,29 +547,44 @@ class ShadowState:
 
         return replace(self, opp_active=new_mon, ctx_opp=ctx_opp, ctx_me=ctx_me)
 
-    def _apply_opp_move(self, move: Any) -> "ShadowState":
-        new_hp = dict(self.my_hp)
-        new_hp[id(self.my_active)] = _apply_expected_damage(
-            self, move, self.opp_active, self.my_active, self.my_active_hp()
+    def _apply_opp_move(self, move: Any, rng: random.Random) -> "ShadowState":
+        s = self
+        hit = s._sample_hit(move, rng)
+
+        if not hit:
+            s = s._log(f"MISS opp:{getattr(move,'id','move')}")
+
+        new_hp = dict(s.my_hp)
+        new_hp[id(s.my_active)], did_crit = apply_expected_damage(
+            s, move, s.opp_active, s.my_active, s.my_active_hp(), rng=rng, hit=hit
         )
-        s = replace(self, my_hp=new_hp)
+        s = replace(s, my_hp=new_hp)
 
-        s = s._maybe_apply_status(move, "me", s.my_active)
+        if did_crit:
+            s = s._log(f"CRIT opp:{getattr(move,'id','move')}")
 
-        if _is_pivot_move(move):
+        if hit:
+            s = s._maybe_apply_status(move, "me", s.my_active, rng)
+
+        if is_pivot_move(move) and hit:
             target = s._best_opp_switch()
             if target is not None:
                 s = s._apply_opp_switch(target)
 
         return s
 
-    def _maybe_apply_status(self, move: Any, side: str, defender: Any) -> "ShadowState":
-        info = _status_infliction(move)
+
+    def _maybe_apply_status(self, move: Any, side: str, defender: Any, rng: random.Random) -> "ShadowState":
+        info = status_infliction(move)
         if not info:
             return self
 
         st, prob = info
         if prob < self.status_threshold:
+            return self
+
+        # stochastic proc
+        if prob < 1.0 and rng.random() >= float(prob):
             return self
 
         if side == "me":
@@ -454,3 +621,8 @@ class ShadowState:
                 if sc > val:
                     best, val = p, sc
         return best
+    
+    def _log(self, msg: str) -> "ShadowState":
+        if not getattr(self, "debug", False):
+            return self
+        return replace(self, events=self.events + (msg,))
