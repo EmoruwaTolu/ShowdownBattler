@@ -41,7 +41,6 @@ def create_mock_pokemon(
     mon.species = species
     mon.base_species = species
     
-    # Stats (REQUIRED: must be int/float, not None)
     if stats is None:
         stats = {
             'hp': 150,
@@ -53,6 +52,8 @@ def create_mock_pokemon(
         }
     mon.stats = stats
     
+    mon.base_stats = stats.copy()  # Use same values for simplicity
+    
     # Boosts (REQUIRED)
     if boosts is None:
         boosts = {'atk': 0, 'def': 0, 'spa': 0, 'spd': 0, 'spe': 0, 'accuracy': 0, 'evasion': 0}
@@ -61,11 +62,12 @@ def create_mock_pokemon(
     # HP
     mon.current_hp_fraction = hp_frac
     mon.max_hp = stats.get('hp', 150)
+    mon.current_hp = int(mon.max_hp * hp_frac)  # Add this for damage calc!
     
-    # Level (REQUIRED)
+    # Level
     mon.level = level
     
-    # Types (REQUIRED: must have type_1, type_2, and types list)
+    # Types
     if len(types) >= 1:
         mon.type_1 = types[0]
         mon.type_2 = types[1] if len(types) > 1 else None
@@ -103,11 +105,17 @@ def create_mock_pokemon(
     mon.moves = {}
     
     # Add identifier method (REQUIRED for calculate_damage)
-    def get_identifier(role):
-        return identifier
+    # The damage calculator calls pokemon.identifier(role) where role is "p1" or "p2"
+    # It expects this to return something like "p1: Garchomp"
+    mon._identifier_string = identifier
+    
+    def get_identifier(role=None):
+        # If called with no arguments or with a role, return the identifier
+        return mon._identifier_string
+    
     mon.identifier = get_identifier
     
-    # Add _data attribute for eviolite check (prevents crashes)
+    # Add _data attribute for eviolite check
     mon._data = Mock()
     mon._data.pokedex = {species: {"evos": []}}
     
@@ -141,7 +149,7 @@ def create_mock_move(
     move.accuracy = accuracy
     move.priority = priority
     
-    # PP (REQUIRED: must be int, not Mock)
+    # PP (REQUIRED)
     move.current_pp = 16
     move.max_pp = 16
     
@@ -188,7 +196,7 @@ def create_mock_battle(
     """
     battle = Mock(spec=Battle)
     
-    # Teams (REQUIRED: calculate_damage uses these)
+    # Teams (REQUIRED calculate_damage uses these)
     battle.team = team
     battle.opponent_team = opponent_team
     
@@ -196,12 +204,20 @@ def create_mock_battle(
     battle.active_pokemon = active
     battle.opponent_active_pokemon = opponent
     
+    # Also set these alternate names (damage calc might use different names)
+    battle.player_active_pokemon = active
+    
+    # Set active role (damage calc might check this)
+    battle.player_username = "Player1"
+    battle.opponent_username = "Player2"
+    
     # Roles (REQUIRED)
     battle.player_role = "p1"
     battle.opponent_role = "p2"
     
-    # All active (REQUIRED for ability checks)
-    battle.all_active_pokemons = [active, opponent]
+    # All active (REQUIRED)
+    # Make sure both Pokemon are actually in the list and not None
+    battle.all_active_pokemons = [p for p in [active, opponent] if p is not None]
     
     # Fields, weather, conditions (REQUIRED)
     battle.fields = {}
@@ -219,11 +235,15 @@ def create_mock_battle(
     
     # get_pokemon method (REQUIRED for calculate_damage)
     def get_pokemon(identifier: str):
-        """Look up Pokemon by identifier"""
+        """Look up Pokemon by identifier - with detailed error logging"""
         if identifier in team:
             return team[identifier]
         elif identifier in opponent_team:
             return opponent_team[identifier]
+        # If not found, this is a problem - log it
+        print(f"WARNING: get_pokemon() called with unknown identifier: '{identifier}'")
+        print(f"  Available in team: {list(team.keys())}")
+        print(f"  Available in opponent_team: {list(opponent_team.keys())}")
         return None
     
     battle.get_pokemon = get_pokemon
@@ -231,10 +251,13 @@ def create_mock_battle(
     # is_grounded method (REQUIRED for some move calcs)
     def is_grounded(pokemon):
         """Check if Pokemon is grounded"""
+        if pokemon is None:
+            return True
         # Simple check: Flying types aren't grounded
-        if PokemonType.FLYING in pokemon.types:
+        types = getattr(pokemon, 'types', [])
+        if PokemonType.FLYING in types:
             return False
-        if pokemon.ability == "levitate":
+        if getattr(pokemon, 'ability', None) == "levitate":
             return False
         return True
     
@@ -246,7 +269,6 @@ def create_garchomp_rotom_scenario():
     """
     Garchomp vs Rotom-Wash - test real damage calculations
     """
-    # Create Garchomp with proper stats
     garchomp = create_mock_pokemon(
         species="Garchomp",
         identifier="p1: Garchomp",
@@ -279,10 +301,9 @@ def create_garchomp_rotom_scenario():
             'spd': 147,
             'spe': 126,
         },
-        # ability="levitate",
+        ability="levitate",
     )
-    
-    # Create moves with proper attributes
+
     earthquake = create_mock_move(
         "earthquake",
         MoveCategory.PHYSICAL,
@@ -324,7 +345,6 @@ def create_garchomp_rotom_scenario():
     
     rotom.moves = {"hydropump": hydropump}
     
-    # Create battle with proper team structure
     team = {"p1: Garchomp": garchomp}
     opp_team = {"p2: Rotom": rotom}
     
@@ -365,7 +385,7 @@ def test_1_damage_calculator():
             return False
     
     print()
-    print("✅ Damage calculator works with mocks!")
+    print("Damage calculator works with mocks!")
     return True
 
 def test_2_real_heuristics():
@@ -399,10 +419,10 @@ def test_2_real_heuristics():
     if scores:
         best_move = max(scores, key=scores.get)
         print(f"Best move: {best_move} (score: {scores[best_move]:.2f})")
-        print("✅ Real heuristics work!")
+        print("Real heuristics work!")
         return True
     else:
-        print("❌ No scores computed")
+        print("No scores computed")
         return False
 
 def test_3_mcts_real_heuristics():
@@ -451,11 +471,11 @@ def test_3_mcts_real_heuristics():
             print(f"     Visits: {action_stats['visits']}, Q: {action_stats['q']:+.3f}")
         
         print()
-        print("✅ MCTS works with real heuristics!")
+        print("MCTS works with real heuristics!")
         return True
         
     except Exception as e:
-        print(f"❌ MCTS failed: {e}")
+        print(f"MCTS failed: {e}")
         import traceback
         traceback.print_exc()
         return False
@@ -468,7 +488,6 @@ def test_4_hybrid_expansion():
     print("TEST 4: HYBRID EXPANSION WITH REAL HEURISTICS")
     print("=" * 80)
     
-    # Create Stone Edge scenario
     garchomp = create_mock_pokemon(
         species="Garchomp",
         identifier="p1: Garchomp",
@@ -516,7 +535,6 @@ def test_4_hybrid_expansion():
     )
     
     print("Stone Edge (80% acc, 4x vs Fire/Flying)")
-    print()
     
     try:
         picked, stats = search(
@@ -534,7 +552,7 @@ def test_4_hybrid_expansion():
         
         root = stats['root']
         
-        print(f"Branches: {len(root.children)}")
+        print(f"\nBranches: {len(root.children)}")
         print()
         
         for action, child in root.children.items():
@@ -542,11 +560,11 @@ def test_4_hybrid_expansion():
             print(f"  {outcome:12s}: N={child.N:3d}, Q={child.Q:+.3f}, P={child.prior:.4f}")
         
         print()
-        print("✅ Hybrid expansion works with real heuristics!")
+        print("Hybrid expansion works with real heuristics!")
         return True
         
     except Exception as e:
-        print(f"❌ Failed: {e}")
+        print(f"Failed: {e}")
         import traceback
         traceback.print_exc()
         return False
@@ -569,7 +587,7 @@ def run_all_tests():
         try:
             results[name] = test_fn()
         except Exception as e:
-            print(f"\n❌ {name} FAILED: {e}")
+            print(f"\n{name} FAILED: {e}")
             import traceback
             traceback.print_exc()
             results[name] = False
@@ -582,14 +600,14 @@ def run_all_tests():
     total = len(results)
     
     for name, result in results.items():
-        status = "✅" if result else "❌"
+        status = "Yes" if result else "No"
         print(f"  {status} {name}")
     
     print()
     print(f"Passed: {passed}/{total}")
     
     if passed == total:
-        print("\n🎉 SUCCESS! Your real heuristics work with hybrid MCTS!")
+        print("\nSUCCESS! Your real heuristics work with hybrid MCTS!")
     
     return results
 
