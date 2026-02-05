@@ -129,6 +129,7 @@ def create_mock_move(
     base_power: int = 0,
     accuracy: float = 1.0,
     priority: int = 0,
+    crit_ratio: int = 0,  # NEW: Add crit_ratio parameter
 ) -> Any:
     """
     Create a Move mock that works with calculate_damage.
@@ -138,6 +139,7 @@ def create_mock_move(
     - Must have n_hit tuple
     - Must have all damage-related attributes
     - Must have current_pp and max_pp as integers
+    - Must have crit_ratio as integer
     """
     move = Mock(spec=Move)
     
@@ -148,6 +150,7 @@ def create_mock_move(
     move.base_power = base_power
     move.accuracy = accuracy
     move.priority = priority
+    move.crit_ratio = crit_ratio  # NEW: Set crit_ratio
     
     # PP (REQUIRED)
     move.current_pp = 16
@@ -159,6 +162,7 @@ def create_mock_move(
         'basePower': base_power,
         'type': move_type.name,
         'category': category.name,
+        'critRatio': crit_ratio,  # Also add to entry dict
     }
     
     # Multi-hit (REQUIRED)
@@ -309,7 +313,8 @@ def create_garchomp_rotom_scenario():
         MoveCategory.PHYSICAL,
         PokemonType.GROUND,
         base_power=100,
-        accuracy=1.0
+        accuracy=1.0,
+        crit_ratio=0,  # Normal crit rate
     )
     earthquake.entry['flags'] = {}
     
@@ -318,7 +323,8 @@ def create_garchomp_rotom_scenario():
         MoveCategory.PHYSICAL,
         PokemonType.DRAGON,
         base_power=120,
-        accuracy=1.0
+        accuracy=1.0,
+        crit_ratio=0,  # Normal crit rate
     )
     
     stoneedge = create_mock_move(
@@ -326,7 +332,8 @@ def create_garchomp_rotom_scenario():
         MoveCategory.PHYSICAL,
         PokemonType.ROCK,
         base_power=100,
-        accuracy=0.8
+        accuracy=0.8,
+        crit_ratio=2,  # High crit rate (50%)
     )
     
     garchomp.moves = {
@@ -340,7 +347,8 @@ def create_garchomp_rotom_scenario():
         MoveCategory.SPECIAL,
         PokemonType.WATER,
         base_power=110,
-        accuracy=0.8
+        accuracy=0.8,
+        crit_ratio=0,  # Normal crit rate
     )
     
     rotom.moves = {"hydropump": hydropump}
@@ -506,10 +514,10 @@ def test_4_hybrid_expansion():
         stats={'hp': 165, 'atk': 120, 'def': 110, 'spa': 145, 'spd': 105, 'spe': 110},
     )
     
-    stoneedge = create_mock_move("stoneedge", MoveCategory.PHYSICAL, PokemonType.ROCK, 100, 0.8)
+    stoneedge = create_mock_move("stoneedge", MoveCategory.PHYSICAL, PokemonType.ROCK, 100, 0.8, crit_ratio=2)
     garchomp.moves = {"stoneedge": stoneedge}
     
-    flamethrower = create_mock_move("flamethrower", MoveCategory.SPECIAL, PokemonType.FIRE, 90, 1.0)
+    flamethrower = create_mock_move("flamethrower", MoveCategory.SPECIAL, PokemonType.FIRE, 90, 1.0, crit_ratio=0)
     moltres.moves = {"flamethrower": flamethrower}
     
     team = {"p1: Garchomp": garchomp}

@@ -155,6 +155,17 @@ def get_move_accuracy(move_name: str, gen_data) -> float:
     
     return float(accuracy) / 100.0
 
+
+def get_move_crit_ratio(move_name: str, gen_data) -> int:
+    """Get crit ratio for a move from GenData."""
+    move_info = get_move_info(move_name, gen_data)
+    
+    if not move_info:
+        return 0
+    
+    # critRatio field: 0 (normal), 1 (Focus Energy), 2 (high crit moves), 3+ (always crit)
+    return move_info.get("critRatio", 0)
+
 def create_pokemon_from_randbats(species_name: str, data: Dict, gen_data, role_name: str = None) -> Any:
     """
     Create a mock Pokemon from RandBats data using GenData for accurate info.
@@ -227,13 +238,15 @@ def create_pokemon_from_randbats(species_name: str, data: Dict, gen_data, role_n
         move_cat = get_move_category(move_name, gen_data)
         move_power = get_move_power(move_name, gen_data)
         move_acc = get_move_accuracy(move_name, gen_data)
+        move_crit = get_move_crit_ratio(move_name, gen_data)  # NEW: Get crit ratio
         
         move = create_mock_move(
             move_id=move_id,
             category=move_cat,
             move_type=move_type,
             base_power=move_power,
-            accuracy=move_acc
+            accuracy=move_acc,
+            crit_ratio=move_crit,  # NEW: Pass crit ratio
         )
         
         moves_dict[move_id] = move

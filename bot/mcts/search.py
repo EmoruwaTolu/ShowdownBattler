@@ -34,7 +34,7 @@ class MCTSConfig:
     # Hybrid expansion (explicit branching for critical moves)
     use_hybrid_expansion: bool = False  # Start disabled
     branch_low_accuracy: bool = True
-    low_accuracy_threshold: float = 0.85
+    low_accuracy_threshold: float = 0.85 # Threshold for considering miss branching
     branch_potential_ohko: bool = True
     ohko_threshold: float = 0.80
     branch_crit_matters: bool = True
