@@ -44,25 +44,37 @@ def base_speed(p: Any, default: int = 80) -> float:
 def status_infliction(move: Any) -> Optional[Tuple[Status, float]]:
     """
     Returns (status, probability) for the move's major status effect.
-    This is used by the forward model to apply *stochastic* procs.
+    
+    First checks move.status for guaranteed status (e.g., Will-O-Wisp).
+    Then checks move.secondary for secondary effect status (e.g., Sacred Fire).
     """
-    mid = str(getattr(move, "id", "") or getattr(move, "name", "")).lower().replace(" ", "")
-
-    # Guaranteed
-    if mid == "willowisp":
-        return (Status.BRN, 1.0)
-    if mid in {"thunderwave", "glare", "nuzzle"}:
-        return (Status.PAR, 1.0)
-
-    # Common 30% procs
-    burn_30 = {"lavaplume", "scald"}
-    para_30 = {"bodyslam", "dragonbreath", "forcepalm", "discharge"}
-
-    if mid in burn_30:
-        return (Status.BRN, 0.30)
-    if mid in para_30:
-        return (Status.PAR, 0.30)
-
+    
+    # Check for guaranteed status (move.status)
+    status = getattr(move, 'status', None)
+    if status:
+        if isinstance(status, Status):
+            return (status, 1.0)
+        elif isinstance(status, str):
+            try:
+                return (Status[status.upper()], 1.0)
+            except:
+                pass
+    
+    # Check for secondary effect status (move.secondary)
+    secondary = getattr(move, 'secondary', None)
+    if secondary and isinstance(secondary, list):
+        for sec in secondary:
+            if isinstance(sec, dict):
+                status_str = sec.get('status')
+                chance = sec.get('chance', 0)
+                
+                if status_str and chance > 0:
+                    try:
+                        status_enum = Status[status_str.upper()]
+                        return (status_enum, chance / 100.0)
+                    except:
+                        pass
+    
     return None
 
 

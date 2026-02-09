@@ -177,7 +177,6 @@ def create_mock_move(
     move.ignore_defensive = False
     move.target = None
     move.recoil = None
-    move.secondary = None
     move.is_stellar_first_use = False
     move.flags = {}
     

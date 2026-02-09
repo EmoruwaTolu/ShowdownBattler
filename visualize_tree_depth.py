@@ -21,9 +21,14 @@ from test_real_heuristics import (
 )
 
 
-def visualize_tree_depth(root, max_depth=4):
+def visualize_tree_depth(root, max_depth=4, show_opponent_moves=False):
     """
     Visualize the MCTS tree showing depth and states.
+    
+    Args:
+        root: Root node of MCTS tree
+        max_depth: Maximum depth to visualize
+        show_opponent_moves: If True, show detailed opponent move analysis
     """
     print("\n" + "=" * 80)
     print("MCTS TREE DEPTH VISUALIZATION")
@@ -39,10 +44,25 @@ def visualize_tree_depth(root, max_depth=4):
         my_hp = state.my_active_hp()
         opp_hp = state.opp_active_hp()
         
+        # Get status
+        my_status = state.my_active_status()
+        opp_status = state.opp_active_status()
+        
         my_species = getattr(me, 'species', 'Unknown')
         opp_species = getattr(opp, 'species', 'Unknown')
         
-        return f"{my_species} {my_hp:.2f} vs {opp_species} {opp_hp:.2f}"
+        # Format with status if present
+        my_str = f"{my_species} {my_hp:.2f}"
+        if my_status:
+            status_name = str(my_status).split('.')[-1].lower()
+            my_str += f"({status_name[:3]})"
+        
+        opp_str = f"{opp_species} {opp_hp:.2f}"
+        if opp_status:
+            status_name = str(opp_status).split('.')[-1].lower()
+            opp_str += f"({status_name[:3]})"
+        
+        return f"{my_str} vs {opp_str}"
     
     def count_nodes_at_depth(node, current_depth, max_depth, counts):
         """Count nodes at each depth level"""
@@ -125,7 +145,131 @@ def visualize_tree_depth(root, max_depth=4):
     print()
     print_tree_recursive(root, 0, "", True, max_depth, show_states=True)
     
+    # If requested, show detailed opponent move analysis
+    if show_opponent_moves:
+        print_opponent_move_analysis(root)
+    
     return depth_counts
+
+
+def print_opponent_move_analysis(root):
+    """
+    Print detailed analysis of opponent moves for each of our moves.
+    """
+    print("\n" + "=" * 80)
+    print("DETAILED OPPONENT MOVE ANALYSIS")
+    print("=" * 80)
+    
+    # Get all our moves from root children
+    our_moves = []
+    for action, child in root.children.items():
+        if action[0] == 'move':
+            move_name = getattr(action[1], 'id', 'unknown')
+            our_moves.append((move_name, action, child))
+    
+    # Sort by visits
+    our_moves.sort(key=lambda x: x[2].N, reverse=True)
+    
+    for move_name, our_action, our_node in our_moves:
+        print(f"\n{'='*80}")
+        print(f"After we use: {move_name.upper()}")
+        print(f"{'='*80}")
+        print(f"Visits: {our_node.N:4d} ({our_node.N/root.N*100:5.1f}%)")
+        print(f"Q-value: {our_node.Q:+.3f}")
+        print(f"Prior: {our_node.prior:.4f}")
+        
+        # State after our move
+        try:
+            state = our_node.state
+            print(f"\nState after {move_name}:")
+            print(f"  Us:       {state.my_active.species} at {state.my_active_hp():.2f} HP", end="")
+            my_status = state.my_active_status()
+            if my_status:
+                print(f" ({my_status})", end="")
+            print()
+            
+            print(f"  Opponent: {state.opp_active.species} at {state.opp_active_hp():.2f} HP", end="")
+            opp_status = state.opp_active_status()
+            if opp_status:
+                print(f" ({opp_status})", end="")
+            print()
+        except Exception as e:
+            print(f"  [Error getting state: {e}]")
+        
+        # Check if terminal
+        if not our_node.children:
+            if our_node.state.is_terminal():
+                print(f"\n  → Terminal state (game over)")
+            else:
+                print(f"\n  → Not expanded (only {our_node.N} visit{'s' if our_node.N != 1 else ''})")
+            continue
+        
+        # Opponent's responses
+        print(f"\n  Opponent's Responses ({len(our_node.children)} moves explored):")
+        print(f"  {'-'*76}")
+        
+        opp_moves = sorted(
+            our_node.children.items(),
+            key=lambda x: x[1].N,
+            reverse=True
+        )
+        
+        for i, (opp_action, opp_node) in enumerate(opp_moves[:5], 1):
+            opp_move_name = getattr(opp_action[1], 'id', 'unknown')
+            opp_visits = opp_node.N
+            opp_pct = (opp_visits / our_node.N * 100) if our_node.N > 0 else 0
+            
+            print(f"\n  {i}. {opp_move_name}")
+            print(f"     Explored: {opp_visits:4d} times ({opp_pct:5.1f}%)")
+            print(f"     Q-value: {opp_node.Q:+.3f}")
+            
+            # Result state
+            try:
+                result_state = opp_node.state
+                print(f"     Result:")
+                
+                # Our status
+                our_hp = result_state.my_active_hp()
+                our_status = result_state.my_active_status()
+                print(f"       Us:       {result_state.my_active.species} at {our_hp:.2f} HP", end="")
+                if our_status:
+                    print(f" ({our_status})", end="")
+                if our_hp <= 0:
+                    print(" ← FAINTED!", end="")
+                print()
+                
+                # Opponent status
+                opp_hp = result_state.opp_active_hp()
+                opp_status_result = result_state.opp_active_status()
+                print(f"       Opponent: {result_state.opp_active.species} at {opp_hp:.2f} HP", end="")
+                if opp_status_result:
+                    print(f" ({opp_status_result})", end="")
+                if opp_hp <= 0:
+                    print(" ← FAINTED!", end="")
+                print()
+                
+                # Show if status changed
+                if opp_status_result and not opp_status:
+                    print(f"       → Opponent got {opp_status_result}!")
+                if our_status and not my_status:
+                    print(f"       → We got {our_status}!")
+                
+            except Exception as e:
+                print(f"     [Error: {e}]")
+            
+            # Show our follow-ups if explored
+            if opp_node.children and i <= 2:  # Only show for top 2 opponent moves
+                followups = sorted(
+                    opp_node.children.items(),
+                    key=lambda x: x[1].N,
+                    reverse=True
+                )[:3]
+                
+                if followups:
+                    print(f"     Our follow-ups:")
+                    for followup_action, followup_node in followups:
+                        followup_name = getattr(followup_action[1], 'id', 'unknown')
+                        print(f"       • {followup_name}: {followup_node.N} visits, Q={followup_node.Q:+.3f}")
 
 
 def test_basic_tree():
@@ -198,9 +342,9 @@ def test_basic_tree():
         return_tree=True,
     )
     
-    # Visualize tree
+    # Visualize tree WITH opponent move analysis
     root = stats['root']
-    depth_counts = visualize_tree_depth(root, max_depth=3)
+    depth_counts = visualize_tree_depth(root, max_depth=3, show_opponent_moves=True)
     
     print("\n" + "=" * 80)
     print("ANALYSIS")

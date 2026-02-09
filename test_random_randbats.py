@@ -181,6 +181,21 @@ def get_move_status(move_name: str, gen_data) -> Optional[Status]:
         return Status[status_str.upper()]
     except (KeyError, AttributeError):
         return None
+    
+def get_move_secondary(move_name: str, gen_data) -> Optional[list]:
+    """Get secondary effects for a move."""
+    move_info = get_move_info(move_name, gen_data)
+    if not move_info:
+        return None
+    
+    secondary = move_info.get("secondary", None)
+    if not secondary:
+        return None
+    
+    if not isinstance(secondary, list):
+        secondary = [secondary]
+    
+    return secondary
 
 def create_pokemon_from_randbats(species_name: str, data: Dict, gen_data, role_name: str = None) -> Any:
     """
@@ -256,6 +271,7 @@ def create_pokemon_from_randbats(species_name: str, data: Dict, gen_data, role_n
         move_acc = get_move_accuracy(move_name, gen_data)
         move_crit = get_move_crit_ratio(move_name, gen_data)
         move_status = get_move_status(move_name, gen_data)
+        move_secondary = get_move_secondary(move_name, gen_data)
         
         move = create_mock_move(
             move_id=move_id,
@@ -264,7 +280,8 @@ def create_pokemon_from_randbats(species_name: str, data: Dict, gen_data, role_n
             base_power=move_power,
             accuracy=move_acc,
             crit_ratio=move_crit,
-            status=move_status
+            status=move_status,
+            secondary=move_secondary,
         )
         
         moves_dict[move_id] = move
