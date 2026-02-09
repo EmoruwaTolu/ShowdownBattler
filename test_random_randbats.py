@@ -5,10 +5,10 @@ import random
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from typing import Dict, Any, List
+from typing import Dict, Any, List, Optional
 from unittest.mock import Mock
 
-from poke_env.battle import MoveCategory, PokemonType
+from poke_env.battle import MoveCategory, PokemonType, Status
 from poke_env.data import to_id_str, GenData
 from bot.model.ctx import EvalContext
 from bot.mcts.search import search, MCTSConfig
@@ -166,6 +166,22 @@ def get_move_crit_ratio(move_name: str, gen_data) -> int:
     # critRatio field: 0 (normal), 1 (Focus Energy), 2 (high crit moves), 3+ (always crit)
     return move_info.get("critRatio", 0)
 
+def get_move_status(move_name: str, gen_data) -> Optional[Status]:
+    """Get status effect for a move from GenData."""
+    move_info = get_move_info(move_name, gen_data)
+    
+    if not move_info:
+        return None
+    
+    status_str = move_info.get("status", None)
+    if not status_str:
+        return None
+    
+    try:
+        return Status[status_str.upper()]
+    except (KeyError, AttributeError):
+        return None
+
 def create_pokemon_from_randbats(species_name: str, data: Dict, gen_data, role_name: str = None) -> Any:
     """
     Create a mock Pokemon from RandBats data using GenData for accurate info.
@@ -183,7 +199,7 @@ def create_pokemon_from_randbats(species_name: str, data: Dict, gen_data, role_n
     if role_name and role_name in roles:
         role = roles[role_name]
     else:
-        role_name = list(roles.keys())[0]
+        role_name = random.choice(list(roles.keys())) # randomly choosing one of the roles from the json
         role = roles[role_name]
     
     # Get moves from role
@@ -238,7 +254,8 @@ def create_pokemon_from_randbats(species_name: str, data: Dict, gen_data, role_n
         move_cat = get_move_category(move_name, gen_data)
         move_power = get_move_power(move_name, gen_data)
         move_acc = get_move_accuracy(move_name, gen_data)
-        move_crit = get_move_crit_ratio(move_name, gen_data)  # NEW: Get crit ratio
+        move_crit = get_move_crit_ratio(move_name, gen_data)
+        move_status = get_move_status(move_name, gen_data)
         
         move = create_mock_move(
             move_id=move_id,
@@ -246,13 +263,22 @@ def create_pokemon_from_randbats(species_name: str, data: Dict, gen_data, role_n
             move_type=move_type,
             base_power=move_power,
             accuracy=move_acc,
-            crit_ratio=move_crit,  # NEW: Pass crit ratio
+            crit_ratio=move_crit,
+            status=move_status
         )
         
         moves_dict[move_id] = move
     
     mon.moves = moves_dict
-    
+
+    print(f"\n=== DIAGNOSTIC: {species_name} ===")
+    print(f"JSON level: {level}")
+    print(f"mon.level: {mon.level}")
+    print(f"Base HP: {base_stats['hp']}")
+    print(f"mon.stats['hp']: {mon.stats['hp']}")
+    print(f"Expected at L{level}: {calculate_hp(base_stats['hp'], level)}")
+    print(f"Expected at L50: {calculate_hp(base_stats['hp'], 50)}")
+        
     return mon, role_name, selected_moves, ability, item
 
 def test_random_randbats_matchup():

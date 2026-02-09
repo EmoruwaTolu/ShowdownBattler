@@ -1,12 +1,10 @@
 from typing import Any, Optional
 import math
 
-# poke-env 0.11.0 imports - classes are in poke_env.battle module
 from poke_env.battle import MoveCategory
 from poke_env.battle import Status
 from poke_env.battle import PokemonType
 
-# Try to import damage calculator (available in poke-env 0.10.0+)
 try:
     from poke_env.calc.damage_calc_gen9 import calculate_damage
     HAS_DAMAGE_CALC = True
@@ -18,151 +16,101 @@ except ImportError:
 from bot.model.ctx import EvalContext
 from bot.scoring.helpers import (
     hp_frac,
-    remaining_count,
     safe_types,
-    looks_like_setup_sweeper,
     is_slower,
-    physical_probability,
-    ally_has_priority,
-    ally_is_frail,
 )
-from bot.scoring.damage_score import estimate_damage_fraction
-from bot.model.opponent_model import get_opponent_set_distribution
-from bot.scoring.race import evaluate_race_for_move
 from bot.scoring.pressure import estimate_opponent_pressure
 
-# Base status values (intrinsic power of each status)
-BASE_STATUS_SLEEP = 55.0
-BASE_STATUS_PARALYSIS = 40.0
-BASE_STATUS_BURN = 38.0
-BASE_STATUS_POISON = 32.0
-BASE_STATUS_DEFAULT = 20.0
-
-# Burn chip damage (1/16 HP per turn)
-BURN_CHIP_PER_TURN = 1.0 / 16.0
-BURN_CHIP_VALUE_MULTIPLIER = 85.0
-
-# Miss cost base and scaling
-MISS_COST_BASE = 18.0
-MISS_COST_DAMAGED_SCALE = 18.0
-MISS_COST_SLOWER_PENALTY = 8.0
-MISS_COST_BOOSTED_OPP_PENALTY = 10.0
-MISS_COST_VALUE_SCALE = 0.20  # Miss cost scales 20% with status value
-
-# Tempo risk
-TEMPO_RISK_BASE = 12.0
-TEMPO_RISK_DAMAGED_SCALE = 18.0
-TEMPO_RISK_SLOWER_PENALTY = 6.0
-TEMPO_RISK_BOOSTED_OPP_PENALTY = 6.0
-
-# Race state modifiers (now scale with race degree)
-RACE_BASE_MODIFIER = 18.0  # Base amount for slight win/loss
-
-# Team synergy
-SYNERGY_WINCON_SETUP_MULT = 1.35
-SYNERGY_WINCON_BULK_MULT = 1.10
-SYNERGY_SECOND_BEST_WEIGHT = 0.5
-
-def move_inflicts_major_status(move: Any) -> Optional[Status]:
-    st = getattr(move, "status", None)
-    return st if st is not None else None
-
-def already_has_major_status(opp: Any) -> bool:
-    try:
-        return getattr(opp, "status", None) is not None
-    except Exception:
-        return False
-
-def major_status_is_applicable(status: Status, move: Any, opp: Any) -> bool:
-    if opp is None:
-        return False
-
-    if getattr(opp, "status", None) is not None:
-        return False
-
+def status_is_applicable(status: Status, move: Any, opp: Any) -> bool:
+    """
+    Check if status can be applied (type immunities).
+    
+    Returns False if:
+    - Fire-type vs Burn
+    - Electric-type vs Paralysis
+    - Steel/Poison-type vs Poison
+    - Ground-type vs Thunder Wave (if not Mold Breaker)
+    """
     opp_types = safe_types(opp)
-
+    
     if status == Status.BRN:
-        if PokemonType.FIRE in opp_types:
-            return False
-    elif status in (Status.PSN, Status.TOX):
-        if PokemonType.STEEL in opp_types or PokemonType.POISON in opp_types:
-            return False
+        return PokemonType.FIRE not in opp_types
+    
     elif status == Status.PAR:
         if PokemonType.ELECTRIC in opp_types:
             return False
-        if getattr(move, "type", None) == PokemonType.ELECTRIC:
+        
+        # Thunder Wave specifically blocked by Ground
+        if getattr(move, 'type', None) == PokemonType.ELECTRIC:
             if PokemonType.GROUND in opp_types:
-                ignore = getattr(move, "ignore_immunity", False)
-                if not ignore:
-                    return False
-
+                # Check for Mold Breaker/immunity-ignoring effect
+                ignore_immunity = getattr(move, 'ignore_immunity', False)
+                return ignore_immunity
+        
+        return True
+    
+    elif status in (Status.PSN, Status.TOX):
+        return (PokemonType.STEEL not in opp_types and 
+                PokemonType.POISON not in opp_types)
+    
+    # Sleep, Freeze have no type immunities
     return True
 
-
-def _best_damage_move(battle: Any) -> Optional[Any]:
-    best = None
-    best_exp = -1.0
-    for mv in getattr(battle, "available_moves", []) or []:
-        if getattr(mv, "category", None) == MoveCategory.STATUS:
-            continue
-        acc = float(getattr(mv, "accuracy", 1.0) or 1.0)
-        acc = max(0.0, min(1.0, acc))
-        exp = float(getattr(mv, "base_power", 0) or 0) * acc
-        if exp > best_exp:
-            best_exp = exp
-            best = mv
-    return best
-
-
-def _race_state_if_we_just_attack(battle: Any, ctx: EvalContext) -> str:
-    mv = _best_damage_move(battle)
-    if mv is None:
-        return "CLOSE"
-    return evaluate_race_for_move(battle, ctx, mv).state
-
-
-def status_miss_cost(battle: Any, ctx: EvalContext, pressure, status_value: float, accuracy: float) -> float:
+def get_base_status_value(status: Status, me: Any, opp: Any, ctx: EvalContext) -> float:
     """
-    Cost of missing a status move (proportional to value and accuracy).
+    Get immediate tactical value of inflicting status.
+    """
+    if status == Status.BRN:
+        return burn_immediate_value(me, opp)
+    
+    elif status == Status.PAR:
+        return para_immediate_value(me, opp)
+    
+    elif status in (Status.PSN, Status.TOX):
+        return poison_immediate_value(status)
+    
+    elif status == Status.SLP:
+        return sleep_immediate_value()
+    
+    elif status == Status.FRZ:
+        return freeze_immediate_value()
+    
+    return 20.0  # Default status value
+
+def calculate_miss_cost(status_value: float, accuracy: float, me: Any, opp: Any) -> float:
+    """
+    Calculate cost of missing a status move.
     
     Miss cost increases when:
     - Status is more valuable (higher opportunity cost)
-    - We're damaged (less time to recover)
+    - We're damaged (less time to waste turns)
     - We're slower (opponent gets free hit)
-    - Opponent is boosted (dangerous to waste turn)
-    - High pressure situations
-    - Move has lower accuracy (higher risk)
+    - Move has lower accuracy (worse when you miss)
+    
+    Returns:
+        Penalty points (typically 15-50)
     """
-    me = ctx.me
-    opp = ctx.opp
-
     # Base cost
-    cost = MISS_COST_BASE
+    cost = 15.0
     
-    # Scale with status value (higher value = worse to miss)
-    cost += status_value * MISS_COST_VALUE_SCALE
+    # Scale with status value
+    # High-value status (55 pts) → higher miss cost
+    # Low-value status (20 pts) → lower miss cost
+    cost += status_value * 0.2
     
-    # Scale with miss chance (lower accuracy = worse penalty)
-    # If accuracy is 50%, missing is not that surprising
-    # If accuracy is 95%, missing feels terrible
+    # Scale with miss chance
+    # 50% acc (50% miss) → 1.5x cost
     miss_chance = 1.0 - accuracy
-    cost *= (1.0 + miss_chance * 0.5)  # Up to 50% more cost for low accuracy
+    cost *= (1.0 + miss_chance * 0.5)
     
-    # Situation-dependent costs
-    cost += (1.0 - hp_frac(me)) * MISS_COST_DAMAGED_SCALE
-
-    if opp is not None and is_slower(me, opp):
-        cost += MISS_COST_SLOWER_PENALTY
-
-    try:
-        if opp is not None and opp.boosts and any(v >= 2 for v in opp.boosts.values()):
-            cost += MISS_COST_BOOSTED_OPP_PENALTY
-    except Exception:
-        pass
-
-    cost += 8.0 * pressure.setup_prob + 6.0 * pressure.threat
-    cost += 4.0 * pressure.physical_prob
+    # Penalty when damaged (wasting turns is worse) NOTE: will probs upgrade this to look and see if the opp is threatening KO instead
+    my_hp = hp_frac(me)
+    if my_hp < 0.7:
+        cost += (1.0 - my_hp) * 15.0
+    
+    # Penalty when slower (opponent gets free damage)
+    if is_slower(me, opp):
+        cost += 8.0
     
     return cost
 
@@ -178,698 +126,116 @@ def score_status_move(move: Any, battle: Any, ctx: EvalContext) -> float:
     5. Miss cost (scales with status value and accuracy)
     """
     opp = ctx.opp
+    me = ctx.me
     if opp is None:
         return -100.0
-    
-    # Hard punish wasting a major-status move into an already-statused target
-    major = move_inflicts_major_status(move)
-    if major is not None and already_has_major_status(opp):
-        return -120.0
 
-    major = move_inflicts_major_status(move)
-    if major is not None and not major_status_is_applicable(major, move, opp):
+    # Check what status this move inflicts
+    status = getattr(move, 'status', None)
+
+    if getattr(opp, 'status', None) is not None:
+        return -120.0
+    
+    if not status_is_applicable(status, move, opp):
         return -80.0
 
-    # Cache pressure calculation
-    cache_key = "opponent_pressure"
-    if cache_key in ctx.cache:
-        pressure = ctx.cache[cache_key]
-    else:
-        pressure = estimate_opponent_pressure(battle, ctx)
-        ctx.cache[cache_key] = pressure
+    score = get_base_status_value(status, me, opp, ctx)
 
-    raw = 0.0
-    raw += base_status_value(move, battle, ctx)
-    raw += team_synergy_value(move, battle, ctx)
-    raw -= tempo_risk(move, battle, ctx, pressure)
-    raw -= _survival_penalty(move, battle, ctx, pressure)
+    accuracy = getattr(move, 'accuracy', 1.0) or 1.0
+    
+    if accuracy < 1.0:
+        # Miss cost scales with how valuable the status is
+        # Missing a powerful status move is worse than missing a weak one
+        miss_cost = calculate_miss_cost(score, accuracy, me, opp)
+        
+        # Expected value formula: EV = accuracy × value + (1-accuracy) × (-miss_cost)
+        score = accuracy * score + (1.0 - accuracy) * (-miss_cost)
+    
+    return score
 
-    # Scale modifier based on how much we're winning/losing
+def burn_immediate_value(me, opp):
+    """Calculate burn value from actual moves (or base stats fallback)."""
+    value = 20.0
     
-    mv = _best_damage_move(battle)
-    if mv is not None:
-        try:
-            race = evaluate_race_for_move(battle, ctx, mv)
-            race_state = race.state
-            
-            # Calculate degree of advantage/disadvantage
-            tko_opp = getattr(race, "tko_opp", 99.0)
-            ttd_me = getattr(race, "ttd_me", 99.0)
-            
-            if race_state == "WINNING":
-                # We're winning: status less valuable
-                # Scale by how much we're winning
-                advantage = max(0.0, min(2.0, (ttd_me - tko_opp)))
-                modifier = -RACE_BASE_MODIFIER * (advantage / 2.0)  # 0 to -18
-                raw += modifier
-            
-            elif race_state == "LOSING":
-                # We're losing: status more valuable (need time)
-                # Scale by how much we're losing
-                disadvantage = max(0.0, min(2.0, (tko_opp - ttd_me)))
-                modifier = RACE_BASE_MODIFIER * (disadvantage / 2.0)  # 0 to +18
-                raw += modifier
-            
-            # CLOSE stays at 0
-        except Exception:
-            pass
-
-    # ACCURACY WITH PROPORTIONAL MISS COST
-    acc = float(getattr(move, "accuracy", 1.0) or 1.0)
-    acc = max(0.0, min(1.0, acc))
+    opp_moves = getattr(opp, 'moves', {})
+    if not opp_moves:
+        # Fallback to base stats
+        opp_atk = (opp.base_stats or {}).get("atk", 100)
+        opp_spa = (opp.base_stats or {}).get("spa", 100)
+        if opp_atk > opp_spa * 1.15:
+            value += 25.0
+        return value
     
-    miss_cost = status_miss_cost(battle, ctx, pressure, raw, acc)
-    final = acc * raw + (1.0 - acc) * (-miss_cost)
+    # Count physical power
+    total_power = 0
+    physical_power = 0
     
-    return final
-
-def _burn_total_value(battle: Any, ctx: EvalContext, pressure) -> float:
-    """
-    Consolidated burn value calculation - ALL burn logic in one place.
+    for move in opp_moves.values():
+        power = getattr(move, 'base_power', 0) or 0
+        if power == 0:
+            continue
+        
+        total_power += power
+        if getattr(move, 'category', None) == MoveCategory.PHYSICAL:
+            physical_power += power
     
-    Burn is valuable for:
-    1. Halving physical attack damage (matchup dependent)
-    2. Passive chip damage (1/16 HP per turn)
-    3. Stopping physical setup sweepers
-
-    """
-    opp = ctx.opp
-    if opp is None:
-        return 0.0
-    
-    # Start with base value
-    value = BASE_STATUS_BURN
-    
-    phys_prob = pressure.physical_prob
-    special_prob = 1.0 - phys_prob
-    
-    # Reduce value against special attackers (burn doesn't help much)
-    value -= special_prob * 12.0
-    
-    # Near-term physical matchup value (next 1-3 turns)
-    # Helps us survive physical attacks
-    value += 8.0  # Base near-term
-    value += 14.0 * phys_prob  # Strong vs physical
-    value -= 2.0 * special_prob  # Weak vs special
-    
-    # Passive burn damage over expected game length
-    our_remaining = remaining_count(battle.team)
-    opp_remaining = remaining_count(battle.opponent_team)
-    
-    if opp_remaining >= 4 and our_remaining >= 4:
-        expected_turns = 3.0
-        horizon = 5  # long-term horizon
-    elif opp_remaining >= 3:
-        expected_turns = 2.5
-        horizon = 3
-    else:
-        expected_turns = 2.0
-        horizon = 2
-    
-    total_chip = BURN_CHIP_PER_TURN * expected_turns
-    chip_value = total_chip * BURN_CHIP_VALUE_MULTIPLIER
-    value += chip_value
-    
-    # Burn stops physical setup sweepers (DD, SD, etc.)
-    setup_value = 6.0 * pressure.setup_prob  # near-term
-    setup_value += 5.0 * pressure.setup_prob  # long-term
-    value += setup_value * phys_prob  # Only matters vs physical sweepers
-
-    # Ongoing benefit over multiple turns
-    value += 3.5 * horizon
-    value += 8.0 * phys_prob  # Additional long-term vs physical
+    # Scale bonus with physical percentage
+    if total_power > 0:
+        physical_pct = physical_power / total_power
+        value += 40.0 * physical_pct
     
     return value
 
-
-def _burn_chip_damage_value(battle: Any, ctx: EvalContext) -> float:
+def para_immediate_value(me: Any, opp: Any) -> float:
     """
-    Helper for secondary effects - just the chip damage portion.
-    (Used by secondary_score.py)
+    Immediate value of paralyzing opponent.
+    
+    Components:
+    1. Speed control (25% full para chance per turn)
+    2. Speed halving (if we're slower, now we're faster!)
     """
-    opp = ctx.opp
-    if opp is None:
-        return 0.0
+    value = 20.0  # Base value (25% full para chance)
     
-    our_remaining = remaining_count(battle.team)
-    opp_remaining = remaining_count(battle.opponent_team)
-    
-    if opp_remaining >= 4 and our_remaining >= 4:
-        expected_turns = 3.0
-    elif opp_remaining >= 3:
-        expected_turns = 2.5
-    else:
-        expected_turns = 2.0
-    
-    total_chip = BURN_CHIP_PER_TURN * expected_turns
-    return total_chip * BURN_CHIP_VALUE_MULTIPLIER
-
-def _paralysis_speed_flip_value(me: Any, opp: Any, dist) -> float:
-    """
-    Helper: Calculate value of speed control from paralysis.
-    
-    Para HALVES opponent speed (Gen 7+), potentially flipping speed tiers.
-    Returns value based on:
-    - Whether we flip from slower to faster
-    - Distribution of opponent speed multipliers (Choice Scarf, etc.)
-    """
-    if me is None or opp is None:
-        return 0.0
-    
+    # Check if we're slower
     try:
-        my_spe = (me.base_stats or {}).get("spe", 80)
-        opp_base_spe = (opp.base_stats or {}).get("spe", 80)
-    except Exception:
-        my_spe, opp_base_spe = 80, 80
-    
-    # Calculate probability we become faster after para
-    flip_prob = 0.0
-    for cand, w in dist:
-        eff_opp_spe = opp_base_spe * getattr(cand, "speed_mult", 1.0)
-        if my_spe >= eff_opp_spe * 0.5:  # Para HALVES speed in Gen 7+
-            flip_prob += w
-    
-    was_slower = my_spe < opp_base_spe
-    
-    # Major flip: we go from slower to faster
-    if flip_prob > 0.8 and was_slower:
-        return 22.0 * flip_prob
-    # Minor improvement: already faster or uncertain flip
-    elif flip_prob > 0.5:
-        return 8.0 * flip_prob
-    else:
-        return 0.0
-
-
-def _paralysis_total_value(battle: Any, ctx: EvalContext, pressure, dist) -> float:
-    """
-    Consolidated paralysis value calculation.
-    
-    Paralysis is valuable for:
-    1. Speed control (flipping speed tiers)
-    2. 25% full para chance (free turns)
-    3. Stopping setup sweepers
-    4. Long-term speed advantage
-    """
-    me = ctx.me
-    opp = ctx.opp
-    if opp is None or me is None:
-        return 0.0
-    
-    # Base value
-    value = BASE_STATUS_PARALYSIS
-    
-    slower = is_slower(me, opp)
-    
-    # SPEED FLIP VALUE 
-    speed_flip_value = _paralysis_speed_flip_value(me, opp, dist)
-    value += speed_flip_value
-    
-    # NEAR-TERM PAYOFF 
-    
-    # Base near-term value
-    value += 10.0
-    
-    # Extra value if we're slower (speed control more important)
-    if slower:
-        value += 12.0
-    else:
-        value += 3.0
-    
-    # Setup deterrent (para helps vs setup sweepers)
-    value += 10.0 * pressure.setup_prob
-    
-    # LONG-TERM VALUE 
-    
-    our_remaining = remaining_count(battle.team)
-    opp_remaining = remaining_count(battle.opponent_team)
-    
-    if opp_remaining >= 4 and our_remaining >= 4:
-        horizon = 5
-    elif opp_remaining >= 3:
-        horizon = 3
-    else:
-        horizon = 2
-    
-    value += 3.0 * horizon
-    if slower:
-        value += 6.0
-    value += 6.0 * pressure.setup_prob
+        if is_slower(me, opp):
+            value += 20.0
+    except:
+        # Can't determine speed, moderate value
+        value += 10.0
     
     return value
 
-def _sleep_total_value() -> float:
-    """Sleep value (very strong short-term, forces switch)."""
-    # Near-term: 26.0
-    # Long-term: 10.0
-    # Base: 55.0
-    return BASE_STATUS_SLEEP + 26.0 + 10.0
-
-def _survival_penalty(move: Any, battle: Any, ctx: EvalContext, pressure) -> float:
+def poison_immediate_value(status: Status) -> float:
     """
-    Penalty for clicking status when we're about to die and status won't help.
+    Immediate value of poisoning opponent.
     
-    If we're in OHKO range and status doesn't improve our survival,
-    we should attack instead (deal damage before dying).
-    
-    Key insight: "Status into death" is almost always wrong unless the
-    status helps us survive.
+    Regular Poison: 1/8 HP per turn
+    Toxic: Ramping (1/16, 2/16, 3/16, ...)
     """
-    me = ctx.me
-    opp = ctx.opp
-    st = getattr(move, "status", None)
-    
-    if me is None or opp is None or st is None:
-        return 0.0
-    
-    my_hp = hp_frac(me)
-    opp_damage = pressure.damage_to_me_frac
-    
-    # Are we in OHKO range?
-    if my_hp < opp_damage * 1.1:
-        # We die next turn
-        
-        # Does this status help us survive?
-        helps_survive = False
-        
-        if st == Status.BRN and pressure.physical_prob > 0.6:
-            # Burn halves physical damage
-            new_damage = opp_damage * 0.5
-            if my_hp >= new_damage:
-                helps_survive = True
-        
-        if st == Status.PAR:
-            # Check if we become faster (speed flip)
-            slower = is_slower(me, opp)
-            if slower:
-                try:
-                    my_spe = (me.base_stats or {}).get("spe", 80)
-                    opp_spe = (opp.base_stats or {}).get("spe", 80)
-                    # After para, do we become faster?
-                    if my_spe >= opp_spe * 0.5:
-                        helps_survive = True
-                except Exception:
-                    pass
-        
-        # If status doesn't help us survive, heavy penalty
-        if not helps_survive:
-            # We're clicking status into death - this is bad!
-            penalty = 40.0
-            
-            # Extra penalty if we're behind in Pokemon
-            our_remaining = remaining_count(battle.team)
-            opp_remaining = remaining_count(battle.opponent_team)
-            if our_remaining < opp_remaining:
-                penalty += (opp_remaining - our_remaining) * 10.0
-            
-            return penalty
-    
-    return 0.0
-
-def base_status_value(move: Any, battle: Any = None, ctx: EvalContext = None) -> float:
-    """
-    Get the total value of a status condition.
-    
-    NOTE: This now returns the FULL value including near/long-term.
-    Individual components (near_term_payoff, long_term_value) are deprecated
-    but kept for backwards compatibility with secondary_score.py temporarily.
-    """
-    st = getattr(move, "status", None)
-    
-    if st is None:
-        return BASE_STATUS_DEFAULT
-    
-    # For burn and paralysis, use consolidated functions if we have full context
-    if battle is not None and ctx is not None:
-        pressure = estimate_opponent_pressure(battle, ctx)
-        
-        if st == Status.BRN:
-            return _burn_total_value(battle, ctx, pressure)
-        
-        if st == Status.PAR:
-            gen = getattr(getattr(battle, "format", None), "gen", 9) or 9
-            try:
-                dist = get_opponent_set_distribution(ctx.opp, int(gen)) or []
-            except Exception:
-                dist = []
-            return _paralysis_total_value(battle, ctx, pressure, dist)
-    
-    # Fallback to simple base values
-    if st == Status.SLP:
-        return _sleep_total_value()
-    elif st == Status.PAR:
-        return BASE_STATUS_PARALYSIS
-    elif st == Status.BRN:
-        return BASE_STATUS_BURN
-    elif st in (Status.PSN, Status.TOX):
-        if battle is not None and ctx is not None:
-            # Use comprehensive poison model with all components
-            return _poison_total_value(battle, ctx, pressure, move)
-        else:
-            return BASE_STATUS_POISON
+    if status == Status.TOX:
+        # Toxic ramps up - more valuable
+        return 35.0
     else:
-        return BASE_STATUS_DEFAULT
+        # Regular poison
+        return 28.0
 
 
-def tempo_risk(move: Any, battle: Any, ctx: EvalContext, pressure = None) -> float:
+def sleep_immediate_value() -> float:
     """
-    Risk of losing tempo by clicking a status move instead of attacking.
-    Now includes matchup-dependent penalties.
+    Immediate value of putting opponent to sleep.
+    
+    Sleep: Opponent can't move for 1-3 turns (huge!)
     """
-    me = ctx.me
-    opp = ctx.opp
+    return 55.0  # Very high value - opponent loses turns
 
-    r = 12.0
-    r += (1.0 - hp_frac(me)) * 18.0
-    if opp is not None and is_slower(me, opp):
-        r += 6.0
-
-    try:
-        if opp is not None and opp.boosts and any(v >= 1 for v in opp.boosts.values()):
-            r += 6.0
-    except Exception:
-        pass
-    
-    # matchup-dependent penalty
-    if pressure is not None:
-        r += _status_matchup_penalty(move, battle, ctx, pressure)
-
-    return r
-
-
-def near_term_payoff(move: Any, battle: Any, ctx: EvalContext, pressure) -> float:
+def freeze_immediate_value() -> float:
     """
-    DEPRECATED: Now included in base_status_value via consolidated functions.
+    Immediate value of freezing opponent.
     
-    Kept for backwards compatibility but returns 0.
-    The consolidated _burn_total_value and _paralysis_total_value now include
-    all near-term, long-term, and base values.
+    Freeze: Similar to sleep (20% thaw chance per turn)
     """
-    return 0.0
-
-
-def long_term_value(move: Any, battle: Any, ctx: EvalContext, pressure) -> float:
-    """
-    DEPRECATED: Now included in base_status_value via consolidated functions.
-    
-    Kept for backwards compatibility but returns 0.
-    """
-    return 0.0
-
-
-def team_synergy_value(move: Any, battle: Any, ctx: EvalContext) -> float:
-    opp = ctx.opp
-    if opp is None:
-        return 0.0
-
-    st = getattr(move, "status", None)
-    if st is None:
-        return 0.0
-
-    gen = getattr(getattr(battle, "format", None), "gen", None)
-    if gen is None:
-        gen = getattr(getattr(ctx, "battle", None), "gen", 9) or 9
-
-    try:
-        dist = get_opponent_set_distribution(opp, 9) or []
-    except Exception:
-        dist = []
-
-    phys_p = physical_probability(opp, battle, ctx)
-    setup_p = sum(w for c, w in dist if getattr(c, "has_setup", False)) if dist else 0.25
-    priority_p = sum(w for c, w in dist if getattr(c, "has_priority", False)) if dist else 0.15
-
-    best = 0.0
-    second = 0.0
-
-    try:
-        opp_base_spe = (opp.base_stats or {}).get("spe", 80)
-    except Exception:
-        opp_base_spe = 80
-
-    for ally in battle.team.values():
-
-        if ally is None:
-            continue
-        if getattr(ally, 'fainted', False):
-            continue  
-        if ally is ctx.me:
-            continue
-        
-        setup_ally = looks_like_setup_sweeper(ally)
-        priority_ally = ally_has_priority(ally)
-        frail_ally = ally_is_frail(ally)
-
-        try:
-            ally_spe = (ally.base_stats or {}).get("spe", 80)
-        except Exception:
-            ally_spe = 80
-
-        wincon_mult = 1.0
-        if setup_ally:
-            wincon_mult *= 1.35
-        if not frail_ally:
-            wincon_mult *= 1.10
-
-        benefit = 0.0
-
-        if st.name == "PAR":
-            flip_prob = 0.0
-            for cand, w in dist:
-                eff_opp_spe = opp_base_spe * getattr(cand, "speed_mult", 1.0)
-                if ally_spe >= eff_opp_spe * 0.5:  # Para HALVES speed in Gen 7+
-                    flip_prob += w
-
-            was_slower = ally_spe < opp_base_spe
-            speed_flip_value = (22.0 if was_slower else 8.0) * flip_prob
-
-            free_turn_ev = 0.25 * (14.0 + (10.0 if setup_ally else 0.0) + (8.0 if frail_ally else 0.0))
-            stop_sweep = 18.0 * setup_p + 6.0 * (1.0 - flip_prob)
-            if priority_p > 0 and frail_ally:
-                stop_sweep += 6.0
-
-            benefit += speed_flip_value + free_turn_ev + stop_sweep
-            if priority_ally:
-                benefit *= 0.85
-
-        elif st.name == "BRN":
-            # Get actual damage to ally using full pressure calculation
-            damage_to_ally = _estimate_damage_to_ally(ally, opp, battle)
-            
-            # KO THRESHOLD VALUE (NEW!)
-            # Check if burn changes OHKO → 2HKO, 2HKO → 3HKO, etc.
-            # This replaces the old generic dmg_reduction calculation
-            ko_threshold_value = _burn_ko_threshold_value(
-                ally, opp, battle, damage_to_ally, phys_p
-            )
-            
-            # SETUP DETERRENCE 
-            # This is independent of KO thresholds
-            phys_setup_p = (
-                sum(w for c, w in dist if getattr(c, "is_physical", False) and getattr(c, "has_setup", False))
-                if dist else 0.20
-            )
-            stop_sweep = 26.0 * phys_setup_p + 8.0 * setup_p * phys_p
-            stop_priority = 10.0 * priority_p * phys_p
-            
-            # COMBINE
-            benefit += ko_threshold_value + stop_sweep + stop_priority
-            
-            # Note: Removed old dmg_reduction and the (not frail_ally) multiplier
-            # because ko_threshold_value captures this more precisely
-
-        elif st.name in ("PSN", "TOX"):
-            benefit += 10.0 + (4.0 if setup_ally else 0.0)
-
-        elif st.name in ("SLP", "FRZ"):
-            benefit += 18.0 + (14.0 if setup_ally else 0.0)
-
-        benefit *= wincon_mult
-
-        if benefit > best:
-            second = best
-            best = benefit
-        elif benefit > second:
-            second = benefit
-
-    return best + 0.5 * second
-
-def _status_matchup_penalty(move: Any, battle: Any, ctx: EvalContext, pressure) -> float:
-    """
-    Additional tempo risk for bad matchups in the CURRENT 1v1.
-    
-    This is applied ON TOP OF base tempo risk and evaluates:
-    - Burn vs special attacker (current active pokemon is special)
-    - Para vs something we outspeed (speed control less urgent NOW)
-    
-    Note: This is matchup-specific, NOT team-wide.
-    Team considerations are handled in team_synergy_value().
-    """
-    st = getattr(move, "status", None)
-    me = ctx.me
-    opp = ctx.opp
-    
-    if st is None or opp is None or me is None:
-        return 0.0
-    
-    penalty = 0.0
-    
-    if st == Status.BRN:
-        # Current opponent is special = bad burn target
-        special_prob = 1.0 - pressure.physical_prob
-        penalty += special_prob * 25.0  
-        
-        # No immediate setup threat = less urgent
-        if pressure.setup_prob < 0.2:
-            penalty += 6.0
-    
-    if st == Status.PAR:
-        # We already outspeed = less urgent NOW
-        if not is_slower(me, opp):
-            penalty += 10.0
-        
-        # No immediate setup threat = less urgent
-        if pressure.setup_prob < 0.2:
-            penalty += 5.0
-    
-    return penalty
-
-def _poison_chip_value(battle: Any, ctx: EvalContext, is_toxic: bool) -> float:
-    """
-    Calculate expected chip damage over game horizon.
-    
-    Regular poison: 1/16 per turn (linear)
-    Toxic: 1/16, 2/16, 3/16... (ramping)
-    """
-    our_remaining = remaining_count(battle.team)
-    opp_remaining = remaining_count(battle.opponent_team)
-    
-    # Estimate how long opponent stays in / game continues
-    if opp_remaining >= 4 and our_remaining >= 4:
-        horizon = 5  # Long game
-    elif opp_remaining >= 3:
-        horizon = 4
-    else:
-        horizon = 3
-    
-    if is_toxic:
-        # Toxic: Ramping damage
-        # Turn 1: 1/16, Turn 2: 2/16, Turn 3: 3/16, etc.
-        # Cumulative: 1/16 + 2/16 + 3/16 + 4/16 + 5/16 = 15/16 = 93.75% over 5 turns!
-        cumulative = 0.0
-        for turn in range(1, horizon + 1):
-            cumulative += turn / 16.0
-        
-        # But opponent might switch or die early
-        # Conservative estimate: assume ~60% stays in
-        effective_damage = cumulative * 0.60
-        
-        # Scale to scoring system (similar to burn chip)
-        return effective_damage * 120.0  # Higher multiplier than burn due to ramp
-    
-    else:
-        # Regular poison: Linear
-        total_chip = (1.0 / 16.0) * horizon
-        return total_chip * 85.0
-    
-def _poison_setup_deterrence(battle: Any, ctx: EvalContext, pressure, opp: Any) -> float:
-    """
-    Poison deters setup sweepers by putting them on a timer.
-    
-    Value increases with:
-    - Opponent's setup probability
-    - Opponent's bulk (more turns to set up = more poison damage)
-    - Lack of Rest/cleric support
-    """
-    setup_prob = pressure.setup_prob
-    
-    if setup_prob < 0.3:
-        # Not a setup threat
-        return 0.0
-    
-    value = 0.0
-    
-    # Base setup deterrence
-    value += 25.0 * setup_prob
-    
-    # Check if opponent is bulky (more turns = more poison value)
-    opp_hp = hp_frac(opp)
-    if opp_hp > 0.80:
-        value += 15.0 * setup_prob
-    
-    # Check if opponent has setup moves (DD, SD, NP, CM, etc.)
-    try:
-        dist = get_opponent_set_distribution(opp, 9) or []
-        has_setup = sum(w for c, w in dist if getattr(c, "has_setup", False))
-        
-        if has_setup > 0.5:
-            # Likely has setup move
-            value += 10.0
-    except Exception:
-        pass
-    
-    return value
-
-def _toxic_stall_synergy(battle: Any, ctx: EvalContext, opp: Any) -> float:
-    """
-    Massive value when you have a wall that can stall out Toxic.
-    
-    Toxic + Wall + Recovery = Guaranteed KO
-    """
-    # Check each teammate
-    best_wall_value = 0.0
-    
-    for ally in battle.team.values():
-        if ally is None or ally.fainted or ally == ctx.me:
-            continue
-        
-        # Estimate how much damage opponent does to this ally
-        # This is a simplified check - ideally we'd use full pressure calculation
-        damage_to_ally = _estimate_damage_to_ally(ally, opp, battle)
-        
-        if damage_to_ally < 0.15:
-            # Ally walls opponent!
-            
-            # Does ally have recovery?
-            has_recovery = _has_recovery_move(ally)
-            
-            if has_recovery:
-                # PERFECT TOXIC STALL SETUP!
-                # This is a win condition
-                wall_value = 50.0
-                
-                # Bonus if wall is very safe (<10% damage)
-                if damage_to_ally < 0.10:
-                    wall_value += 15.0
-                
-                best_wall_value = max(best_wall_value, wall_value)
-            
-            else:
-                # Can wall but can't sustain forever
-                # Still good for short-term stall
-                best_wall_value = max(best_wall_value, 25.0)
-    
-    return best_wall_value
-
-
-def _has_recovery_move(pokemon: Any) -> bool:
-    """Check if Pokemon has a recovery move."""
-    recovery_moves = {
-        "recover", "softboiled", "roost", "rest", "slackoff",
-        "moonlight", "morningsun", "synthesis", "shoreup", "wish",
-        "healorder", "milkdrink", "junglehealing", "lunarblessing",
-        "lifedew", "floralhealing", "strengthsap"
-    }
-    
-    try:
-        for move in pokemon.moves.values():
-            if move.id in recovery_moves:
-                return True
-    except Exception:
-        pass
-    
-    return False
-
+    return 45.0  # High value but slightly less than sleep
 
 def _get_pokemon_identifier(pokemon: Any, battle: Any) -> Optional[str]:
     """
@@ -1051,168 +417,3 @@ def _type_based_damage_estimate(ally: Any, opp: Any) -> float:
     except Exception:
         # Ultimate fallback
         return 0.25
-
-
-def _burn_ko_threshold_value(
-    ally: Any,
-    opp: Any,
-    battle: Any,
-    damage_to_ally: float,
-    phys_p: float
-) -> float:
-    """
-    Calculate value based on how burn changes KO thresholds.
-    
-    Key insight: What matters is HITS TO KO (HTK), not raw damage.
-    
-    Returns:
-    - Large bonus if burn saves from OHKO/2HKO (+35 to +65)
-    - Small bonus if burn improves survivability meaningfully (+10 to +28)
-    - Penalty if burn doesn't change HTK enough - wasted on tanky matchup (-15)
-    
-    Examples:
-    - Weavile takes 75% per turn → 2HKO, with burn → 3HKO: +35 * phys_p
-    - Corviknight takes 20% per turn → 5HKO, with burn → 10HKO: -15 * phys_p (wasted!)
-    """
-    if phys_p < 0.5:
-        # Not physical enough for burn to matter
-        return 0.0
-    
-    if ally is None or opp is None:
-        return 0.0
-    
-    ally_hp = hp_frac(ally)
-    
-    # Calculate hits to KO without burn
-    if damage_to_ally <= 0.01:
-        htk_without = 99  # Basically immune
-    else:
-        htk_without = math.ceil(ally_hp / damage_to_ally)
-    
-    # Calculate hits to KO with burn (halves physical damage)
-    burned_damage = damage_to_ally * 0.5
-    if burned_damage <= 0.01:
-        htk_with = 99
-    else:
-        htk_with = math.ceil(ally_hp / burned_damage)
-    
-    # How many extra hits does burn give us?
-    extra_hits = htk_with - htk_without
-    
-    # Scale by physical probability
-    value = 0.0
-    
-    # CRITICAL THRESHOLDS 
-    
-    if htk_without == 1:
-        # OHKO → Survives
-        if htk_with >= 2:
-            # Burn saves from OHKO!
-            value = 50.0 * phys_p
-            
-            # Extra bonus if becomes 3HKO or better
-            if htk_with >= 3:
-                value += 15.0 * phys_p
-    
-    elif htk_without == 2:
-        # 2HKO → More hits
-        if htk_with >= 3:
-            # Burn prevents 2HKO
-            value = 35.0 * phys_p
-            
-            # Extra bonus if becomes 4HKO+
-            if htk_with >= 4:
-                value += 10.0 * phys_p
-    
-    elif htk_without == 3:
-        # 3HKO → More hits
-        if htk_with >= 4:
-            # Meaningful improvement
-            value = 20.0 * phys_p
-            
-            if htk_with >= 5:
-                value += 8.0 * phys_p
-    
-    elif htk_without >= 4:
-        # Already tanking well
-        if extra_hits >= 2:
-            # Marginal improvement
-            value = 10.0 * phys_p
-        else:
-            # Burn barely helps - wasted on tanky matchup
-            value = -15.0 * phys_p
-    
-    return value
-
-    
-def _poison_counterplay_penalty(battle: Any, ctx: EvalContext, opp: Any) -> float:
-    """
-    Reduce poison value if opponent can cure it.
-    """
-    penalty = 0.0
-    
-    # Check opponent's known moves for Rest
-    try:
-        for move in opp.moves.values():
-            if move.id == "rest":
-                # Opponent has Rest
-                # They can cure poison, but have to sleep
-                # This is still somewhat good for us (they lose 2 turns)
-                penalty += 20.0
-                break
-    except Exception:
-        pass
-    
-    # Check opponent's ability
-    try:
-        ability = opp.ability
-        if ability in ("magicguard", "magicbounce"):
-            # Immune to poison damage or bounces it back
-            penalty += 100.0  # Don't use poison!
-    except Exception:
-        pass
-    
-    # Check for cleric support on opponent's team
-    # This is complex - requires checking all opponent's team
-    # For now, skip (low priority)
-    
-    return penalty
-
-def _poison_total_value(battle: Any, ctx: EvalContext, pressure, move) -> float:
-    """
-    Comprehensive poison/toxic value.
-    
-    NEW: Accounts for:
-    - Ramping damage (Toxic)
-    - Setup deterrence
-    - Toxic stall synergy
-    - Opponent counterplay
-    """
-    opp = ctx.opp
-    if opp is None:
-        return 0.0
-    
-    move_id = str(getattr(move, "id", "")).lower()
-    is_toxic = (move_id == "toxic")
-    
-    # Base value
-    value = BASE_STATUS_POISON  # 32.0
-    
-    # 1. Chip damage (ramping for Toxic)
-    chip_value = _poison_chip_value(battle, ctx, is_toxic)
-    value += chip_value
-    
-    # 2. Setup deterrence (puts sweepers on timer)
-    setup_value = _poison_setup_deterrence(battle, ctx, pressure, opp)
-    value += setup_value
-    
-    # 3. Toxic stall synergy (wall + recovery)
-    if is_toxic:
-        stall_value = _toxic_stall_synergy(battle, ctx, opp)
-        value += stall_value
-    
-    # 4. Opponent counterplay (Rest, immunities)
-    counterplay = _poison_counterplay_penalty(battle, ctx, opp)
-    value -= counterplay
-    
-    return value

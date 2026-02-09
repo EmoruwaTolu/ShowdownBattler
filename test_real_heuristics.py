@@ -129,7 +129,9 @@ def create_mock_move(
     base_power: int = 0,
     accuracy: float = 1.0,
     priority: int = 0,
-    crit_ratio: int = 0,  # NEW: Add crit_ratio parameter
+    crit_ratio: int = 0,
+    status: Status = None,
+    secondary: list = None, 
 ) -> Any:
     """
     Create a Move mock that works with calculate_damage.
@@ -150,7 +152,9 @@ def create_mock_move(
     move.base_power = base_power
     move.accuracy = accuracy
     move.priority = priority
-    move.crit_ratio = crit_ratio  # NEW: Set crit_ratio
+    move.crit_ratio = crit_ratio
+    move.status = status
+    move.secondary = secondary if secondary is not None else []
     
     # PP (REQUIRED)
     move.current_pp = 16
