@@ -13,6 +13,41 @@ def _tanh01(x: float) -> float:
 def _team_hp_sum(hp_map: dict[int, float]) -> float:
     return float(sum(max(0.0, min(1.0, v)) for v in hp_map.values()))
 
+def evaluate_boosts(state: Any) -> float:
+    """
+    Evaluate stat boost advantage.
+    
+    Returns value in [-1, +1]:
+    - Positive: We have boost advantage
+    - Negative: Opponent has boost advantage
+
+    NOTE: This is a fairly rudimentary approach, there's much better way to decide if the boosts on our side are better, will improve this later
+    """
+    my_active_id = id(state.my_active)
+    opp_active_id = id(state.opp_active)
+    
+    my_boosts = state.my_boosts.get(my_active_id, {})
+    opp_boosts = state.opp_boosts.get(opp_active_id, {})
+    
+    # Weight boosts by importance
+    my_value = (
+        my_boosts.get('atk', 0) * 1.5 +
+        my_boosts.get('spa', 0) * 1.5 +
+        my_boosts.get('spe', 0) * 1.2 +
+        my_boosts.get('def', 0) * 0.7 +
+        my_boosts.get('spd', 0) * 0.7
+    )
+    
+    opp_value = (
+        opp_boosts.get('atk', 0) * 1.5 +
+        opp_boosts.get('spa', 0) * 1.5 +
+        opp_boosts.get('spe', 0) * 1.2 +
+        opp_boosts.get('def', 0) * 0.7 +
+        opp_boosts.get('spd', 0) * 0.7
+    )
+    
+    diff = my_value - opp_value
+    return _tanh01(diff / 10.0)
 
 def evaluate_state(state: Any) -> float:
     """
@@ -39,7 +74,7 @@ def evaluate_state(state: Any) -> float:
         return _tanh01((my_sum - opp_sum) / 2.0)
 
     # Patch status so race calc + heuristics see simulated BRN/PAR
-    with state._patched_status():
+    with state._patched_status(), state._patched_boosts():
         # Team HP advantage (flawed but stable, will probs come up with a better way to determine winning positions)
         my_sum = _team_hp_sum(state.my_hp)
         opp_sum = _team_hp_sum(state.opp_hp)
@@ -85,6 +120,8 @@ def evaluate_state(state: Any) -> float:
             # Bound it so it doesn't dominate
             switch_term = _tanh01(best_sw_score / 120.0)
 
+        boost_term = evaluate_boosts(state)
+
         # Status shaping (small)
         status_term = 0.0
 
@@ -102,9 +139,10 @@ def evaluate_state(state: Any) -> float:
 
     # Weighted sum (anchor on HP, then tempo, then “can we safely escape”)
     value = (
-        0.60 * hp_term +
-        0.30 * race_term +
+        0.50 * hp_term +
+        0.25 * race_term +
         0.10 * switch_term +
+        0.15 * boost_term + 
         status_term
     )
 

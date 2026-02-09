@@ -197,6 +197,21 @@ def get_move_secondary(move_name: str, gen_data) -> Optional[list]:
     
     return secondary
 
+def get_move_boosts(move_name: str, gen_data) -> Optional[Dict[str, int]]:
+    """Get guaranteed stat boosts (e.g., Nasty Plot)."""
+    move_info = get_move_info(move_name, gen_data)
+    if not move_info:
+        return None
+    return move_info.get('boosts', None)
+
+
+def get_move_self(move_name: str, gen_data) -> Optional[Dict]:
+    """Get self-inflicted effects (e.g., Draco Meteor drops SpA)."""
+    move_info = get_move_info(move_name, gen_data)
+    if not move_info:
+        return None
+    return move_info.get('self', None)
+
 def create_pokemon_from_randbats(species_name: str, data: Dict, gen_data, role_name: str = None) -> Any:
     """
     Create a mock Pokemon from RandBats data using GenData for accurate info.
@@ -272,6 +287,8 @@ def create_pokemon_from_randbats(species_name: str, data: Dict, gen_data, role_n
         move_crit = get_move_crit_ratio(move_name, gen_data)
         move_status = get_move_status(move_name, gen_data)
         move_secondary = get_move_secondary(move_name, gen_data)
+        move_boosts = get_move_boosts(move_name, gen_data)
+        move_self = get_move_self(move_name, gen_data)  
         
         move = create_mock_move(
             move_id=move_id,
@@ -282,6 +299,8 @@ def create_pokemon_from_randbats(species_name: str, data: Dict, gen_data, role_n
             crit_ratio=move_crit,
             status=move_status,
             secondary=move_secondary,
+            boosts=move_boosts,   
+            self_effect=move_self
         )
         
         moves_dict[move_id] = move

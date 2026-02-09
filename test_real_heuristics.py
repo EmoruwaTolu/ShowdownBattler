@@ -132,6 +132,8 @@ def create_mock_move(
     crit_ratio: int = 0,
     status: Status = None,
     secondary: list = None, 
+    boosts: dict = None,
+    self_effect: dict = None,
 ) -> Any:
     """
     Create a Move mock that works with calculate_damage.
@@ -155,6 +157,8 @@ def create_mock_move(
     move.crit_ratio = crit_ratio
     move.status = status
     move.secondary = secondary if secondary is not None else []
+    move.boosts = boosts 
+    move.self = self_effect    
     
     # PP (REQUIRED)
     move.current_pp = 16

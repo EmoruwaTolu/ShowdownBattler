@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, replace, field
 from typing import Any, Callable, Dict, List, Optional, Tuple
 from contextlib import contextmanager
 import math
@@ -77,6 +77,65 @@ def status_infliction(move: Any) -> Optional[Tuple[Status, float]]:
     
     return None
 
+def get_move_boosts(move: Any) -> Optional[Tuple[Optional[Dict[str, int]], Optional[Dict[str, int]], float]]:
+    """
+    Extract stat boost changes from a move.
+    
+    Returns tuple of (self_boosts, target_boosts, chance) or None:
+    - self_boosts: boosts applied to user (e.g., Swords Dance: {'atk': 2})
+    - target_boosts: boosts applied to opponent (e.g., Charm: {'atk': -2})
+    - chance: probability of applying (1.0 for guaranteed, 0.2 for 20%, etc.)
+    
+    Examples:
+    - Swords Dance: ({'atk': 2}, None, 1.0)
+    - Dragon Dance: ({'atk': 1, 'spe': 1}, None, 1.0)
+    - Draco Meteor: ({'spa': -2}, None, 1.0)
+    - Charm: (None, {'atk': -2}, 1.0)
+    - Crunch: (None, {'def': -1}, 0.2)  # 20% chance
+    """
+    # Check for guaranteed self-boost (e.g., Swords Dance, Dragon Dance)
+    boosts = getattr(move, 'boosts', None)
+    if boosts:
+        return (boosts, None, 1.0)
+    
+    # Check move.self for self-inflicted changes (e.g., Draco Meteor, Superpower)
+    # NOTE: for the future I'd probably want to check abilities here and see if Contrary or any abilities that influence stat drops are involved
+    self_data = getattr(move, 'self', None)
+    if self_data and isinstance(self_data, dict):
+        self_boosts = self_data.get('boosts', None)
+        if self_boosts:
+            return (self_boosts, None, 1.0)
+    
+    # Check secondary effects for chance-based boosts
+    secondary = getattr(move, 'secondary', None)
+    if secondary:
+        if isinstance(secondary, list):
+            for sec in secondary:
+                if isinstance(sec, dict):
+                    sec_boosts = sec.get('boosts', None)
+                    if sec_boosts:
+                        chance = sec.get('chance', 100) / 100.0
+                        
+                        # Check if it's a self-boost or target-boost
+                        # If 'self' key exists in secondary, it's a self-boost
+                        if sec.get('self'):
+                            return (sec_boosts, None, chance)
+                        else:
+                            # Most secondary boosts affect the target
+                            return (None, sec_boosts, chance)
+        
+        elif isinstance(secondary, dict):
+            # Sometimes secondary is a dict, not a list
+            sec_boosts = secondary.get('boosts', None)
+            if sec_boosts:
+                chance = secondary.get('chance', 100) / 100.0
+                if secondary.get('self'):
+                    return (sec_boosts, None, chance)
+                else:
+                    return (None, sec_boosts, chance)
+    
+    return None
+
 
 def safe_accuracy(move: Any) -> float:
     try:
@@ -141,7 +200,7 @@ def apply_expected_damage(
         return float(defender_hp), False
 
     try:
-        with state._patched_status():
+        with state._patched_status(), state._patched_boosts():
             dmg_frac = float(state.dmg_fn(move, attacker, defender, state.battle))
     except Exception:
         dmg_frac = 0.25
@@ -181,6 +240,9 @@ class ShadowState:
 
     my_status: Dict[int, Optional[Status]]
     opp_status: Dict[int, Optional[Status]]
+
+    my_boosts: Dict[int, Dict[str, int]] = field(default_factory=dict)
+    opp_boosts: Dict[int, Dict[str, int]] = field(default_factory=dict)
 
     ply: int = 0
 
@@ -228,6 +290,32 @@ class ShadowState:
         my_status = {id(p): getattr(p, "status", None) for p in my_team}
         opp_status = {id(p): getattr(p, "status", None) for p in opp_team}
 
+        my_boosts = {}
+        for p in my_team:
+            boosts = getattr(p, 'boosts', {})
+            my_boosts[id(p)] = {
+                'atk': boosts.get('atk', 0),
+                'def': boosts.get('def', 0),
+                'spa': boosts.get('spa', 0),
+                'spd': boosts.get('spd', 0),
+                'spe': boosts.get('spe', 0),
+                'accuracy': boosts.get('accuracy', 0),
+                'evasion': boosts.get('evasion', 0),
+            }
+        
+        opp_boosts = {}
+        for p in opp_team:
+            boosts = getattr(p, 'boosts', {})
+            opp_boosts[id(p)] = {
+                'atk': boosts.get('atk', 0),
+                'def': boosts.get('def', 0),
+                'spa': boosts.get('spa', 0),
+                'spd': boosts.get('spd', 0),
+                'spe': boosts.get('spe', 0),
+                'accuracy': boosts.get('accuracy', 0),
+                'evasion': boosts.get('evasion', 0),
+            }
+
         return ShadowState(
             battle=battle,
             ctx_me=ctx_me,
@@ -240,6 +328,8 @@ class ShadowState:
             opp_hp=opp_hp,
             my_status=my_status,
             opp_status=opp_status,
+            my_boosts=my_boosts,
+            opp_boosts=opp_boosts, 
             score_move_fn=score_move_fn,
             score_switch_fn=score_switch_fn,
             dmg_fn=dmg_fn,
@@ -265,6 +355,47 @@ class ShadowState:
         finally:
             my_p.status = old_my
             opp_p.status = old_opp
+
+    @contextmanager
+    def _patched_boosts(self):
+        """
+        Temporarily patch Pokemon.boosts with simulated boost values.
+        
+        This allows damage calculation and other functions to use the correct
+        boost values from the simulation state.
+        """
+        
+        # Store original boosts
+        original_my = {}
+        original_opp = {}
+        
+        # Patch my team's boosts
+        for p in self.my_team:
+            p_id = id(p)
+            if p_id in self.my_boosts:
+                original_my[p_id] = getattr(p, 'boosts', {}).copy()
+                p.boosts = self.my_boosts[p_id].copy()
+        
+        # Patch opponent team's boosts
+        for p in self.opp_team:
+            p_id = id(p)
+            if p_id in self.opp_boosts:
+                original_opp[p_id] = getattr(p, 'boosts', {}).copy()
+                p.boosts = self.opp_boosts[p_id].copy()
+        
+        try:
+            yield
+        finally:
+            # Restore original boosts
+            for p in self.my_team:
+                p_id = id(p)
+                if p_id in original_my:
+                    p.boosts = original_my[p_id]
+            
+            for p in self.opp_team:
+                p_id = id(p)
+                if p_id in original_opp:
+                    p.boosts = original_opp[p_id]
     
     def with_forced_outcome(self, hit: Optional[bool] = None, crit: Optional[bool] = None) -> "ShadowState":
         """
@@ -518,6 +649,9 @@ class ShadowState:
         if hit:
             s = s._maybe_apply_status(move, "opp", s.opp_active, rng)
 
+        if hit:
+            s = s._maybe_apply_boosts_us(move, rng)
+
         if is_pivot_move(move) and hit:
             target = s._best_my_switch()
             if target is not None:
@@ -578,6 +712,9 @@ class ShadowState:
         if hit:
             s = s._maybe_apply_status(move, "me", s.my_active, rng)
 
+        if hit:
+            s = s._maybe_apply_boosts_opp(move, rng)
+
         if is_pivot_move(move) and hit:
             target = s._best_opp_switch()
             if target is not None:
@@ -611,6 +748,114 @@ class ShadowState:
             mp = dict(self.opp_status)
             mp[id(defender)] = st
             return replace(self, opp_status=mp)
+        
+    def _apply_boost_changes(self, boost_changes: Dict[str, int], side: str, pokemon: Any) -> "ShadowState":
+        """
+        Apply boost changes to a Pokemon, clamping to [-6, +6].
+        
+        Args:
+            boost_changes: Dict like {'atk': 2, 'spe': 1}
+            side: 'me' or 'opp'
+            pokemon: The Pokemon receiving the boosts
+        
+        Returns:
+            New ShadowState with updated boosts
+        """
+        if side == "me":
+            boosts_map = dict(self.my_boosts)
+            current = boosts_map.get(id(pokemon), {
+                'atk': 0, 'def': 0, 'spa': 0, 'spd': 0, 'spe': 0,
+                'accuracy': 0, 'evasion': 0
+            }).copy()
+        else:
+            boosts_map = dict(self.opp_boosts)
+            current = boosts_map.get(id(pokemon), {
+                'atk': 0, 'def': 0, 'spa': 0, 'spd': 0, 'spe': 0,
+                'accuracy': 0, 'evasion': 0
+            }).copy()
+        
+        # Apply changes, clamp to [-6, +6]
+        for stat, change in boost_changes.items():
+            if stat in current:
+                new_val = current[stat] + change
+                current[stat] = max(-6, min(6, new_val))
+        
+        boosts_map[id(pokemon)] = current
+        
+        if side == "me":
+            return replace(self, my_boosts=boosts_map)
+        else:
+            return replace(self, opp_boosts=boosts_map)
+
+
+    def _maybe_apply_boosts_us(self, move: Any, rng: random.Random) -> "ShadowState":
+        """
+        Apply stat boosts when we use a move.
+        
+        Self-boosts go to us, target-boosts go to opponent.
+        """
+        boost_data = get_move_boosts(move)
+        if not boost_data:
+            return self
+        
+        self_boosts, target_boosts, chance = boost_data
+        
+        # Roll for chance
+        if chance < 1.0 and rng.random() >= float(chance):
+            return self  # Didn't proc
+        
+        s = self
+        
+        # Apply self-boosts (to us)
+        if self_boosts:
+            s = s._apply_boost_changes(self_boosts, "me", s.my_active)
+            if s.debug:
+                boost_str = ", ".join(f"{k}:{v:+d}" for k, v in self_boosts.items())
+                s = s._log(f"BOOST me:{s.my_active.species} {boost_str}")
+        
+        # Apply target-boosts (to opponent)
+        if target_boosts:
+            s = s._apply_boost_changes(target_boosts, "opp", s.opp_active)
+            if s.debug:
+                boost_str = ", ".join(f"{k}:{v:+d}" for k, v in target_boosts.items())
+                s = s._log(f"BOOST opp:{s.opp_active.species} {boost_str}")
+        
+        return s
+
+
+    def _maybe_apply_boosts_opp(self, move: Any, rng: random.Random) -> "ShadowState":
+        """
+        Apply stat boosts when opponent uses a move.
+        
+        Self-boosts go to opponent, target-boosts go to us.
+        """
+        boost_data = get_move_boosts(move)
+        if not boost_data:
+            return self
+        
+        self_boosts, target_boosts, chance = boost_data
+        
+        # Roll for chance
+        if chance < 1.0 and rng.random() >= float(chance):
+            return self
+        
+        s = self
+        
+        # Apply self-boosts (to opponent)
+        if self_boosts:
+            s = s._apply_boost_changes(self_boosts, "opp", s.opp_active)
+            if s.debug:
+                boost_str = ", ".join(f"{k}:{v:+d}" for k, v in self_boosts.items())
+                s = s._log(f"BOOST opp:{s.opp_active.species} {boost_str}")
+        
+        # Apply target-boosts (to us)
+        if target_boosts:
+            s = s._apply_boost_changes(target_boosts, "me", s.my_active)
+            if s.debug:
+                boost_str = ", ".join(f"{k}:{v:+d}" for k, v in target_boosts.items())
+                s = s._log(f"BOOST me:{s.my_active.species} {boost_str}")
+        
+        return s
 
     def _best_my_switch(self) -> Optional[Any]:
         best, val = None, -1e18
