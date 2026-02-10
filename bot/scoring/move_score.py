@@ -15,89 +15,66 @@ from poke_env.battle import MoveCategory, SideCondition
 from bot.mcts.shadow_state import get_move_boosts
 
 def score_move(move: Any, battle: Any, ctx: EvalContext) -> float:
-    """
-    Score a move based on its effectiveness.
-    
-    Status moves: Use specialized status scoring
-    Damage moves: Base damage + KO bonus + secondaries + chip synergy - penalties
-    """
     me = ctx.me
     opp = ctx.opp
     if me is None or opp is None:
         return -100.0
-    
+
+    # Setup moves (Dragon Dance / Calm Mind etc.)
     setup_score = score_setup_move(move, battle, ctx)
     if setup_score > 0:
         return setup_score
 
+    # Other status moves
     if move.category == MoveCategory.STATUS:
-        # Status value
         return score_status_move(move, battle, ctx)
 
     dmg_frac = float(estimate_damage_fraction(move, me, opp, battle))
     opp_hp = hp_frac(opp)
 
-    # Base score from damage
-    score = dmg_frac * 100.0
-    
-    # KO bonus
+    accuracy = float(getattr(move, "accuracy", 1.0) or 1.0)
+    accuracy = max(0.0, min(1.0, accuracy))
+
+    # Expected damage
+    score = (dmg_frac * 100.0) * accuracy
+
+    # Small "reliability" bonus
+    score += 5.0 * (accuracy - 0.85) / 0.15 if accuracy >= 0.85 else -10.0
+
+    # KO Bonus
     ko_prob = ko_probability_from_fraction(dmg_frac, opp_hp)
-    # score += ko_bonus(ko_prob, slower=is_slower(me, opp))
-
     if ko_prob > 0:
-        # Base KO value: removing opponent is valuable
-        ko_value = 50.0 * ko_prob
-        
-        # Speed bonus: KOing while faster means we don't take damage
         slower = is_slower(me, opp)
-        speed_bonus = (5.0 if slower else 15.0) * ko_prob
-        
-        score += ko_value + speed_bonus
 
-    accuracy = getattr(move, 'accuracy', 1.0) or 1.0
-    
-    if accuracy >= 1.0:
-        score += 20  # Perfect accuracy (Earthquake, Flamethrower)
-    elif accuracy >= 0.95:
-        score += 15  # Near-perfect (Thunderbolt, Ice Beam)
-    elif accuracy >= 0.90:
-        score += 10  # Good (most standard moves)
-    elif accuracy >= 0.85:
-        score += 5 
-    # There's no reason to score moves with an accuracy less than this, since MCTS will already branch for these (search.py)
+        # Finishing is valuable, but keep it proportional and not bigger than damage itself
+        # If you're faster, KO is slightly more valuable (avoid taking a hit)
+        finish_bonus = (30.0 + (10.0 if not slower else 0.0)) * ko_prob
+        score += finish_bonus
 
-    # Secondary effects
     if ko_prob < 0.95:
         score += score_secondaries(move, battle, ctx, ko_prob, dmg_frac=dmg_frac)
-        # No need to consider secondary effects if the move is already going to KO
-        # 95% chosen here because for damaging statuses like burn/toxic the residual will finish the job
 
-    priority = getattr(move, 'priority', 0) or 0
+    priority = int(getattr(move, "priority", 0) or 0)
     if priority > 0:
-        # Priority moves (Aqua Jet, Mach Punch, etc.) valuable for finishing
+        # priority matters most when you're slower OR opp is low
         if opp_hp < 0.35:
-            score += 20  # Excellent finisher
-        elif opp_hp < 0.50:
-            score += 12  # Good finisher
+            score += 10.0
+        elif is_slower(me, opp):
+            score += 6.0
         else:
-            score += 6   # Minor speed control value
-
-    #Crit potential gains
-    crit_bonus = calculate_crit_bonus(move, battle, ctx, dmg_frac, ko_prob)
-    score += crit_bonus
+            score += 2.0
 
     score -= get_stat_drop_penalty(move, battle, ctx)
-    
-    # Apply recoil penalty
-    recoil = getattr(move, 'recoil', 0) or 0
+
+    recoil = float(getattr(move, "recoil", 0) or 0.0)
     if recoil > 0:
-        # Double-Edge (33%), Brave Bird (33%), Head Smash (50%)
-        # Penalty = recoil_fraction × 50
-        # 33% recoil = -16.5 points, 50% recoil = -25 points (capped at 20)
         recoil_penalty = min(20.0, abs(recoil) * 50.0)
         score -= recoil_penalty
-    
-    return score
+
+    # Crit is probably affecting stability, will soon change to not boost moves with regular crit chance jusr moves with a heightened one
+    score += min(3.0, calculate_crit_bonus(move, battle, ctx, dmg_frac, ko_prob))
+
+    return float(score)
 
 def calculate_crit_bonus(move: Any, battle: Any, ctx: Any, base_damage_frac: float, ko_prob: float) -> float:
     """
@@ -207,118 +184,159 @@ def get_stat_drop_penalty(move: Any, battle: Any, ctx: EvalContext) -> float:
 def score_setup_move(move: Any, battle: Any, ctx: EvalContext) -> float:
     """
     Score stat-boosting moves (Swords Dance, Nasty Plot, Dragon Dance, etc.)
-    
-    Value depends on:
-    - How many stages we boost
-    - Which stats we boost (offensive > defensive)
-    - Whether we can survive to use the boosts (risk assessment)
-    - Current HP situation
-    NOTE: will probably add scoring for how moves improve current matchup too
+
+    Key ideas:
+    - Diminishing returns per stage (strong early, weak late)
+    - Risk-aware: setup is only good if we likely survive
+    - Speed boosts are only valuable if they flip speed order
+    - Depth=3 horizon: repeated setup beyond +1/+2 should be strongly discouraged
+    - Cap output so priors don't dominate everything
     """
-    
+
     boost_data = get_move_boosts(move)
     if not boost_data:
         return 0.0
-    
+
     self_boosts, target_boosts, chance = boost_data
-    
+
     # We only care about self-boosts for setup moves
     if not self_boosts:
         return 0.0
-    
+
     # Only positive boosts (setup moves, not Draco Meteor penalties)
     if all(v <= 0 for v in self_boosts.values()):
         return 0.0
-    
+
     me = ctx.me
     opp = ctx.opp
-    
-    current_boosts = getattr(me, 'boosts', {})
-    
-    # Base value of boosts WITH DIMINISHING RETURNS
+    current_boosts = getattr(me, "boosts", {}) or {}
+
+    # ---------------------------
+    # Base value with diminishing returns
+    # ---------------------------
     boost_value = 0.0
-    
+
     for stat, stages in self_boosts.items():
-        if stages > 0:
-            current_level = current_boosts.get(stat, 0)
-            
-            # Don't boost if already at +6
-            if current_level >= 6:
-                continue
-            
-            # Clamp to +6 max
-            actual_stages = min(stages, 6 - current_level)
-            
-            # Calculate value (the benefits of boosting when already boosted diminish with the more boosts)
-            base_per_stage = 30.0 if stat in ['atk', 'spa'] else 25.0 if stat == 'spe' else 20.0
-            
-            for i in range(actual_stages):
-                new_level = current_level + i + 1
-                
-                if new_level <= 2:
-                    multiplier = 1.0
-                elif new_level == 3:
-                    multiplier = 0.7
-                elif new_level == 4:
-                    multiplier = 0.5
-                elif new_level == 5:
-                    multiplier = 0.3
-                else:  # new_level >= 6
-                    multiplier = 0.1
-                
-                boost_value += base_per_stage * multiplier
-    
-    # If we got no value (already at +6), return 0
-    if boost_value <= 0:
+        if stages <= 0:
+            continue
+
+        current_level = int(current_boosts.get(stat, 0))
+        if current_level >= 6:
+            continue
+
+        actual_stages = min(int(stages), 6 - current_level)
+
+        # base value per stage: keep these reasonable
+        base_per_stage = 30.0 if stat in ["atk", "spa"] else 20.0 if stat == "spe" else 12.0
+
+        for i in range(actual_stages):
+            new_level = current_level + i + 1
+
+            if new_level <= 2:
+                multiplier = 1.0
+            elif new_level == 3:
+                multiplier = 0.7
+            elif new_level == 4:
+                multiplier = 0.5
+            elif new_level == 5:
+                multiplier = 0.3
+            else:  # 6
+                multiplier = 0.1
+
+            boost_value += base_per_stage * multiplier
+
+    if boost_value <= 0.0:
         return 0.0
-    
-    # Risk factor: Can we survive to use the boosts?
-    my_hp = getattr(me, 'current_hp_fraction', 1.0)
-    opp_hp = getattr(opp, 'current_hp_fraction', 1.0)
-    
-    # Estimate opponent's best damage against us
+
+    # ---------------------------
+    # Risk: can we survive the turn we spend setting up?
+    # ---------------------------
+    my_hp = float(getattr(me, "current_hp_fraction", 1.0) or 1.0)
+    opp_hp = float(getattr(opp, "current_hp_fraction", 1.0) or 1.0)
+
     opp_max_damage = 0.0
-    for opp_move in getattr(opp, 'moves', {}).values():
+    for opp_move in getattr(opp, "moves", {}).values():
         try:
-            dmg = estimate_damage_fraction(opp_move, opp, me, battle)
+            dmg = float(estimate_damage_fraction(opp_move, opp, me, battle))
             opp_max_damage = max(opp_max_damage, dmg)
-        except:
-            opp_max_damage = 0.5
-    
-    # Apply risk penalty
+        except Exception:
+            # keep conservative fallback but don't overwrite a found value
+            opp_max_damage = max(opp_max_damage, 0.5)
+
+    # risk scaling (slightly harsher than before)
     if opp_max_damage >= my_hp:
-        boost_value *= 0.2
+        boost_value *= 0.15
     elif opp_max_damage >= my_hp * 0.75:
-        boost_value *= 0.4
+        boost_value *= 0.35
     elif opp_max_damage >= my_hp * 0.5:
-        boost_value *= 0.6
+        boost_value *= 0.55
     else:
-        boost_value *= 1.2
-    
-    # Speed tier consideration
+        boost_value *= 1.10
+
+    # ---------------------------
+    # Speed: reward only if it flips speed order
+    # ---------------------------
     try:
-        my_spe = me.stats.get('spe', 100)
-        opp_spe = opp.stats.get('spe', 100)
-        
-        if my_spe > opp_spe:
-            boost_value *= 1.2
+        my_spe = float(me.stats.get("spe", 100) or 100)
+        opp_spe = float(opp.stats.get("spe", 100) or 100)
+
+        cur_spe_stage = int(current_boosts.get("spe", 0))
+        gained_spe = int(self_boosts.get("spe", 0))
+
+        def spe_multiplier(stage: int) -> float:
+            # Pokémon stage multipliers
+            if stage >= 0:
+                return (2.0 + stage) / 2.0
+            return 2.0 / (2.0 - stage)
+
+        before = my_spe * spe_multiplier(cur_spe_stage)
+        after = my_spe * spe_multiplier(min(6, cur_spe_stage + gained_spe))
+
+        was_slower = before < opp_spe
+        becomes_faster = after >= opp_spe
+
+        if was_slower and becomes_faster:
+            boost_value *= 1.20  # big value: you now move first
+        elif was_slower and not becomes_faster and gained_spe > 0:
+            boost_value *= 0.75  # still slower: meh
         else:
-            boost_value *= 0.9
-    except:
+            boost_value *= 0.95  # already faster or no speed boost: small change
+    except Exception:
         pass
-    
-    # Multi-stat boost bonus
+
+    # ---------------------------
+    # Multi-stat boost bonus (toned down)
+    # ---------------------------
     num_boosted_stats = sum(1 for v in self_boosts.values() if v > 0)
     if num_boosted_stats >= 2:
-        boost_value *= 1.3
-    
-    # HP situation
+        boost_value *= 1.10  # was 1.3 (too high)
+
+    # ---------------------------
+    # HP situation (toned down)
+    # ---------------------------
     if my_hp > 0.8 and opp_hp > 0.6:
-        boost_value *= 1.2
+        boost_value *= 1.05  # was 1.2
     elif opp_hp < 0.3:
-        boost_value *= 0.3
-    
-    return boost_value
+        boost_value *= 0.45  # was 0.3 (still downweight, but less extreme)
+
+    # Horizon factor for depth=3: discourage repeated setup
+    atk_stage = int(current_boosts.get("atk", 0))
+    spa_stage = int(current_boosts.get("spa", 0))
+    spe_stage = int(current_boosts.get("spe", 0))
+
+    max_stage = max(atk_stage, spa_stage, spe_stage)
+
+    if max_stage >= 2:
+        boost_value *= 0.35
+    elif max_stage >= 1:
+        boost_value *= 0.65
+
+    # Final cap to prevent prior domination
+    boost_value = min(boost_value, 70.0)
+
+    # print("Boost value: " + str(boost_value))
+
+    return float(boost_value)
 
 def calculate_boost_ignore_value(move: Any, me: Any, opp: Any, battle: Any, crit_chance: float) -> float:
     """

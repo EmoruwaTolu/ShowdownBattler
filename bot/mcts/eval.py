@@ -116,6 +116,9 @@ def evaluate_state(state: Any) -> float:
         for (kind, obj) in state.legal_actions():
             if kind != "move" or obj is None:
                 continue
+            # skip setup/status moves (no damage)
+            if getattr(obj, "base_power", 0) <= 0:
+                continue
             s = float(state.score_move_fn(obj, state.battle, state.ctx_me))
             if s > best_mv_score:
                 best_mv_score = s
@@ -150,7 +153,6 @@ def evaluate_state(state: Any) -> float:
             switch_term = _tanh01(best_sw_score / 120.0)
 
         boost_term = evaluate_boosts(state)
-        print("Boost term: " + str(boost_term))
 
         # Status shaping (small)
         status_term = 0.0
@@ -167,6 +169,7 @@ def evaluate_state(state: Any) -> float:
         if state.my_status.get(id(state.my_active)) == Status.PAR:
             status_term -= 0.06
 
+    tempo_penalty = 0.04 * state.ply 
     # Weighted sum (anchor on HP, then tempo, then “can we safely escape”)
     value = (
         0.50 * hp_term +
@@ -174,7 +177,7 @@ def evaluate_state(state: Any) -> float:
         0.10 * switch_term +
         0.15 * boost_term + 
         status_term
-    )
+    ) - tempo_penalty
 
     # final clamp
     return max(-1.0, min(1.0, float(value)))

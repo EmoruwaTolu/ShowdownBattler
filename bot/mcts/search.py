@@ -121,8 +121,12 @@ def select_child(node: Node, c_puct: float) -> Tuple[Action, Node]:
     best_child: Optional[Node] = None
 
     for a, child in node.children.items():
-        q = child.Q
-        u = q + c_puct * child.prior * (sqrt_N / (1 + child.N))
+        if child.N == 0:
+            u = float('inf')
+        else:
+            q = child.Q
+            u = q + c_puct * child.prior * (sqrt_N / (1 + child.N))
+        
         if u > best_u:
             best_u = u
             best_a = a
