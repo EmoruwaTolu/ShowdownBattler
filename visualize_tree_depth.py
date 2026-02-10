@@ -36,11 +36,9 @@ def visualize_tree_depth(root, max_depth=4, show_opponent_moves=False):
     
     def get_state_summary(state):
         """Get a summary of the game state - works with your ShadowState"""
-        # Direct attributes (not methods)
         me = state.my_active
         opp = state.opp_active
         
-        # Methods for HP
         my_hp = state.my_active_hp()
         opp_hp = state.opp_active_hp()
         
@@ -48,22 +46,50 @@ def visualize_tree_depth(root, max_depth=4, show_opponent_moves=False):
         my_status = state.my_active_status()
         opp_status = state.opp_active_status()
         
+        # Get boosts
+        my_boosts = state.my_boosts.get(id(me), {})
+        opp_boosts = state.opp_boosts.get(id(opp), {})
+        
         my_species = getattr(me, 'species', 'Unknown')
         opp_species = getattr(opp, 'species', 'Unknown')
         
-        # Format with status if present
+        # Format my side
         my_str = f"{my_species} {my_hp:.2f}"
-        if my_status:
-            status_name = str(my_status).split('.')[-1].lower()
-            my_str += f"({status_name[:3]})"
         
+        # Add status
+        if my_status:
+            status_name = str(my_status).split('.')[-1].lower()[:3]
+            my_str += f"({status_name})"
+        
+        # Add significant boosts (non-zero)
+        my_boost_str = ""
+        for stat in ['atk', 'def', 'spa', 'spd', 'spe']:
+            val = my_boosts.get(stat, 0)
+            if val != 0:
+                my_boost_str += f"{stat[:2]}{val:+d} "
+        
+        if my_boost_str:
+            my_str += f"[{my_boost_str.strip()}]"
+        
+        # Format opponent side
         opp_str = f"{opp_species} {opp_hp:.2f}"
+        
+        # Add status
         if opp_status:
-            status_name = str(opp_status).split('.')[-1].lower()
-            opp_str += f"({status_name[:3]})"
+            status_name = str(opp_status).split('.')[-1].lower()[:3]
+            opp_str += f"({status_name})"
+        
+        # Add significant boosts
+        opp_boost_str = ""
+        for stat in ['atk', 'def', 'spa', 'spd', 'spe']:
+            val = opp_boosts.get(stat, 0)
+            if val != 0:
+                opp_boost_str += f"{stat[:2]}{val:+d} "
+        
+        if opp_boost_str:
+            opp_str += f"[{opp_boost_str.strip()}]"
         
         return f"{my_str} vs {opp_str}"
-    
     def count_nodes_at_depth(node, current_depth, max_depth, counts):
         """Count nodes at each depth level"""
         if current_depth > max_depth:
@@ -107,8 +133,37 @@ def visualize_tree_depth(root, max_depth=4, show_opponent_moves=False):
                 
                 move_name = getattr(obj, 'id', getattr(obj, 'species', 'unknown'))
                 action_str = f"{kind} {move_name}"
+                
+                # NEW: Add outcome annotations (hit/miss/crit)
                 if outcome:
-                    action_str += f" [{outcome}]"
+                    if outcome == 'crit':
+                        action_str += " 💥"  # Crit indicator
+                    elif outcome == 'hit':
+                        action_str += " ✓"   # Hit indicator
+                    elif outcome == 'miss':
+                        action_str += " ✗"   # Miss indicator
+                
+                # Check for crit in debug events
+                if hasattr(child.state, 'events') and child.state.events:
+                    events = child.state.events
+                    move_category = getattr(obj, 'category', None)
+                    
+                    # Only check CRIT for damaging moves
+                    if move_category in [MoveCategory.PHYSICAL, MoveCategory.SPECIAL]:
+                        for event in events:
+                            event_str = str(event)
+                            # Only show CRIT if it's our move
+                            if f'CRIT me:{move_name}' in event_str:
+                                action_str += " CRIT"
+                                break
+                    
+                    # Check MISS for all moves (including STATUS moves that can miss)
+                    for event in events:
+                        event_str = str(event)
+                        # Only show MISS if it's our move
+                        if f'MISS me:{move_name}' in event_str:
+                            action_str += " MISS"
+                            break
                 
                 # Prepare prefix for child
                 if is_last:
@@ -128,7 +183,6 @@ def visualize_tree_depth(root, max_depth=4, show_opponent_moves=False):
             
             if len(children) > num_to_show:
                 print(f"{child_prefix}... and {len(children) - num_to_show} more children")
-    
     # Count nodes at each depth
     depth_counts = {}
     count_nodes_at_depth(root, 0, max_depth, depth_counts)

@@ -15,13 +15,9 @@ def _team_hp_sum(hp_map: dict[int, float]) -> float:
 
 def evaluate_boosts(state: Any) -> float:
     """
-    Evaluate stat boost advantage.
+    Evaluate stat boost advantage with DIMINISHING RETURNS.
     
-    Returns value in [-1, +1]:
-    - Positive: We have boost advantage
-    - Negative: Opponent has boost advantage
-
-    NOTE: This is a fairly rudimentary approach, there's much better way to decide if the boosts on our side are better, will improve this later
+    Going from +0 → +1 is worth more than +2 → +3, hence the diminishing returns function
     """
     my_active_id = id(state.my_active)
     opp_active_id = id(state.opp_active)
@@ -29,25 +25,58 @@ def evaluate_boosts(state: Any) -> float:
     my_boosts = state.my_boosts.get(my_active_id, {})
     opp_boosts = state.opp_boosts.get(opp_active_id, {})
     
-    # Weight boosts by importance
-    my_value = (
-        my_boosts.get('atk', 0) * 1.5 +
-        my_boosts.get('spa', 0) * 1.5 +
-        my_boosts.get('spe', 0) * 1.2 +
-        my_boosts.get('def', 0) * 0.7 +
-        my_boosts.get('spd', 0) * 0.7
-    )
-    
-    opp_value = (
-        opp_boosts.get('atk', 0) * 1.5 +
-        opp_boosts.get('spa', 0) * 1.5 +
-        opp_boosts.get('spe', 0) * 1.2 +
-        opp_boosts.get('def', 0) * 0.7 +
-        opp_boosts.get('spd', 0) * 0.7
-    )
+    # Calculate boost value
+    my_value = _calculate_boost_state_value(my_boosts)
+    opp_value = _calculate_boost_state_value(opp_boosts)
     
     diff = my_value - opp_value
     return _tanh01(diff / 10.0)
+
+
+def _calculate_boost_state_value(boosts: dict) -> float:
+    """
+    Calculate the value of a boost state with diminishing returns.
+    
+    Returns a value where each additional boost stage is worth less.
+    """
+    value = 0.0
+    
+    for stat in ['atk', 'spa', 'spe', 'def', 'spd']:
+        stages = boosts.get(stat, 0)
+        
+        # Weight by stat importance
+        if stat in ['atk', 'spa']:
+            base_weight = 1.5
+        elif stat == 'spe':
+            base_weight = 1.2
+        else:
+            base_weight = 0.7
+        
+        # Apply diminishing returns
+        if stages > 0:
+            # Positive boosts with diminishing returns
+            stage_value = 0.0
+            for i in range(1, stages + 1):
+                if i == 1:
+                    stage_value += 1.0  # 1st stage: full value
+                elif i == 2:
+                    stage_value += 0.8  # 2nd stage: 80%
+                elif i == 3:
+                    stage_value += 0.6  # 3rd stage: 60%
+                elif i == 4:
+                    stage_value += 0.4  # 4th stage: 40%
+                elif i == 5:
+                    stage_value += 0.2  # 5th stage: 20%
+                else:
+                    stage_value += 0.1  # 6th stage: 10%
+            
+            value += stage_value * base_weight
+        
+        elif stages < 0:
+            # Negative boosts (penalty)
+            value += stages * base_weight
+    
+    return value
 
 def evaluate_state(state: Any) -> float:
     """
@@ -121,6 +150,7 @@ def evaluate_state(state: Any) -> float:
             switch_term = _tanh01(best_sw_score / 120.0)
 
         boost_term = evaluate_boosts(state)
+        print("Boost term: " + str(boost_term))
 
         # Status shaping (small)
         status_term = 0.0

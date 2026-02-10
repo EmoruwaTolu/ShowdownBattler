@@ -12,6 +12,7 @@ from bot.scoring.helpers import hp_frac, is_slower
 from bot.scoring.status_score import score_status_move
 from bot.scoring.secondary_score import score_secondaries
 from poke_env.battle import MoveCategory, SideCondition
+from bot.mcts.shadow_state import get_move_boosts
 
 def score_move(move: Any, battle: Any, ctx: EvalContext) -> float:
     """
@@ -24,6 +25,10 @@ def score_move(move: Any, battle: Any, ctx: EvalContext) -> float:
     opp = ctx.opp
     if me is None or opp is None:
         return -100.0
+    
+    setup_score = score_setup_move(move, battle, ctx)
+    if setup_score > 0:
+        return setup_score
 
     if move.category == MoveCategory.STATUS:
         # Status value
@@ -80,6 +85,8 @@ def score_move(move: Any, battle: Any, ctx: EvalContext) -> float:
     #Crit potential gains
     crit_bonus = calculate_crit_bonus(move, battle, ctx, dmg_frac, ko_prob)
     score += crit_bonus
+
+    score -= get_stat_drop_penalty(move, battle, ctx)
     
     # Apply recoil penalty
     recoil = getattr(move, 'recoil', 0) or 0
@@ -159,6 +166,159 @@ def get_crit_chance(crit_ratio: int) -> float:
     else:
         return 1.0         # 100%
 
+def get_stat_drop_penalty(move: Any, battle: Any, ctx: EvalContext) -> float:
+    """
+    Penalty for moves that drop our own stats.
+    
+    Returns positive value to subtract from score.
+    """
+    
+    boost_data = get_move_boosts(move)
+    if not boost_data:
+        return 0.0
+    
+    self_boosts, target_boosts, chance = boost_data
+    if not self_boosts:
+        return 0.0
+    
+    # Calculate penalty
+    penalty = 0.0
+    for stat, stages in self_boosts.items():
+        if stages < 0:  # Only penalize drops
+            if stat in ['atk', 'spa']:
+                penalty += abs(stages) * 15.0  # -2 SpA = -30 points
+            elif stat == 'spe':
+                penalty += abs(stages) * 10.0
+            else:
+                penalty += abs(stages) * 5.0
+    
+    # Reduce penalty if opponent almost dead
+    opp_hp = getattr(ctx.opp, 'current_hp_fraction', 1.0)
+    if opp_hp < 0.3:
+        penalty *= 0.5  # Worth it for the KO
+    
+    # Increase penalty in sweep scenarios
+    my_hp = getattr(ctx.me, 'current_hp_fraction', 1.0)
+    if my_hp > 0.7 and opp_hp > 0.5:
+        penalty *= 1.3  # Need sustained damage
+    
+    return penalty
+
+def score_setup_move(move: Any, battle: Any, ctx: EvalContext) -> float:
+    """
+    Score stat-boosting moves (Swords Dance, Nasty Plot, Dragon Dance, etc.)
+    
+    Value depends on:
+    - How many stages we boost
+    - Which stats we boost (offensive > defensive)
+    - Whether we can survive to use the boosts (risk assessment)
+    - Current HP situation
+    NOTE: will probably add scoring for how moves improve current matchup too
+    """
+    
+    boost_data = get_move_boosts(move)
+    if not boost_data:
+        return 0.0
+    
+    self_boosts, target_boosts, chance = boost_data
+    
+    # We only care about self-boosts for setup moves
+    if not self_boosts:
+        return 0.0
+    
+    # Only positive boosts (setup moves, not Draco Meteor penalties)
+    if all(v <= 0 for v in self_boosts.values()):
+        return 0.0
+    
+    me = ctx.me
+    opp = ctx.opp
+    
+    current_boosts = getattr(me, 'boosts', {})
+    
+    # Base value of boosts WITH DIMINISHING RETURNS
+    boost_value = 0.0
+    
+    for stat, stages in self_boosts.items():
+        if stages > 0:
+            current_level = current_boosts.get(stat, 0)
+            
+            # Don't boost if already at +6
+            if current_level >= 6:
+                continue
+            
+            # Clamp to +6 max
+            actual_stages = min(stages, 6 - current_level)
+            
+            # Calculate value (the benefits of boosting when already boosted diminish with the more boosts)
+            base_per_stage = 30.0 if stat in ['atk', 'spa'] else 25.0 if stat == 'spe' else 20.0
+            
+            for i in range(actual_stages):
+                new_level = current_level + i + 1
+                
+                if new_level <= 2:
+                    multiplier = 1.0
+                elif new_level == 3:
+                    multiplier = 0.7
+                elif new_level == 4:
+                    multiplier = 0.5
+                elif new_level == 5:
+                    multiplier = 0.3
+                else:  # new_level >= 6
+                    multiplier = 0.1
+                
+                boost_value += base_per_stage * multiplier
+    
+    # If we got no value (already at +6), return 0
+    if boost_value <= 0:
+        return 0.0
+    
+    # Risk factor: Can we survive to use the boosts?
+    my_hp = getattr(me, 'current_hp_fraction', 1.0)
+    opp_hp = getattr(opp, 'current_hp_fraction', 1.0)
+    
+    # Estimate opponent's best damage against us
+    opp_max_damage = 0.0
+    for opp_move in getattr(opp, 'moves', {}).values():
+        try:
+            dmg = estimate_damage_fraction(opp_move, opp, me, battle)
+            opp_max_damage = max(opp_max_damage, dmg)
+        except:
+            opp_max_damage = 0.5
+    
+    # Apply risk penalty
+    if opp_max_damage >= my_hp:
+        boost_value *= 0.2
+    elif opp_max_damage >= my_hp * 0.75:
+        boost_value *= 0.4
+    elif opp_max_damage >= my_hp * 0.5:
+        boost_value *= 0.6
+    else:
+        boost_value *= 1.2
+    
+    # Speed tier consideration
+    try:
+        my_spe = me.stats.get('spe', 100)
+        opp_spe = opp.stats.get('spe', 100)
+        
+        if my_spe > opp_spe:
+            boost_value *= 1.2
+        else:
+            boost_value *= 0.9
+    except:
+        pass
+    
+    # Multi-stat boost bonus
+    num_boosted_stats = sum(1 for v in self_boosts.values() if v > 0)
+    if num_boosted_stats >= 2:
+        boost_value *= 1.3
+    
+    # HP situation
+    if my_hp > 0.8 and opp_hp > 0.6:
+        boost_value *= 1.2
+    elif opp_hp < 0.3:
+        boost_value *= 0.3
+    
+    return boost_value
 
 def calculate_boost_ignore_value(move: Any, me: Any, opp: Any, battle: Any, crit_chance: float) -> float:
     """

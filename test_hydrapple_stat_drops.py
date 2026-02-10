@@ -71,7 +71,7 @@ def test_hydrapple_stat_drops():
     randbats_data = load_randbats_data()
     
     player_species = "Hydrapple"
-    opponent_species = "Tyranitar"
+    opponent_species = "Reuniclus"
     
     print("\n" + "=" * 80)
     print("SCENARIO SETUP")
@@ -239,7 +239,7 @@ def test_hydrapple_stat_drops():
         max_depth=3,
         c_puct=1.6,
         seed=42,
-        use_hybrid_expansion=False,
+        use_hybrid_expansion=True,
     )
     
     # Reset to initial state
