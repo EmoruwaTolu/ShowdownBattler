@@ -328,6 +328,8 @@ def _switch_in_penalty(switch_target: Any, opponent: Any, battle: Any) -> float:
         return 0.0
 
     damage = _estimate_damage_from_opponent(opponent, switch_target, battle)
+    print(f"  [SWITCH PENALTY] {opponent.species} → {switch_target.species}")
+    print(f"  Predicted damage: {damage:.1%}")
 
     # Penalty scales with damage
     if damage >= 0.80:
@@ -501,11 +503,11 @@ def score_switch(pokemon: Any, battle: Any, ctx: EvalContext) -> float:
             score -= 20
 
     # Optional debug (leave on for now; pivot no longer calls score_switch)
-    # print(f"\n=== SWITCH DEBUG: {pokemon.species} ===")
-    # print(f"Matchup: {matchup_diff:.1f} × 40 = {matchup_diff * 40:.1f}")
-    # print(f"Danger: {danger:.1f} × 10 = {danger * 10:.1f}")
-    # print(f"Penalty: {switch_penalty:.1f} × 50 = {-switch_penalty * 50:.1f}")
-    # print(f"Total: {score:.1f}")
+    print(f"\n=== SWITCH DEBUG: {pokemon.species} ===")
+    print(f"Matchup: {matchup_diff:.1f} × 40 = {matchup_diff * 40:.1f}")
+    print(f"Danger: {danger:.1f} × 10 = {danger * 10:.1f}")
+    print(f"Penalty: {switch_penalty:.1f} × 50 = {-switch_penalty * 50:.1f}")
+    print(f"Total: {score:.1f}")
 
     return float(score)
 

@@ -314,6 +314,9 @@ def create_pokemon_from_randbats(species_name: str, data: Dict, gen_data, role_n
     print(f"mon.stats['hp']: {mon.stats['hp']}")
     print(f"Expected at L{level}: {calculate_hp(base_stats['hp'], level)}")
     print(f"Expected at L50: {calculate_hp(base_stats['hp'], 50)}")
+    print(f"Moves:")
+    for move_id, move in mon.moves.items():  
+        print(f"  - {move.id}: {move.base_power} BP, {move.category.name}, {move.type.name}")
         
     return mon, role_name, selected_moves, ability, item
 

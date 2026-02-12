@@ -199,11 +199,16 @@ def apply_expected_damage(
     if move is None or not hit:
         return float(defender_hp), False
 
+    # Non-damaging moves should never deal damage in the shadow sim.
+    # (Boosting / status effects are handled elsewhere.)
+    if float(getattr(move, 'base_power', 0) or 0) <= 0:
+        return float(defender_hp), False
+
     try:
         with state._patched_status(), state._patched_boosts():
             dmg_frac = float(state.dmg_fn(move, attacker, defender, state.battle))
     except Exception:
-        dmg_frac = 0.25
+        dmg_frac = 0.0
     
     # Check for forced crit (for hybrid expansion)
     forced_crit = getattr(state, '_forced_crit', None)
@@ -216,9 +221,6 @@ def apply_expected_damage(
         crit_multiplier=state.crit_multiplier,
         forced_crit=forced_crit,
     )
-
-    if did_crit:
-        state = state._log(f"CRIT {getattr(attacker,'species','att')}->{getattr(defender,'species','def')} via {getattr(move,'id','move')}")
 
     return max(0.0, float(defender_hp) - float(dmg_frac)), did_crit
 
@@ -442,6 +444,32 @@ class ShadowState:
         return s
 
     def _order_for_turn(self, my_action: Action, opp_action: Action, rng: random.Random) -> int:
+        """
+        Determine action order for the turn.
+        
+        Order priority:
+        1. Switches always go before moves
+        2. Between moves: higher priority first, then speed, then random
+        3. Between switches: faster Pokemon switches first (simultaneous switches)
+        """
+        my_is_switch = my_action[0] == "switch"
+        opp_is_switch = opp_action[0] == "switch"
+        
+        # If one is switching and the other isn't, switch goes first
+        if my_is_switch and not opp_is_switch:
+            return +1  # We switch first
+        if opp_is_switch and not my_is_switch:
+            return -1  # Opponent switches first
+        
+        # If both switching, faster Pokemon switches first (or random on speed tie)
+        if my_is_switch and opp_is_switch:
+            ms = self._effective_speed(self.my_active, "me")
+            os = self._effective_speed(self.opp_active, "opp")
+            if ms != os:
+                return +1 if ms > os else -1
+            return +1 if rng.random() < 0.5 else -1
+        
+        # Both using moves - check priority, then speed
         mp = move_priority(my_action[1]) if my_action[0] == "move" else 0
         op = move_priority(opp_action[1]) if opp_action[0] == "move" else 0
 
@@ -458,8 +486,25 @@ class ShadowState:
         return +1 if rng.random() < 0.5 else -1
 
     def legal_actions(self) -> List[Action]:
+        """All legal actions for *our* side from this ShadowState.
+
+        Key rule: if our active is fainted, the only legal actions are switches
+        to non-fainted teammates. This avoids impossible "move while fainted"
+        transitions and keeps logs/rollouts consistent.
+        """
         actions: List[Action] = []
 
+        # Forced replacement: a fainted active cannot act.
+        if self.my_hp.get(id(self.my_active), 1.0) <= 0.0:
+            for p in self.my_team:
+                if p is self.my_active:
+                    continue
+                if is_fainted(p) or self.my_hp.get(id(p), 1.0) <= 0.0:
+                    continue
+                actions.append(("switch", p))
+            return actions or [("move", None)]
+
+        # Moves (turn-0 can use battle.available_moves if present, else fall back)
         if self.ply == 0 and getattr(self.battle, "available_moves", None):
             for m in self.battle.available_moves:
                 actions.append(("move", m))
@@ -467,6 +512,7 @@ class ShadowState:
             for m in (getattr(self.my_active, "moves", None) or {}).values():
                 actions.append(("move", m))
 
+        # Switches
         for p in self.my_team:
             if p is self.my_active:
                 continue
@@ -476,8 +522,33 @@ class ShadowState:
 
         return actions or [("move", None)]
 
+
     def legal_actions_opp(self) -> List[Action]:
+        """All legal actions for the opponent side from this ShadowState."""
         actions: List[Action] = []
+
+        # Forced replacement: a fainted active cannot act.
+        if self.opp_hp.get(id(self.opp_active), 1.0) <= 0.0:
+            for p in self.opp_team:
+                if p is self.opp_active:
+                    continue
+                if is_fainted(p) or self.opp_hp.get(id(p), 1.0) <= 0.0:
+                    continue
+                actions.append(("switch", p))
+            return actions or [("move", None)]
+
+        for m in (getattr(self.opp_active, "moves", None) or {}).values():
+            actions.append(("move", m))
+
+        for p in self.opp_team:
+            if p is self.opp_active:
+                continue
+            if is_fainted(p) or self.opp_hp.get(id(p), 1.0) <= 0.0:
+                continue
+            actions.append(("switch", p))
+
+        return actions or [("move", None)]
+
 
         for m in (getattr(self.opp_active, "moves", None) or {}).values():
             actions.append(("move", m))
@@ -495,7 +566,7 @@ class ShadowState:
         actions = self.legal_actions_opp()
         scores: List[float] = []
 
-        with self._patched_status():
+        with self._patched_status(), self._patched_boosts():
             for k, o in actions:
                 if k == "move":
                     scores.append(float(self.score_move_fn(o, self.battle, self.ctx_opp)))
@@ -528,16 +599,31 @@ class ShadowState:
         return actions[-1]
 
     def _apply_end_of_turn_chip(self) -> "ShadowState":
-        CHIP = 1.0 / 16.0  # burn chip per turn in Gen 9
+        CHIP_BRN = 1.0 / 16.0  # burn chip per turn in Gen 9
+        CHIP_PSN = 1.0 / 8.0   # regular poison chip (approx)
+        CHIP_TOX = 1.0 / 6.0   # toxic chip (approx; we don't model counter here)
         new_my_hp = dict(self.my_hp)
         new_opp_hp = dict(self.opp_hp)
 
         # Active-only chip (good approximation for planning)
         if self.my_status.get(id(self.my_active)) == Status.BRN:
-            new_my_hp[id(self.my_active)] = max(0.0, new_my_hp.get(id(self.my_active), 0.0) - CHIP)
+            new_my_hp[id(self.my_active)] = max(0.0, new_my_hp.get(id(self.my_active), 0.0) - CHIP_BRN)
 
         if self.opp_status.get(id(self.opp_active)) == Status.BRN:
-            new_opp_hp[id(self.opp_active)] = max(0.0, new_opp_hp.get(id(self.opp_active), 0.0) - CHIP)
+            new_opp_hp[id(self.opp_active)] = max(0.0, new_opp_hp.get(id(self.opp_active), 0.0) - CHIP_BRN)
+
+        # Poison / toxic (active-only chip approximation)
+        my_st = self.my_status.get(id(self.my_active))
+        if my_st == Status.PSN:
+            new_my_hp[id(self.my_active)] = max(0.0, new_my_hp.get(id(self.my_active), 0.0) - CHIP_PSN)
+        elif my_st == Status.TOX:
+            new_my_hp[id(self.my_active)] = max(0.0, new_my_hp.get(id(self.my_active), 0.0) - CHIP_TOX)
+
+        opp_st = self.opp_status.get(id(self.opp_active))
+        if opp_st == Status.PSN:
+            new_opp_hp[id(self.opp_active)] = max(0.0, new_opp_hp.get(id(self.opp_active), 0.0) - CHIP_PSN)
+        elif opp_st == Status.TOX:
+            new_opp_hp[id(self.opp_active)] = max(0.0, new_opp_hp.get(id(self.opp_active), 0.0) - CHIP_TOX)
 
         return replace(self, my_hp=new_my_hp, opp_hp=new_opp_hp)
 
@@ -583,16 +669,32 @@ class ShadowState:
         s = self
         if order == +1:
             s = s._apply_my_action(my_action, rng)
+            # Don't allow fainted Pokemon to use moves (but allow switches)
             if not s.is_terminal():
-                s = s._apply_opp_action(opp_action, rng)
+                if opp_action[0] == "switch" or s.opp_hp.get(id(s.opp_active), 0.0) > 0.0:
+                    s = s._apply_opp_action(opp_action, rng)
         else:
             s = s._apply_opp_action(opp_action, rng)
+            # Don't allow fainted Pokemon to use moves (but allow switches)
             if not s.is_terminal():
-                s = s._apply_my_action(my_action, rng)
+                if my_action[0] == "switch" or s.my_hp.get(id(s.my_active), 0.0) > 0.0:
+                    s = s._apply_my_action(my_action, rng)
 
         # End of full turn
         if not s.is_terminal():
             s = s._apply_end_of_turn_chip()
+
+        # If an active fainted during the turn, force an automatic replacement.
+        # This prevents illegal "fainted active keeps acting / being evaluated" states.
+        if not s.is_terminal() and s.my_hp.get(id(s.my_active), 1.0) <= 0.0:
+            target = s._best_my_switch()
+            if target is not None:
+                s = s._apply_my_switch(target)
+
+        if not s.is_terminal() and s.opp_hp.get(id(s.opp_active), 1.0) <= 0.0:
+            target = s._best_opp_switch()
+            if target is not None:
+                s = s._apply_opp_switch(target)
 
         return replace(s, ply=s.ply + 1)
 
@@ -602,33 +704,37 @@ class ShadowState:
     def _apply_opp_action(self, action: Action, rng: random.Random) -> "ShadowState":
         return self._apply_opp_switch(action[1]) if action[0] == "switch" else self._apply_opp_move(action[1], rng)
 
+
     def _apply_my_switch(self, new_mon: Any) -> "ShadowState":
-        if new_mon is None or is_fainted(new_mon):
+        if new_mon is None:
             return self
+        # Only check shadow state HP, not the real Pokemon's fainted attribute
         if self.my_hp.get(id(new_mon), 1.0) <= 0.0:
             return self
 
+        s = self._log(f"We switch to {getattr(new_mon, 'species', getattr(new_mon, 'name', 'unknown'))}")
+
         # Keep contexts aligned (best-effort)
         try:
-            ctx_me = replace(self.ctx_me, me=new_mon, opp=self.opp_active)
+            ctx_me = replace(s.ctx_me, me=new_mon, opp=s.opp_active)
         except Exception:
-            ctx_me = self.ctx_me
+            ctx_me = s.ctx_me
             try:
                 ctx_me.me = new_mon
-                ctx_me.opp = self.opp_active
+                ctx_me.opp = s.opp_active
             except Exception:
                 pass
 
         try:
-            ctx_opp = replace(self.ctx_opp, opp=new_mon)
+            ctx_opp = replace(s.ctx_opp, opp=new_mon)
         except Exception:
-            ctx_opp = self.ctx_opp
+            ctx_opp = s.ctx_opp
             try:
                 ctx_opp.opp = new_mon
             except Exception:
                 pass
 
-        return replace(self, my_active=new_mon, ctx_me=ctx_me, ctx_opp=ctx_opp)
+        return replace(s, my_active=new_mon, ctx_me=ctx_me, ctx_opp=ctx_opp)
 
     def _apply_my_move(self, move: Any, rng: random.Random) -> "ShadowState":
         s = self
@@ -667,31 +773,35 @@ class ShadowState:
 
 
     def _apply_opp_switch(self, new_mon: Any) -> "ShadowState":
-        if new_mon is None or is_fainted(new_mon):
+        if new_mon is None:
             return self
+        # Only check shadow state HP, not the real Pokemon's fainted attribute
+        # (The real Pokemon might be fainted, but in this shadow timeline it's alive)
         if self.opp_hp.get(id(new_mon), 1.0) <= 0.0:
             return self
 
+        s = self._log(f"Opp switches to {getattr(new_mon, 'species', getattr(new_mon, 'name', 'unknown'))}")
+
         try:
-            ctx_opp = replace(self.ctx_opp, me=new_mon, opp=self.my_active)
+            ctx_opp = replace(s.ctx_opp, me=new_mon, opp=s.my_active)
         except Exception:
-            ctx_opp = self.ctx_opp
+            ctx_opp = s.ctx_opp
             try:
                 ctx_opp.me = new_mon
-                ctx_opp.opp = self.my_active
+                ctx_opp.opp = s.my_active
             except Exception:
                 pass
 
         try:
-            ctx_me = replace(self.ctx_me, opp=new_mon)
+            ctx_me = replace(s.ctx_me, opp=new_mon)
         except Exception:
-            ctx_me = self.ctx_me
+            ctx_me = s.ctx_me
             try:
                 ctx_me.opp = new_mon
             except Exception:
                 pass
 
-        return replace(self, opp_active=new_mon, ctx_opp=ctx_opp, ctx_me=ctx_me)
+        return replace(s, opp_active=new_mon, ctx_opp=ctx_opp, ctx_me=ctx_me)
 
     def _apply_opp_move(self, move: Any, rng: random.Random) -> "ShadowState":
         s = self
@@ -880,6 +990,11 @@ class ShadowState:
         return best
     
     def _log(self, msg: str) -> "ShadowState":
+        """Append a debug event.
+
+        IMPORTANT: we prefix with the current ply so downstream tooling can
+        reliably attribute events to a single simulated turn.
+        """
         if not getattr(self, "debug", False):
             return self
-        return replace(self, events=self.events + (msg,))
+        return replace(self, events=self.events + (f"[P{self.ply}] {msg}",))

@@ -77,7 +77,7 @@ def action_priors(state: ShadowState, actions: List[Action]) -> Dict[Action, flo
     Convert heuristic scores into priors P(a|s) for PUCT.
     """
     scores: List[float] = []
-    with state._patched_status():
+    with state._patched_status(), state._patched_boosts():
         for kind, obj in actions:
             if kind == "move":
                 scores.append(float(state.score_move_fn(obj, state.battle, state.ctx_me)))
@@ -155,7 +155,7 @@ def should_branch_move(move: Any, state: ShadowState, cfg: MCTSConfig) -> bool:
     # Check 2: Potential OHKO scenarios
     if cfg.branch_potential_ohko:
         try:
-            with state._patched_status():
+            with state._patched_status(), state._patched_boosts():
                 dmg_frac = float(state.dmg_fn(move, state.my_active, state.opp_active, state.battle))
             
             opp_hp = state.opp_active_hp()
@@ -167,7 +167,7 @@ def should_branch_move(move: Any, state: ShadowState, cfg: MCTSConfig) -> bool:
     # Check 3: Crit matters (normal hit doesn't KO but crit does)
     if cfg.branch_crit_matters:
         try:
-            with state._patched_status():
+            with state._patched_status(), state._patched_boosts():
                 dmg_frac = float(state.dmg_fn(move, state.my_active, state.opp_active, state.battle))
             
             opp_hp = state.opp_active_hp()
