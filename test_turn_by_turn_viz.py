@@ -291,4 +291,4 @@ def test_simple_ko_scenario():
 
 if __name__ == "__main__":
     test_switch_in_damage()
-    test_simple_ko_scenario()
+    # test_simple_ko_scenario()

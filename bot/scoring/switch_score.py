@@ -80,6 +80,64 @@ def _estimate_damage_from_opponent(opponent: Any, target: Any, battle: Any) -> f
     except Exception:
         return 0.25
 
+def _estimate_damage_from_us(attacker: Any, defender: Any, battle: Any) -> float:
+    """
+    Estimate the damage we (attacker) would deal to defender.
+    
+    Returns: Fraction of defender's max HP (0.0 - 1.0+)
+    """
+    if attacker is None or defender is None:
+        return 0.0
+    
+    try:
+        from poke_env.calc.damage_calc_gen9 import calculate_damage
+        from poke_env.battle import MoveCategory
+        
+        best_avg_damage = 0.0
+        
+        for move in getattr(attacker, "moves", {}).values():
+            if move is None:
+                continue
+            
+            # Skip status moves
+            if getattr(move, "category", None) == MoveCategory.STATUS:
+                continue
+            
+            # Get identifiers
+            attacker_id = _get_pokemon_identifier(attacker, battle)
+            defender_id = _get_pokemon_identifier(defender, battle)
+            if attacker_id is None or defender_id is None:
+                continue
+            
+            try:
+                # Calculate damage (min/max roll)
+                min_dmg, max_dmg = calculate_damage(
+                    attacker_identifier=attacker_id,
+                    defender_identifier=defender_id,
+                    move=move,
+                    battle=battle,
+                    is_critical=False,
+                )
+                
+                # Convert to fraction
+                defender_max_hp = getattr(defender, "max_hp", None) or getattr(defender, "stats", {}).get("hp", 100)
+                if not defender_max_hp or defender_max_hp <= 0:
+                    continue
+                
+                avg_dmg = (min_dmg + max_dmg) / 2.0
+                dmg_frac = avg_dmg / float(defender_max_hp)
+                
+                best_avg_damage = max(best_avg_damage, float(dmg_frac))
+            
+            except Exception:
+                continue
+        
+        return float(best_avg_damage)
+    
+    except Exception:
+        # Fallback: rough estimate based on types/stats
+        # This is very crude but better than 0.0
+        return 0.25
 
 def _get_pokemon_identifier(pokemon: Any, battle: Any) -> Optional[str]:
     """Get battle identifier for a Pokemon."""
@@ -322,26 +380,227 @@ def _danger_urgency(current_mon: Any, opponent: Any, battle: Any) -> float:
 def _switch_in_penalty(switch_target: Any, opponent: Any, battle: Any) -> float:
     """
     Penalty for taking damage on switch-in.
-    High values = bad switch (takes heavy damage)
+    
+    CRITICAL FIX: Now checks if we SURVIVE the switch-in, not just raw damage.
+    
+    Returns higher penalty if:
+    - We get KO'd on switch (HUGE penalty)
+    - We're left in KO range (big penalty)
+    - We take heavy damage but survive (moderate penalty)
+    
+    Args:
+        switch_target: Pokemon we're switching in
+        opponent: Current opponent active
+        battle: Battle state
+    
+    Returns:
+        Penalty value (higher = worse switch)
     """
     if switch_target is None or opponent is None:
         return 0.0
-
-    damage = _estimate_damage_from_opponent(opponent, switch_target, battle)
-    print(f"  [SWITCH PENALTY] {opponent.species} → {switch_target.species}")
-    print(f"  Predicted damage: {damage:.1%}")
-
-    # Penalty scales with damage
-    if damage >= 0.80:
-        return 80  # Switch-in nearly dies
-    elif damage >= 0.50:
-        return 50  # Heavy damage
-    elif damage >= 0.30:
-        return 20  # Moderate damage
-    elif damage >= 0.15:
-        return 5   # Light chip
+    
+    # Calculate total damage on switch-in
+    hit_damage = _estimate_damage_from_opponent(opponent, switch_target, battle)
+    hazard_damage = _hazard_damage_frac_on_entry(switch_target, battle)
+    total_damage = hit_damage + hazard_damage
+    
+    # Get current HP of switch target
+    current_hp = hp_frac(switch_target)
+    
+    # Calculate HP after switch
+    hp_after = current_hp - total_damage
+    
+    # print(f"  [SWITCH PENALTY] {opponent.species} → {switch_target.species}")
+    # print(f"  Current HP: {current_hp:.1%}")
+    # print(f"  Hit damage: {hit_damage:.1%}")
+    # print(f"  Hazard damage: {hazard_damage:.1%}")
+    # print(f"  Total damage: {total_damage:.1%}")
+    # print(f"  HP after switch: {hp_after:.1%}")
+    
+    # Do we survive?
+    if hp_after <= 0.0:
+        print(f"  → KO'd on switch! Penalty: 100")
+        return 100.0
+    
+    # Are we left in immediate KO range?
+    if hp_after <= 0.15:
+        print(f"  → In KO range! Penalty: 70")
+        return 70.0  # Very bad - likely to die next turn
+    
+    # Are we left weak but alive?
+    if hp_after <= 0.30:
+        penalty = 50.0 + (total_damage * 20)  # 50-70 range
+        print(f"  → Left weak. Penalty: {penalty:.1f}")
+        return penalty
+    
+    # We survive comfortably - penalty scales with damage taken
+    if total_damage >= 0.60:
+        penalty = 35.0  # Heavy damage but we're healthy enough
+    elif total_damage >= 0.45:
+        penalty = 25.0  # Significant damage
+    elif total_damage >= 0.30:
+        penalty = 15.0  # Moderate damage
+    elif total_damage >= 0.20:
+        penalty = 8.0   # Light damage
+    elif total_damage >= 0.10:
+        penalty = 3.0   # Chip damage
     else:
-        return 0   # Minimal damage
+        penalty = 0.0   # Negligible
+    
+    print(f"  → Survivable damage. Penalty: {penalty:.1f}")
+    return penalty
+
+
+def _speed_control_value(switch_target: Any, opponent: Any, battle: Any, ctx: Any = None) -> float:
+    """
+    Value of gaining speed control by switching.
+    
+    Being faster than the opponent lets you:
+    - Attack first (can KO before they act)
+    - Set up safely (they can't revenge kill)
+    - Force switches (they have to respect our speed)
+    
+    Args:
+        switch_target: Pokemon we're switching in
+        opponent: Current opponent active
+        battle: Battle state
+        ctx: Optional EvalContext for boost information
+    
+    Returns:
+        Bonus value (higher = better)
+    """
+    if switch_target is None or opponent is None:
+        return 0.0
+    
+    try:
+        # Get base speeds
+        target_base_speed = getattr(switch_target, "base_stats", {}).get("spe", 80)
+        opp_base_speed = getattr(opponent, "base_stats", {}).get("spe", 80)
+        
+        # Get speed boosts (if available from context)
+        target_spe_boost = 0
+        opp_spe_boost = 0
+        
+        if ctx is not None:
+            try:
+                # Try to get boosts from shadow state if available
+                if hasattr(ctx, 'my_boosts'):
+                    target_spe_boost = ctx.my_boosts.get(id(switch_target), {}).get('spe', 0)
+                if hasattr(ctx, 'opp_boosts'):
+                    opp_spe_boost = ctx.opp_boosts.get(id(opponent), {}).get('spe', 0)
+            except Exception:
+                pass
+        
+        # Calculate effective speeds (simplified boost multiplier)
+        # +1 = 1.5x, +2 = 2x, +3 = 2.5x, etc.
+        def speed_multiplier(boost: int) -> float:
+            if boost >= 1:
+                return 1.0 + (boost * 0.5)
+            elif boost <= -1:
+                return 1.0 / (1.0 + (abs(boost) * 0.5))
+            return 1.0
+        
+        target_eff_speed = target_base_speed * speed_multiplier(target_spe_boost)
+        opp_eff_speed = opp_base_speed * speed_multiplier(opp_spe_boost)
+        
+        # Check paralysis (halves speed)
+        try:
+            from poke_env.battle import Status
+            if getattr(switch_target, 'status', None) == Status.PAR:
+                target_eff_speed *= 0.5
+            if getattr(opponent, 'status', None) == Status.PAR:
+                opp_eff_speed *= 0.5
+        except Exception:
+            pass
+        
+        # Do we outspeed?
+        if target_eff_speed <= opp_eff_speed:
+            return 0.0  # We don't outspeed, no bonus
+        
+        # If we outspeed, value depends on how much damage we threaten
+        our_damage = _estimate_damage_from_us(switch_target, opponent, battle)
+        opp_hp = hp_frac(opponent)
+        
+        # Critical: Can we KO them before they act?
+        if our_damage >= opp_hp * 0.95:
+            return 40.0  # HUGE value - we get a free KO
+        
+        # Can we threaten significant damage?
+        if our_damage >= 0.60:
+            return 30.0  # Very strong - outspeed + big damage
+        elif our_damage >= 0.45:
+            return 20.0  # Good - outspeed + solid damage
+        elif our_damage >= 0.30:
+            return 12.0  # Decent - outspeed + moderate damage
+        else:
+            return 5.0   # Small bonus - just speed control
+    
+    except Exception:
+        return 0.0
+
+
+def _positioning_value(current_mon: Any, switch_target: Any, opponent: Any, battle: Any) -> float:
+    """
+    Value of gaining positional advantage by switching.
+    
+    High value when:
+    - Current mon is forced out anyway (switch is "free")
+    - Switch-in forces opponent to switch (we gain momentum)
+    - We maintain or gain type advantage
+    
+    Args:
+        current_mon: Current active Pokemon
+        switch_target: Pokemon we're switching in
+        opponent: Current opponent active
+        battle: Battle state
+    
+    Returns:
+        Bonus value (higher = better)
+    """
+    if current_mon is None or switch_target is None or opponent is None:
+        return 0.0
+    
+    from bot.scoring.switch_score import _estimate_damage_from_opponent, _matchup_score
+    
+    score = 0.0
+    
+    # Is current mon forced out anyway? (Switch is "free")
+    current_hp = hp_frac(current_mon)
+    damage_if_stay = _estimate_damage_from_opponent(opponent, current_mon, battle)
+    
+    if damage_if_stay >= current_hp * 0.95:
+        score += 25.0  # Switch is free - staying dies anyway
+        # print(f"  [POSITIONING] Free switch - current mon dies if stays (+25)")
+    elif damage_if_stay >= current_hp * 0.75:
+        score += 15.0  # Likely forced out next turn
+        # print(f"  [POSITIONING] Likely forced out (+15)")
+    
+    # Do we force opponent to switch?
+    target_damage_to_opp = _estimate_damage_from_us(switch_target, opponent, battle)
+    opp_hp = hp_frac(opponent)
+    
+    if target_damage_to_opp >= opp_hp * 0.90:
+        score += 20.0  # We threaten KO, they likely switch
+        # print(f"  [POSITIONING] Force opponent switch - threaten KO (+20)")
+    elif target_damage_to_opp >= 0.60:
+        score += 12.0  # We threaten heavy damage
+        # print(f"  [POSITIONING] Force opponent switch - heavy damage (+12)")
+    
+    # Do we maintain/gain type advantage?
+    try:
+        target_matchup = _matchup_score(switch_target, opponent, battle)
+        current_matchup = _matchup_score(current_mon, opponent, battle)
+        
+        if target_matchup > 50 and target_matchup > current_matchup:
+            score += 10.0  # Strong advantage gained
+            # print(f"  [POSITIONING] Gain type advantage (+10)")
+        elif target_matchup > 30:
+            score += 5.0  # Maintain advantage
+            # print(f"  [POSITIONING] Maintain advantage (+5)")
+    except Exception:
+        pass
+    
+    return score
 
 
 def _setup_danger(mon: Any, opponent: Any, battle: Any, ctx: EvalContext) -> float:
@@ -428,89 +687,116 @@ def _best_race_for_mon_vs_opp(battle: Any, ctx: EvalContext, mon: Any, opp: Any)
 
     return best if best is not None else DamageRace(99.0, 99.0, "CLOSE", 0.0, 0)
 
-
-def score_switch(pokemon: Any, battle: Any, ctx: EvalContext) -> float:
-    """
-    Score switching to a specific Pokemon.
-    """
+def score_switch(pokemon: Any, battle: Any, ctx: Any) -> float:
     if pokemon is None or getattr(pokemon, "fainted", False):
         return -999.0
-
+    
     current_mon = ctx.me
     opponent = ctx.opp
-
+    
     if current_mon is None or opponent is None:
         return 10.0 * hp_frac(pokemon)
-
+    
     if pokemon is current_mon:
         return -999.0
-
+    
+    # Matchup differential
     current_matchup = _matchup_score(current_mon, opponent, battle)
     new_matchup = _matchup_score(pokemon, opponent, battle)
     matchup_diff = new_matchup - current_matchup
-
+    
+    # Danger urgency (how badly we need to switch)
     danger = _danger_urgency(current_mon, opponent, battle)
+    
     switch_penalty = _switch_in_penalty(pokemon, opponent, battle)
-
+    
+    # Setup danger differential
     current_setup_risk = _setup_danger(current_mon, opponent, battle, ctx)
     new_setup_risk = _setup_danger(pokemon, opponent, battle, ctx)
     setup_diff = current_setup_risk - new_setup_risk
-
+    
+    # Win condition preservation
     preserve_value = _win_condition_value(pokemon, battle)
-
-    # Race improvement shaping (small)
+    
+    speed_value = _speed_control_value(pokemon, opponent, battle, ctx)
+    
+    positioning_value = _positioning_value(current_mon, pokemon, opponent, battle)
+    
+    # Race improvement (existing code)
     try:
+        from bot.scoring.race import _best_race_for_mon_vs_opp
         now_race = _best_race_for_mon_vs_opp(battle, ctx, current_mon, opponent)
         in_race = _best_race_for_mon_vs_opp(battle, ctx, pokemon, opponent)
-
+        
         if now_race.state in ("LOSING", "CLOSE") and in_race.state == "WINNING":
-            preserve_value += 2.5  # => +25 after *10
+            preserve_value += 2.5
         elif now_race.state == "LOSING" and in_race.state == "CLOSE":
-            preserve_value += 1.0  # => +10
+            preserve_value += 1.0
         elif now_race.state == "WINNING" and in_race.state == "LOSING":
-            preserve_value -= 1.5  # => -15
+            preserve_value -= 1.5
     except Exception:
         pass
-
+    
     score = (
-        matchup_diff * 40
-        + danger * 10
-        - switch_penalty * 50
-        + setup_diff * 25
-        + preserve_value * 10
+        matchup_diff * 40          # Matchup improvement
+        + danger * 10              # Urgency to switch
+        - switch_penalty * 50      # Damage taken (FIXED)
+        + setup_diff * 25          # Setup danger reduction
+        + preserve_value * 10      # Win-con preservation
+        + speed_value              # Speed control (NEW)
+        + positioning_value        # Positioning (NEW)
     )
-
-
-    # Toxic Spikes absorption bonus (grounded Poison-types clear them on entry)
+    
+    # Toxic Spikes absorption
     score += _toxic_spikes_absorb_bonus(pokemon, battle)
-    # Special cases
+    
+    # Regenerator ability
     if str(getattr(pokemon, "ability", "")).lower() == "regenerator":
         score += 15
-
+    
+    # Intimidate ability (vs physical attackers)
     if str(getattr(pokemon, "ability", "")).lower() == "intimidate":
         pressure = estimate_opponent_pressure(battle, ctx)
         physical_prob = float(getattr(pressure, "physical_prob", 0.0) or 0.0)
         if physical_prob > 0.5:
             score += 20 * physical_prob
 
+    # Low danger penalty (don't switch unnecessarily)
     if danger < 40:
         score -= 15
-
+    
+    # Late game logic
     our_remaining = remaining_count(battle.team)
     opp_remaining = remaining_count(battle.opponent_team)
-    if our_remaining <= 2 and opp_remaining <= 2:
+    
+    if our_remaining <= 2:
+        # Late game - be much more conservative
+        from bot.scoring.switch_score import _switch_total_damage_on_entry
+        total_damage = _switch_total_damage_on_entry(pokemon, opponent, battle)
+        
+        if total_damage > 0.50:
+            score -= 50  # Heavy penalty for risky late switches
+        elif total_damage > 0.35:
+            score -= 30
+        
+        # Only switch if matchup improvement is significant
+        if matchup_diff < 30:
+            score -= 35  # Don't make marginal switches late
+    
+    elif our_remaining <= 2 and opp_remaining <= 2:
+        # Both in late game
         if matchup_diff < 20:
             score -= 20
-
-    # Optional debug (leave on for now; pivot no longer calls score_switch)
-    print(f"\n=== SWITCH DEBUG: {pokemon.species} ===")
-    print(f"Matchup: {matchup_diff:.1f} × 40 = {matchup_diff * 40:.1f}")
-    print(f"Danger: {danger:.1f} × 10 = {danger * 10:.1f}")
-    print(f"Penalty: {switch_penalty:.1f} × 50 = {-switch_penalty * 50:.1f}")
-    print(f"Total: {score:.1f}")
-
+    
+    # print(f"\n=== IMPROVED SWITCH SCORE: {pokemon.species} ===")
+    # print(f"Matchup diff: {matchup_diff:.1f} × 40 = {matchup_diff * 40:.1f}")
+    # print(f"Danger: {danger:.1f} × 10 = {danger * 10:.1f}")
+    # print(f"Penalty: {switch_penalty:.1f} × 50 = {-switch_penalty * 50:.1f}")
+    # print(f"Speed value: {speed_value:.1f}")
+    # print(f"Positioning: {positioning_value:.1f}")
+    # print(f"Total: {score:.1f}")
+    
     return float(score)
-
 
 def _slow_pivot_value(current_mon: Any, switch_target: Any, opponent: Any, battle: Any) -> float:
     """
