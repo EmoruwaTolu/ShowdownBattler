@@ -153,7 +153,7 @@ def should_branch_move(move: Any, state: ShadowState, cfg: MCTSConfig) -> bool:
         return True
     
     # Check 2: Potential OHKO scenarios
-    if cfg.branch_potential_ohko:
+    if cfg.branch_potential_ohko and accuracy < 1.0:
         try:
             with state._patched_status(), state._patched_boosts():
                 dmg_frac = float(state.dmg_fn(move, state.my_active, state.opp_active, state.battle))

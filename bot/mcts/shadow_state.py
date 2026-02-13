@@ -666,26 +666,26 @@ class ShadowState:
         opp_action = self.choose_opp_action(rng)
         order = self._order_for_turn(my_action, opp_action, rng)
         
-        print(f"\n=== ACTUAL TURN EXECUTION ===")
-        print(f"Before: {self.my_active.species} {self.my_active_hp():.0%} vs {self.opp_active.species} {self.opp_active_hp():.0%}")
-        print(f"My action: {my_action[0]} {getattr(my_action[1], 'id', getattr(my_action[1], 'species', '?'))}")
-        print(f"Opp action: {opp_action[0]} {getattr(opp_action[1], 'id', getattr(opp_action[1], 'species', '?'))}")
-        print(f"Order: {'+1 (we first)' if order == 1 else '-1 (opp first)'}")
+        # print(f"\n=== ACTUAL TURN EXECUTION ===")
+        # print(f"Before: {self.my_active.species} {self.my_active_hp():.0%} vs {self.opp_active.species} {self.opp_active_hp():.0%}")
+        # print(f"My action: {my_action[0]} {getattr(my_action[1], 'id', getattr(my_action[1], 'species', '?'))}")
+        # print(f"Opp action: {opp_action[0]} {getattr(opp_action[1], 'id', getattr(opp_action[1], 'species', '?'))}")
+        # print(f"Order: {'+1 (we first)' if order == 1 else '-1 (opp first)'}")
 
         s = self
         if order == +1:
-            print(">>> Applying our action...")
+            # print(">>> Applying our action...")
             s = s._apply_my_action(my_action, rng)
             # Don't allow fainted Pokemon to use moves (but allow switches)
-            print(f"After our action: {s.my_active.species} {s.my_active_hp():.0%} vs {s.opp_active.species} {s.opp_active_hp():.0%}")
+            # print(f"After our action: {s.my_active.species} {s.my_active_hp():.0%} vs {s.opp_active.species} {s.opp_active_hp():.0%}")
         
             if not s.is_terminal():
                 if opp_action[0] == "switch" or s.opp_hp.get(id(s.opp_active), 0.0) > 0.0:
-                    print(">>> Applying opponent's action...")
+                    # print(">>> Applying opponent's action...")
                     s = s._apply_opp_action(opp_action, rng)
-                    print(f"After opp action: {s.my_active.species} {s.my_active_hp():.0%} vs {s.opp_active.species} {s.opp_active_hp():.0%}")
-                else:
-                    print(">>> Opponent's action SKIPPED (fainted)")
+                    # print(f"After opp action: {s.my_active.species} {s.my_active_hp():.0%} vs {s.opp_active.species} {s.opp_active_hp():.0%}")
+                # else:
+                    # print(">>> Opponent's action SKIPPED (fainted)")
 
         else:
             s = s._apply_opp_action(opp_action, rng)
@@ -706,9 +706,9 @@ class ShadowState:
                 s = s._apply_my_switch(target)
 
         if not s.is_terminal() and s.opp_hp.get(id(s.opp_active), 1.0) <= 0.0:
-            print(f"[AUTO-SWITCH] Opp active {s.opp_active.species} at {s.opp_hp.get(id(s.opp_active), 1.0):.1%}")
+            # print(f"[AUTO-SWITCH] Opp active {s.opp_active.species} at {s.opp_hp.get(id(s.opp_active), 1.0):.1%}")
             target = s._best_opp_switch()
-            print(f"[AUTO-SWITCH] Switching to {target.species if target else None}")
+            # print(f"[AUTO-SWITCH] Switching to {target.species if target else None}")
             if target is not None:
                 s = s._apply_opp_switch(target)
 
@@ -820,8 +820,8 @@ class ShadowState:
         return replace(s, opp_active=new_mon, ctx_opp=ctx_opp, ctx_me=ctx_me)
 
     def _apply_opp_move(self, move: Any, rng: random.Random) -> "ShadowState":
-        print(f"[_apply_opp_move] START: {self.opp_active.species} using {move.id}")
-        print(f"[_apply_opp_move] Is pivot? {is_pivot_move(move)}")
+        # print(f"[_apply_opp_move] START: {self.opp_active.species} using {move.id}")
+        # print(f"[_apply_opp_move] Is pivot? {is_pivot_move(move)}")
         s = self
         hit = s._sample_hit(move, rng)
 
@@ -844,13 +844,13 @@ class ShadowState:
             s = s._maybe_apply_boosts_opp(move, rng)
 
         if is_pivot_move(move) and hit:
-            print(f"[_apply_opp_move] PIVOT! Switching opponent...")
+            # print(f"[_apply_opp_move] PIVOT! Switching opponent...")
             target = s._best_opp_switch()
             if target is not None:
                 s = s._apply_opp_switch(target)
-                print(f"[_apply_opp_move] Switched to {s.opp_active.species}")
+                # print(f"[_apply_opp_move] Switched to {s.opp_active.species}")
         
-        print(f"[_apply_opp_move] END: {s.opp_active.species}")
+        # print(f"[_apply_opp_move] END: {s.opp_active.species}")
         return s
 
 

@@ -185,6 +185,13 @@ def _has_heavy_duty_boots(pokemon: Any) -> bool:
     item = str(getattr(pokemon, "item", "") or "").lower()
     return item in {"heavydutyboots", "heavy-dutyboots", "heavy-duty boots", "heavy_duty_boots"}
 
+def has_priority(mon) -> bool:
+    for m in (getattr(mon, "moves", {}) or {}).values():
+        if m is None:
+            continue
+        if int(getattr(m, "priority", 0) or 0) > 0:
+            return True
+    return False
 
 def _hazard_damage_frac_on_entry(pokemon: Any, battle: Any) -> float:
     """Estimate fraction of max HP lost on switch-in from damaging hazards on OUR side.
@@ -325,7 +332,7 @@ def _matchup_score(mon: Any, opponent: Any, battle: Any) -> float:
         score -= 60  # OHKO'd
 
     # Offensive evaluation - how much damage can our mon deal?
-    damage_dealt = _estimate_damage_from_opponent(mon, opponent, battle)
+    damage_dealt = _estimate_damage_from_us(mon, opponent, battle)
 
     if damage_dealt > 0.80:
         score += 40  # Threatens OHKO
@@ -419,18 +426,18 @@ def _switch_in_penalty(switch_target: Any, opponent: Any, battle: Any) -> float:
     
     # Do we survive?
     if hp_after <= 0.0:
-        print(f"  → KO'd on switch! Penalty: 100")
+        # print(f"  → KO'd on switch! Penalty: 100")
         return 100.0
     
     # Are we left in immediate KO range?
     if hp_after <= 0.15:
-        print(f"  → In KO range! Penalty: 70")
+        # print(f"  → In KO range! Penalty: 70")
         return 70.0  # Very bad - likely to die next turn
     
     # Are we left weak but alive?
     if hp_after <= 0.30:
         penalty = 50.0 + (total_damage * 20)  # 50-70 range
-        print(f"  → Left weak. Penalty: {penalty:.1f}")
+        # print(f"  → Left weak. Penalty: {penalty:.1f}")
         return penalty
     
     # We survive comfortably - penalty scales with damage taken
@@ -447,7 +454,7 @@ def _switch_in_penalty(switch_target: Any, opponent: Any, battle: Any) -> float:
     else:
         penalty = 0.0   # Negligible
     
-    print(f"  → Survivable damage. Penalty: {penalty:.1f}")
+    # print(f"  → Survivable damage. Penalty: {penalty:.1f}")
     return penalty
 
 
@@ -560,8 +567,6 @@ def _positioning_value(current_mon: Any, switch_target: Any, opponent: Any, batt
     if current_mon is None or switch_target is None or opponent is None:
         return 0.0
     
-    from bot.scoring.switch_score import _estimate_damage_from_opponent, _matchup_score
-    
     score = 0.0
     
     # Is current mon forced out anyway? (Switch is "free")
@@ -628,7 +633,52 @@ def _setup_danger(mon: Any, opponent: Any, battle: Any, ctx: EvalContext) -> flo
         return 15 * setup_prob  # Opponent might try to setup
     else:
         return 30 * setup_prob  # Opponent can setup freely
+    
+def _has_damaging_priority(mon: Any) -> bool:
+    for m in (getattr(mon, "moves", {}) or {}).values():
+        if m is None:
+            continue
+        if int(getattr(m, "priority", 0) or 0) <= 0:
+            continue
+        if getattr(m, "category", None) == MoveCategory.STATUS:
+            continue
+        if int(getattr(m, "base_power", 0) or 0) <= 0:
+            continue
+        return True
+    return False
 
+def _has_hazard_removal(mon: Any) -> bool:
+    REMOVAL_IDS = {"defog", "rapidspin", "tidyup", "mortalspin", "courtchange"}
+    for m in (getattr(mon, "moves", {}) or {}).values():
+        mid = str(getattr(m, "id", "") or "").lower()
+        if mid in REMOVAL_IDS:
+            return True
+    return False
+
+def _is_speed_control(mon: Any) -> bool:
+    """Speed control = either naturally fast OR has damaging priority OR holds scarf."""
+    if mon is None:
+        return False
+    item = str(getattr(mon, "item", "") or "").lower()
+    if item == "choicescarf":
+        return True
+    if _has_damaging_priority(mon):
+        return True
+    try:
+        spe = float((getattr(mon, "base_stats", None) or {}).get("spe", 80))
+        return spe >= 105  # cheap heuristic; tune to taste
+    except Exception:
+        return False
+
+def _alive_team(battle_team_dict) -> list[Any]:
+    out = []
+    for p in (battle_team_dict or {}).values():
+        if p is None:
+            continue
+        if getattr(p, "fainted", False):
+            continue
+        out.append(p)
+    return out
 
 def _win_condition_value(switch_target: Any, battle: Any) -> float:
     """
@@ -690,112 +740,128 @@ def _best_race_for_mon_vs_opp(battle: Any, ctx: EvalContext, mon: Any, opp: Any)
 def score_switch(pokemon: Any, battle: Any, ctx: Any) -> float:
     if pokemon is None or getattr(pokemon, "fainted", False):
         return -999.0
-    
-    current_mon = ctx.me
-    opponent = ctx.opp
-    
+
+    current_mon = getattr(ctx, "me", None)
+    opponent = getattr(ctx, "opp", None)
+
     if current_mon is None or opponent is None:
         return 10.0 * hp_frac(pokemon)
-    
+
     if pokemon is current_mon:
         return -999.0
-    
-    # Matchup differential
+
+    # --- core terms you already have ---
     current_matchup = _matchup_score(current_mon, opponent, battle)
     new_matchup = _matchup_score(pokemon, opponent, battle)
     matchup_diff = new_matchup - current_matchup
-    
-    # Danger urgency (how badly we need to switch)
+
     danger = _danger_urgency(current_mon, opponent, battle)
-    
     switch_penalty = _switch_in_penalty(pokemon, opponent, battle)
-    
-    # Setup danger differential
-    current_setup_risk = _setup_danger(current_mon, opponent, battle, ctx)
-    new_setup_risk = _setup_danger(pokemon, opponent, battle, ctx)
-    setup_diff = current_setup_risk - new_setup_risk
-    
-    # Win condition preservation
-    preserve_value = _win_condition_value(pokemon, battle)
-    
+
+    cur_setup = _setup_danger(current_mon, opponent, battle, ctx)
+    new_setup = _setup_danger(pokemon, opponent, battle, ctx)
+    setup_diff = cur_setup - new_setup
+
     speed_value = _speed_control_value(pokemon, opponent, battle, ctx)
-    
     positioning_value = _positioning_value(current_mon, pokemon, opponent, battle)
-    
-    # Race improvement (existing code)
-    try:
-        from bot.scoring.race import _best_race_for_mon_vs_opp
-        now_race = _best_race_for_mon_vs_opp(battle, ctx, current_mon, opponent)
-        in_race = _best_race_for_mon_vs_opp(battle, ctx, pokemon, opponent)
-        
-        if now_race.state in ("LOSING", "CLOSE") and in_race.state == "WINNING":
-            preserve_value += 2.5
-        elif now_race.state == "LOSING" and in_race.state == "CLOSE":
-            preserve_value += 1.0
-        elif now_race.state == "WINNING" and in_race.state == "LOSING":
-            preserve_value -= 1.5
-    except Exception:
-        pass
-    
+
+    # “trade is good” knob
+    our_remaining = remaining_count(battle.team)
+    opp_remaining = remaining_count(battle.opponent_team)
+    ahead = our_remaining - opp_remaining
+    ahead_factor = max(0.0, min(1.0, (ahead - 1) / 3.0))  # up 2 => .33, up 4+ => 1.0
+
+    preserve_value = _win_condition_value(pokemon, battle)
+
+    # When ahead, “preserve” matters less (you want to convert)
+    preserve_value *= (1.0 - 0.6 * ahead_factor)
+
+    # When ahead, don't over-penalize "unnecessary switch" (play more direct)
+    low_danger_penalty = 15.0 * (1.0 - ahead_factor)
+
+    # role-aware preservation (don’t sack only X)
+    alive = _alive_team(getattr(battle, "team", None))
+
+    num_removers = sum(1 for p in alive if _has_hazard_removal(p))
+    num_priority = sum(1 for p in alive if _has_damaging_priority(p))
+    num_speedctrl = sum(1 for p in alive if _is_speed_control(p))
+
+    is_only_remover = (num_removers == 1 and _has_hazard_removal(pokemon))
+    is_only_priority = (num_priority == 1 and _has_damaging_priority(pokemon))
+    is_only_speedctrl = (num_speedctrl == 1 and _is_speed_control(pokemon))
+
+    # approximate “will this switch likely put the resource into danger?”
+    hit = _estimate_damage_from_opponent(opponent, pokemon, battle)
+    hazard = _hazard_damage_frac_on_entry(pokemon, battle)
+    hp_after = hp_frac(pokemon) - (hit + hazard)
+
+    role_preserve_bonus = 0.0
+    # If we'd be left very low, strongly discourage risking the unique resource.
+    if hp_after <= 0.25:
+        if is_only_remover:
+            role_preserve_bonus += 30.0
+        if is_only_priority:
+            role_preserve_bonus += 22.0
+        if is_only_speedctrl:
+            role_preserve_bonus += 18.0
+    elif hp_after <= 0.40:
+        if is_only_remover:
+            role_preserve_bonus += 15.0
+        if is_only_priority:
+            role_preserve_bonus += 10.0
+        if is_only_speedctrl:
+            role_preserve_bonus += 8.0
+
+    # But when we’re *way* ahead, reduce this a bit (conversion > perfection)
+    role_preserve_bonus *= (1.0 - 0.35 * ahead_factor)
+
+    # “when ahead, convert” bonus: if the switch-in threatens a KO, reward it
+    threat = _estimate_damage_from_us(pokemon, opponent, battle)
+    if ahead_factor > 0.0 and threat >= hp_frac(opponent) * 0.90:
+        positioning_value += 20.0 * ahead_factor
+
+    # final score (keep weights consistent + sane)
     score = (
-        matchup_diff * 40          # Matchup improvement
-        + danger * 10              # Urgency to switch
-        - switch_penalty * 50      # Damage taken (FIXED)
-        + setup_diff * 25          # Setup danger reduction
-        + preserve_value * 10      # Win-con preservation
-        + speed_value              # Speed control (NEW)
-        + positioning_value        # Positioning (NEW)
+        matchup_diff * 0.8
+        + danger * 0.3
+        - switch_penalty * 0.5
+        + setup_diff * 0.8
+        + preserve_value * 0.5
+        + role_preserve_bonus
+        + speed_value
+        + positioning_value
     )
-    
+
     # Toxic Spikes absorption
     score += _toxic_spikes_absorb_bonus(pokemon, battle)
-    
-    # Regenerator ability
+
+    # Ability bumps
     if str(getattr(pokemon, "ability", "")).lower() == "regenerator":
-        score += 15
-    
-    # Intimidate ability (vs physical attackers)
+        score += 15.0
+
     if str(getattr(pokemon, "ability", "")).lower() == "intimidate":
         pressure = estimate_opponent_pressure(battle, ctx)
         physical_prob = float(getattr(pressure, "physical_prob", 0.0) or 0.0)
         if physical_prob > 0.5:
-            score += 20 * physical_prob
+            score += 20.0 * physical_prob
 
-    # Low danger penalty (don't switch unnecessarily)
+    # Low danger penalty (scaled by lead)
     if danger < 40:
-        score -= 15
-    
-    # Late game logic
-    our_remaining = remaining_count(battle.team)
-    opp_remaining = remaining_count(battle.opponent_team)
-    
+        score -= low_danger_penalty
+
+    # Late game safety
     if our_remaining <= 2:
-        # Late game - be much more conservative
-        from bot.scoring.switch_score import _switch_total_damage_on_entry
         total_damage = _switch_total_damage_on_entry(pokemon, opponent, battle)
-        
         if total_damage > 0.50:
-            score -= 50  # Heavy penalty for risky late switches
+            score -= 50
         elif total_damage > 0.35:
             score -= 30
-        
-        # Only switch if matchup improvement is significant
         if matchup_diff < 30:
-            score -= 35  # Don't make marginal switches late
-    
+            score -= 35
     elif our_remaining <= 2 and opp_remaining <= 2:
-        # Both in late game
         if matchup_diff < 20:
             score -= 20
-    
-    # print(f"\n=== IMPROVED SWITCH SCORE: {pokemon.species} ===")
-    # print(f"Matchup diff: {matchup_diff:.1f} × 40 = {matchup_diff * 40:.1f}")
-    # print(f"Danger: {danger:.1f} × 10 = {danger * 10:.1f}")
-    # print(f"Penalty: {switch_penalty:.1f} × 50 = {-switch_penalty * 50:.1f}")
-    # print(f"Speed value: {speed_value:.1f}")
-    # print(f"Positioning: {positioning_value:.1f}")
-    # print(f"Total: {score:.1f}")
-    
+
     return float(score)
 
 def _slow_pivot_value(current_mon: Any, switch_target: Any, opponent: Any, battle: Any) -> float:

@@ -4,7 +4,7 @@ import os
 import re
 from typing import Any
 
-from poke_env.battle import Status
+from poke_env.battle import Status, MoveCategory
 from bot.model.opponent_model import build_opponent_belief
 from bot.scoring.race import evaluate_race_for_move
 
@@ -95,6 +95,36 @@ AVG_UNSEEN_ROLE_WEIGHT = avg_unseen_role_weight(RANDBATS_DB)
 # Discount so unseen priors don't over-dominate real, known board state
 UNSEEN_SLOT_DISCOUNT = 0.90
 
+
+def _move_id(m: Any) -> str:
+    return _norm_id(getattr(m, "id", getattr(m, "name", "")))
+
+def _mon_has_removal(mon: Any) -> bool:
+    for mv in (getattr(mon, "moves", None) or {}).values():
+        if mv is None:
+            continue
+        if _move_id(mv) in REMOVAL:
+            return True
+    return False
+
+def _mon_has_damaging_priority(mon: Any) -> bool:
+    # "speed control / priority user" ≈ has a damaging move with priority > 0
+    for mv in (getattr(mon, "moves", None) or {}).values():
+        if mv is None:
+            continue
+        pr = int(getattr(mv, "priority", 0) or 0)
+        if pr <= 0:
+            continue
+        if getattr(mv, "category", None) == MoveCategory.STATUS:
+            continue
+        try:
+            if int(getattr(mv, "base_power", 0) or 0) <= 0:
+                continue
+        except Exception:
+            pass
+        return True
+    return False
+
 def candidate_role_weight(c) -> float:
     w = 1.0
 
@@ -162,6 +192,12 @@ def team_value(team, hp_map, boosts_map, gen: int, status_map=None) -> float:
     total = 0.0
     status_map = status_map or {}
 
+    # Alive list for "only X left" checks
+    alive = [m for m in team if float(hp_map.get(id(m), 0.0)) > 0.0]
+
+    num_removers = sum(1 for m in alive if _mon_has_removal(m))
+    num_priority = sum(1 for m in alive if _mon_has_damaging_priority(m))
+
     for mon in team:
         hp = float(hp_map.get(id(mon), 0.0))
         if hp <= 0.0:
@@ -171,13 +207,25 @@ def team_value(team, hp_map, boosts_map, gen: int, status_map=None) -> float:
         boosts = (boosts_map.get(id(mon), {}) if boosts_map else {}) or {}
         st = status_map.get(id(mon), None)
 
+        # Unique-role multiplier: preserve only remover / only priority
+        unique_mult = 1.0
+        try:
+            if num_removers == 1 and _mon_has_removal(mon):
+                unique_mult *= 1.10
+            if num_priority == 1 and _mon_has_damaging_priority(mon):
+                unique_mult *= 1.07
+        except Exception:
+            pass
+
         v = hp
         v *= role_w
+        v *= unique_mult
         v *= boost_multiplier(boosts, hp)
         v *= low_hp_multiplier(hp, role_w)
         v *= status_multiplier(st)
 
         total += v
+
     return total
 
 def opp_unseen_value(opp_known_count: int, opp_total: int = 6) -> float:
@@ -263,25 +311,14 @@ def _calculate_boost_state_value(boosts: dict) -> float:
     
     return value
 
+
 def evaluate_state(state: Any) -> float:
     """
     Returns a scalar value for MCTS backup: higher is better for us.
     Range ~[-1, +1].
-
-    6v6-aware shaping:
-      - Belief-weighted team value (HP * role importance * boosts, with low-HP penalty)
-      - Unseen opponent slot value (prevents "it's just a 1v1" behavior)
-      - Numbers advantage
-      - Local race/tempo (best damaging move)
-      - Escape hatch (best switch) only when race is bad
-      - Boost advantage (active vs active) with diminishing returns
-      - Status shaping (small)
-      - Active preservation term (small)
-      - Progress term (prefer converting the lead)
-      - Sac penalty when ahead (don’t throw away mons for no reason)
     """
 
-    # --- Hard terminal-ish checks that should dominate everything ---
+    #   Hard terminal-ish checks that should dominate everything  
     my_sum_raw = _team_hp_sum(state.my_hp)
     opp_sum_raw = _team_hp_sum(state.opp_hp)
 
@@ -296,37 +333,32 @@ def evaluate_state(state: Any) -> float:
     if opp_sum_raw <= 1e-9 and (battle_finished or opp_known >= opp_total):
         return +1.0
 
-    # IMPORTANT SAFETY:
-    # If our active is fainted but opponent active is not, this state is *immediately bad*
-    # (and in your current simulator it can happen mid-turn due to move ordering).
     my_active_hp = float(state.my_hp.get(id(state.my_active), 0.0))
     opp_active_hp = float(state.opp_hp.get(id(state.opp_active), 0.0))
+
+    # Safety: if our active is fainted but theirs isn't, clamp strongly negative
     if my_active_hp <= 0.0 and opp_active_hp > 0.0:
-        # Don’t let boosts/race accidentally make this look good.
-        # Still give *tiny* credit if we’re massively ahead in resources, but keep it very negative.
-        # (You can tune 0.15 later.)
         lead_hint = _tanh01((my_sum_raw - opp_sum_raw) / 1.5)
         return max(-1.0, min(1.0, float(-0.90 + 0.15 * lead_hint)))
 
     gen = int(getattr(state.battle, "gen", 9) or 9)
 
     with state._patched_status(), state._patched_boosts():
-        # --- Team value (belief-weighted) ---
-        my_value = team_value(state.my_team, state.my_hp, state.my_boosts, gen)
-        opp_value_known = team_value(state.opp_team, state.opp_hp, state.opp_boosts, gen)
+        #   Team value (belief-weighted)  
+        my_value = team_value(state.my_team, state.my_hp, state.my_boosts, gen, status_map=state.my_status)
+        opp_value_known = team_value(state.opp_team, state.opp_hp, state.opp_boosts, gen, status_map=state.opp_status)
 
-        # Unseen opponent slots treated as alive resources.
         opp_unseen = max(0, opp_total - opp_known)
         opp_value = opp_value_known + opp_unseen_value(opp_known, opp_total)
 
         team_term = _tanh01((my_value - opp_value) / 1.2)
 
-        # --- Numbers advantage (healthy count) ---
+        #   Numbers advantage (healthy count)  
         my_healthy = healthy_count(state.my_team, state.my_hp, 0.55)
         opp_healthy = healthy_count(state.opp_team, state.opp_hp, 0.55) + opp_unseen
         numbers_term = _tanh01((my_healthy - opp_healthy) / 1.5)
 
-        # --- Best-move race advantage (local tempo) ---
+        #   Best-move race advantage (local tempo)  
         best_mv = None
         best_mv_score = -1e18
         for (kind, obj) in state.legal_actions():
@@ -344,7 +376,7 @@ def evaluate_state(state: Any) -> float:
             race = evaluate_race_for_move(state.battle, state.ctx_me, best_mv)
             race_term = _tanh01((race.ttd_me - race.tko_opp) / 1.5)
 
-        # --- Escape hatch only when losing the race ---
+        #   Escape hatch only when losing the race  
         switch_term = 0.0
         if race_term < 0.0:
             best_sw_score = -1e18
@@ -356,17 +388,19 @@ def evaluate_state(state: Any) -> float:
                 sc = float(state.score_switch_fn(p, state.battle, state.ctx_me))
                 if sc > best_sw_score:
                     best_sw_score = sc
-            switch_term = _tanh01(best_sw_score / 120.0)
 
-        # --- Boost term (active vs active) ---
-        # If our active is extremely low, don’t let boosts dominate (they might be unusable).
+            # normalize to your switch_score scale
+            SW_NORM = 35.0
+            switch_term = _tanh01(best_sw_score / SW_NORM)
+
+        # Boost term (active vs active)
         boost_term = evaluate_boosts(state)
         if my_active_hp < 0.20:
             boost_term *= 0.40
         elif my_active_hp < 0.35:
             boost_term *= 0.70
 
-        # --- Status shaping (small, but “preserve breaker” aware) ---
+        # Status shaping
         status_term = 0.0
         if state.opp_status.get(id(state.opp_active)) == Status.BRN:
             status_term += 0.10
@@ -379,37 +413,43 @@ def evaluate_state(state: Any) -> float:
         if state.my_status.get(id(state.my_active)) in (Status.PSN, Status.TOX):
             status_term -= 0.05
 
-        # --- Active preservation ---
+        # Active preservation  
         my_active_role = expected_role_weight_for_mon(state.my_active, gen)
         if my_active_role > 1.06:
             active_preserve = _tanh01((my_active_hp - 0.60) / 0.20)
         else:
             active_preserve = _tanh01((my_active_hp - 0.45) / 0.25)
 
-    # --- Tempo penalty (deeper is slightly worse) ---
+    #   Tempo penalty  
     tempo_penalty = 0.04 * float(state.ply)
 
-    # --- Progress / conversion ---
-    # Encourage lines that actually reduce opponent resources, especially when ahead.
+    #   Progress / conversion  
     opp_sum_now = _team_hp_sum(state.opp_hp)
     progress_term = _tanh01((1.0 - opp_sum_now) / 0.6)
 
-    # --- Material lead (alive count) ---
+    #   Material lead (alive count)  
     my_alive = sum(1 for v in state.my_hp.values() if float(v) > 0.0)
     opp_alive = sum(1 for v in state.opp_hp.values() if float(v) > 0.0)
     ahead = my_alive - opp_alive
 
-    # --- Sac penalty when ahead ---
+    # Lead factor for "when ahead, trade is good"
+    ahead_factor = max(0.0, min(1.0, (ahead - 1) / 3.0))  # up2=>.33, up4+=>1
+    active_preserve *= (1.0 - 0.50 * ahead_factor)
+
+    #   Sac penalty when ahead (trade-aware)  
     sac_penalty = 0.0
     if ahead >= 2:
         if my_active_hp <= 0.0:
-            sac_penalty += 0.25
+            if opp_active_hp <= 0.0:
+                sac_penalty += 0.02  # trade is basically fine
+            else:
+                sac_penalty += 0.20  # true sack is bad
         elif my_active_hp < 0.15:
-            sac_penalty += 0.12
+            sac_penalty += 0.10
         elif my_active_hp < 0.30:
-            sac_penalty += 0.06
+            sac_penalty += 0.05
 
-    # --- Dynamic weights ---
+    #   Dynamic weights  
     if ahead >= 2:
         w_team = 0.34
         w_numbers = 0.08
