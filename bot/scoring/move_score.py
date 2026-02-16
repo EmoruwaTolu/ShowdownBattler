@@ -326,10 +326,12 @@ def score_setup_move(move: Any, battle: Any, ctx: EvalContext) -> float:
 
     max_stage = max(atk_stage, spa_stage, spe_stage)
 
-    if max_stage >= 2:
-        boost_value *= 0.35
+    if max_stage >= 4:
+        boost_value *= 0.50  # Only penalize extreme setup
+    elif max_stage >= 2:
+        boost_value *= 0.80  # Mild penalty
     elif max_stage >= 1:
-        boost_value *= 0.65
+        boost_value *= 0.90  # Very mild penalty
 
     # Final cap to prevent prior domination
     boost_value = min(boost_value, 70.0)

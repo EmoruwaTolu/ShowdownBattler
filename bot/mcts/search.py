@@ -114,23 +114,69 @@ def select_child(node: Node, c_puct: float) -> Tuple[Action, Node]:
     """
     Pick child that maximizes:
       Q + c_puct * P * sqrt(N_parent) / (1 + N_child)
+    
+    For hybrid actions (multiple outcome branches), uses expected Q across all branches.
     """
     sqrt_N = math.sqrt(max(1, node.N))
     best_a: Optional[Action] = None
     best_u = -1e18
     best_child: Optional[Node] = None
-
+    
+    # Group children by base action (for hybrid branches)
+    base_action_groups = {}
     for a, child in node.children.items():
-        if child.N == 0:
-            u = float('inf')
+        # Base action is (kind, obj) without outcome label
+        base_action = (a[0], a[1]) if len(a) >= 2 else a
+        if base_action not in base_action_groups:
+            base_action_groups[base_action] = []
+        base_action_groups[base_action].append((a, child))
+    
+    for base_action, action_children in base_action_groups.items():
+        if len(action_children) == 1:
+            # Single outcome (not hybrid) - use normal PUCT
+            a, child = action_children[0]
+            if child.N == 0:
+                u = float('inf')
+            else:
+                q = child.Q
+                u = q + c_puct * child.prior * (sqrt_N / (1 + child.N))
+            
+            if u > best_u:
+                best_u = u
+                best_a = a
+                best_child = child
         else:
-            q = child.Q
-            u = q + c_puct * child.prior * (sqrt_N / (1 + child.N))
-        
-        if u > best_u:
-            best_u = u
-            best_a = a
-            best_child = child
+            # Multiple outcomes (hybrid) - use EXPECTED Q across branches
+            # Calculate expected Q weighted by outcome probabilities
+            total_prior = sum(child.prior for _, child in action_children)
+            
+            if total_prior > 0:
+                # Expected Q = sum(probability * Q) for each outcome
+                expected_q = 0.0
+                total_n = 0
+                
+                for a, child in action_children:
+                    if child.N > 0:
+                        # Weight by probability (stored in prior)
+                        probability = child.prior / total_prior
+                        expected_q += probability * child.Q
+                        total_n += child.N
+                
+                # Use total visits across all branches for exploration term
+                if total_n > 0:
+                    u = expected_q + c_puct * total_prior * (sqrt_N / (1 + total_n))
+                else:
+                    u = float('inf')  # Unexplored hybrid action
+                
+                if u > best_u:
+                    best_u = u
+                    # Select the least-visited branch to explore
+                    min_visits = min(child.N for _, child in action_children)
+                    for a, child in action_children:
+                        if child.N == min_visits:
+                            best_a = a
+                            best_child = child
+                            break
 
     return best_a, best_child
 
@@ -296,6 +342,42 @@ def evaluate_leaf(node: Node) -> float:
     return float(evaluate_state(node.state))
 
 
+def get_action_expected_q(node: Node, base_action: Tuple) -> Tuple[float, int]:
+    """
+    For hybrid actions with multiple outcome branches, compute expected Q.
+    Returns (expected_q, total_visits)
+    """
+    # Find all children that match this base action
+    matching_children = []
+    for a, child in node.children.items():
+        child_base = (a[0], a[1]) if len(a) >= 2 else a
+        if child_base == base_action:
+            matching_children.append(child)
+    
+    if not matching_children:
+        return 0.0, 0
+    
+    if len(matching_children) == 1:
+        # Single outcome - just return its Q
+        child = matching_children[0]
+        return child.Q, child.N
+    
+    # Multiple outcomes - compute expected value
+    total_prior = sum(child.prior for child in matching_children)
+    total_visits = sum(child.N for child in matching_children)
+    
+    if total_prior <= 0 or total_visits == 0:
+        return 0.0, total_visits
+    
+    expected_q = sum(
+        (child.prior / total_prior) * child.Q 
+        for child in matching_children
+        if child.N > 0
+    )
+    
+    return expected_q, total_visits
+
+
 def backup(node: Node, value: float) -> None:
     cur: Optional[Node] = node
     while cur is not None:
@@ -355,14 +437,13 @@ def search(
         model_crit=cfg.model_crit,
         crit_chance=cfg.crit_chance,
         crit_multiplier=cfg.crit_multiplier,
-        debug=True
+        debug=False
     )
     root = Node(root_state, parent=None, prior=1.0)
 
     # Expand root once (using master_rng so it's reproducible)
     expand(root, master_rng, cfg, is_root=True)
 
-    # Optional: restrict root to moves only
     if not allow_switches and root.children:
         root.children = {a: n for a, n in root.children.items() if a[0] == "move"}
         if not root.children:
@@ -401,38 +482,86 @@ def search(
         backup(node, value)
 
     # Build root stats
-    actions = list(root.children.keys())
+    # Group actions by base action to handle hybrid branches
+    base_action_map = {}
+    for a in list(root.children.keys()):
+        base_action = (a[0], a[1]) if len(a) >= 2 else a
+        if base_action not in base_action_map:
+            base_action_map[base_action] = []
+        base_action_map[base_action].append(a)
+    
     rows: List[Dict[str, Any]] = []
-    for a in actions:
-        child = root.children[a]
-        kind, name = action_name(a)
-        rows.append(
-            {
+    for base_action, action_list in base_action_map.items():
+        if len(action_list) == 1:
+            # Single outcome - use directly
+            a = action_list[0]
+            child = root.children[a]
+            kind, name = action_name(a)
+            rows.append({
                 "kind": kind,
                 "name": name,
                 "visits": int(child.N),
                 "q": float(child.Q),
                 "prior": float(child.prior),
-            }
-        )
+                "action": a,  # Store for picking
+            })
+        else:
+            # Multiple outcomes (hybrid) - compute expected Q
+            expected_q, total_visits = get_action_expected_q(root, base_action)
+            total_prior = sum(root.children[a].prior for a in action_list)
+            
+            # Use the base action name (without outcome label)
+            kind = base_action[0]
+            obj = base_action[1]
+            if kind == "move":
+                name = str(getattr(obj, "id", "") or getattr(obj, "name", "") or "move")
+            else:
+                name = str(getattr(obj, "species", "") or getattr(obj, "name", "") or "switch")
+            
+            # Pick most-visited branch as representative
+            best_branch = max(action_list, key=lambda a: root.children[a].N)
+            
+            rows.append({
+                "kind": kind,
+                "name": name + " [expected]",  # Mark as expected value
+                "visits": int(total_visits),
+                "q": float(expected_q),
+                "prior": float(total_prior),
+                "action": best_branch,  # Store for picking
+            })
+    
     rows.sort(key=lambda d: (d["visits"], d["q"]), reverse=True)
 
-    # Pick best action from root children
+    # Pick best action from root children (based on total visits for hybrid actions)
     if cfg.temperature and cfg.temperature > 1e-9:
-        visits = [root.children[a].N for a in actions]
+        # Temperature-based selection
+        base_action_visits = {}
+        for base_action, action_list in base_action_map.items():
+            total_visits = sum(root.children[a].N for a in action_list)
+            base_action_visits[base_action] = total_visits
+        
+        actions_for_temp = list(base_action_visits.keys())
+        visits = list(base_action_visits.values())
         m = max(visits)
         weights = [math.exp((v - m) / float(cfg.temperature)) for v in visits]
         z = sum(weights) or 1.0
         r = master_rng.random() * z
         acc = 0.0
-        picked = actions[-1]
-        for a, w in zip(actions, weights):
+        picked_base = actions_for_temp[-1]
+        for ba, w in zip(actions_for_temp, weights):
             acc += w
             if acc >= r:
-                picked = a
+                picked_base = ba
                 break
+        
+        # Pick most-visited branch of this base action
+        picked = max(base_action_map[picked_base], key=lambda a: root.children[a].N)
     else:
-        picked = max(actions, key=lambda a: root.children[a].N)
+        # Argmax visits across all base actions
+        best_base_action = max(base_action_map.keys(), 
+                              key=lambda ba: sum(root.children[a].N for a in base_action_map[ba]))
+        # Pick most-visited branch
+        picked = max(base_action_map[best_base_action], key=lambda a: root.children[a].N)
 
     payload = {"top": rows[:10], "sims": int(cfg.num_simulations)}
 

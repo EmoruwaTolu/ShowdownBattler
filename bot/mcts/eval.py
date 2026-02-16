@@ -2,12 +2,19 @@ import math
 import json
 import os
 import re
-from typing import Any
+from typing import Any, Optional
 
 from poke_env.battle import Status, MoveCategory
 from bot.model.opponent_model import build_opponent_belief
 from bot.scoring.race import evaluate_race_for_move
 
+from bot.mcts.randbats_analyzer import (
+    is_physical_attacker as rb_is_physical,
+    is_fast_sweeper as rb_is_fast,
+    is_defensive as rb_is_defensive,
+    has_setup_potential as rb_has_setup,
+    has_priority_moves as rb_has_priority,
+)
 
 def _tanh01(x: float) -> float:
     # maps to (-1, 1)
@@ -312,6 +319,96 @@ def _calculate_boost_state_value(boosts: dict) -> float:
     return value
 
 
+# ============================================================================
+# Perfect Detection Helper Functions (using randbats database)
+# ============================================================================
+
+def is_physical_attacker_perfect(mon: Any) -> bool:
+    """
+    Check if Pokemon is physical attacker using randbats database.
+    Falls back to base stats if needed.
+    """
+    try:
+        return rb_is_physical(mon)
+    except:
+        # Fallback to base stats
+        try:
+            atk = mon.base_stats.get('atk', 100)
+            spa = mon.base_stats.get('spa', 100)
+            return atk > spa * 1.1
+        except:
+            return True
+
+
+def is_fast_sweeper_perfect(mon: Any) -> bool:
+    """
+    Check if Pokemon is fast sweeper using randbats database.
+    Falls back to base speed if needed.
+    """
+    try:
+        return rb_is_fast(mon)
+    except:
+        # Fallback to base speed
+        try:
+            spe = mon.base_stats.get('spe', 100)
+            return spe >= 100
+        except:
+            return False
+
+
+def is_defensive_perfect(mon: Any) -> bool:
+    """
+    Check if Pokemon is defensive using randbats database.
+    Falls back to bulk calculation if needed.
+    """
+    try:
+        return rb_is_defensive(mon)
+    except:
+        # Fallback to bulk calculation
+        try:
+            hp = mon.base_stats.get('hp', 100)
+            defense = mon.base_stats.get('def', 100)
+            spdef = mon.base_stats.get('spd', 100)
+            bulk = hp * (defense + spdef) / 2
+            return bulk > 15000
+        except:
+            return False
+
+
+def has_setup_potential_perfect(mon: Any) -> bool:
+    """
+    Check if Pokemon has setup moves using randbats database.
+    Falls back to checking known moves if needed.
+    """
+    try:
+        return rb_has_setup(mon)
+    except:
+        # Fallback: check known moves
+        for move in (getattr(mon, 'moves', None) or {}).values():
+            move_id = _norm_id(str(getattr(move, 'id', '') or ''))
+            if move_id in SETUP_MOVES:
+                return True
+        return False
+
+
+def has_priority_move_perfect(mon: Any) -> bool:
+    """
+    Check if Pokemon has priority moves using randbats database.
+    Falls back to checking known moves if needed.
+    """
+    try:
+        return rb_has_priority(mon)
+    except:
+        # Fallback: check known moves
+        for move in (getattr(mon, 'moves', None) or {}).values():
+            if move is None:
+                continue
+            priority = int(getattr(move, 'priority', 0) or 0)
+            if priority > 0 and getattr(move, 'base_power', 0) > 0:
+                return True
+        return False
+
+
 def evaluate_state(state: Any) -> float:
     """
     Returns a scalar value for MCTS backup: higher is better for us.
@@ -340,6 +437,51 @@ def evaluate_state(state: Any) -> float:
     if my_active_hp <= 0.0 and opp_active_hp > 0.0:
         lead_hint = _tanh01((my_sum_raw - opp_sum_raw) / 1.5)
         return max(-1.0, min(1.0, float(-0.90 + 0.15 * lead_hint)))
+
+    # === PERFECT: Endgame detection ===
+    my_alive_count = sum(1 for v in state.my_hp.values() if v > 0)
+    opp_alive_count = sum(1 for v in state.opp_hp.values() if v > 0)
+    
+    # Pure 1v1 endgame
+    if my_alive_count == 1 and opp_alive_count == 1:
+        endgame_value = 0.0
+        
+        # HP advantage
+        hp_diff = my_active_hp - opp_active_hp
+        endgame_value += _tanh01(hp_diff / 0.4)
+        
+        # Priority move advantage
+        if has_priority_move_perfect(state.my_active) and not has_priority_move_perfect(state.opp_active):
+            endgame_value += 0.10
+        elif has_priority_move_perfect(state.opp_active) and not has_priority_move_perfect(state.my_active):
+            endgame_value -= 0.10
+        
+        # Residual damage (poison/toxic)
+        my_status_eg = state.my_status.get(id(state.my_active))
+        opp_status_eg = state.opp_status.get(id(state.opp_active))
+        
+        if my_status_eg in (Status.PSN, Status.TOX) and opp_status_eg not in (Status.PSN, Status.TOX):
+            endgame_value -= 0.12
+        elif opp_status_eg in (Status.PSN, Status.TOX) and my_status_eg not in (Status.PSN, Status.TOX):
+            endgame_value += 0.12
+        
+        return max(-1.0, min(1.0, endgame_value))
+    
+    # 1v2+ (we're down to last mon)
+    elif my_alive_count == 1 and opp_alive_count >= 2:
+        my_boosts_eg = state.my_boosts.get(id(state.my_active), {})
+        max_boost = max((v for v in my_boosts_eg.values() if v > 0), default=0)
+        
+        if has_setup_potential_perfect(state.my_active) and my_active_hp > 0.7 and max_boost < 2:
+            return -0.30  # Can try to setup sweep
+        elif max_boost >= 4:
+            return -0.10  # Already boosted
+        else:
+            return -0.70  # Probably losing
+    
+    # 2+v1 (opponent down to last mon)
+    elif my_alive_count >= 2 and opp_alive_count == 1:
+        return +0.70  # We're winning
 
     gen = int(getattr(state.battle, "gen", 9) or 9)
 
@@ -400,18 +542,37 @@ def evaluate_state(state: Any) -> float:
         elif my_active_hp < 0.35:
             boost_term *= 0.70
 
-        # Status shaping
+        # === PERFECT: Context-aware status evaluation ===
         status_term = 0.0
+        
+        # Opponent status (good for us)
         if state.opp_status.get(id(state.opp_active)) == Status.BRN:
-            status_term += 0.10
+            if is_physical_attacker_perfect(state.opp_active):
+                status_term += 0.18  # Physical attacker burned!
+            else:
+                status_term += 0.08  # Special attacker burned
         if state.opp_status.get(id(state.opp_active)) == Status.PAR:
-            status_term += 0.06
+            if is_fast_sweeper_perfect(state.opp_active):
+                status_term += 0.12  # Fast sweeper paralyzed!
+            else:
+                status_term += 0.06
+        
+        # Our status (bad for us)
         if state.my_status.get(id(state.my_active)) == Status.BRN:
-            status_term -= 0.10
+            if is_physical_attacker_perfect(state.my_active):
+                status_term -= 0.18  # Our physical attacker burned!
+            else:
+                status_term -= 0.08
         if state.my_status.get(id(state.my_active)) == Status.PAR:
-            status_term -= 0.06
+            if is_fast_sweeper_perfect(state.my_active):
+                status_term -= 0.12  # Our fast sweeper paralyzed!
+            else:
+                status_term -= 0.06
         if state.my_status.get(id(state.my_active)) in (Status.PSN, Status.TOX):
-            status_term -= 0.05
+            if is_defensive_perfect(state.my_active):
+                status_term -= 0.12  # Our defensive mon poisoned!
+            else:
+                status_term -= 0.05
 
         # Active preservation  
         my_active_role = expected_role_weight_for_mon(state.my_active, gen)

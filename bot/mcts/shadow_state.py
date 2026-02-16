@@ -33,14 +33,6 @@ def move_priority(move: Any) -> int:
     except Exception:
         return 0
 
-
-def base_speed(p: Any, default: int = 80) -> float:
-    try:
-        return float((p.base_stats or {}).get("spe", default))
-    except Exception:
-        return float(default)
-
-
 def status_infliction(move: Any) -> Optional[Tuple[Status, float]]:
     """
     Returns (status, probability) for the move's major status effect.
@@ -246,6 +238,9 @@ class ShadowState:
     my_boosts: Dict[int, Dict[str, int]] = field(default_factory=dict)
     opp_boosts: Dict[int, Dict[str, int]] = field(default_factory=dict)
 
+    my_toxic_counter: int = 0
+    opp_toxic_counter: int = 0
+
     ply: int = 0
 
     score_move_fn: Optional[ScoreMoveFn] = None
@@ -262,6 +257,9 @@ class ShadowState:
 
     events: Tuple[str, ...] = ()
     debug: bool = False
+    
+    # Cache for expensive operations (role weights, damage, etc.)
+    cache: Optional[Any] = None
 
     @staticmethod
     def from_battle(
@@ -278,7 +276,8 @@ class ShadowState:
         model_crit: bool = True,
         crit_chance: float = 1.0 / 24.0,
         crit_multiplier: float = 1.5,
-        debug: bool = False
+        debug: bool = False,
+        cache: Optional[Any] = None
     ) -> "ShadowState":
         me = ctx_me.me
         opp = ctx_me.opp
@@ -342,6 +341,7 @@ class ShadowState:
             crit_chance=crit_chance,
             crit_multiplier=crit_multiplier,
             debug=bool(debug),
+            cache=cache,
         )
 
     @contextmanager
@@ -437,7 +437,7 @@ class ShadowState:
         return all(v <= 0.0 for v in self.my_hp.values()) or all(v <= 0.0 for v in self.opp_hp.values())
 
     def _effective_speed(self, p: Any, side: str) -> float:
-        s = base_speed(p)
+        s = float((p.stats or {}).get('spe', 100)) #use the pokemon's actual stats not base stats
         st = (self.my_status if side == "me" else self.opp_status).get(id(p))
         if st == Status.PAR:
             s *= 0.5
@@ -483,7 +483,8 @@ class ShadowState:
             return +1 if ms > os else -1
 
         # speed tie
-        return +1 if rng.random() < 0.5 else -1
+        result = +1 if rng.random() < 0.5 else -1
+        return result
 
     def legal_actions(self) -> List[Action]:
         """All legal actions for *our* side from this ShadowState.
@@ -601,9 +602,11 @@ class ShadowState:
     def _apply_end_of_turn_chip(self) -> "ShadowState":
         CHIP_BRN = 1.0 / 16.0  # burn chip per turn in Gen 9
         CHIP_PSN = 1.0 / 8.0   # regular poison chip (approx)
-        CHIP_TOX = 1.0 / 6.0   # toxic chip (approx; we don't model counter here)
         new_my_hp = dict(self.my_hp)
         new_opp_hp = dict(self.opp_hp)
+
+        new_my_toxic_counter = self.my_toxic_counter
+        new_opp_toxic_counter = self.opp_toxic_counter
 
         # Active-only chip (good approximation for planning)
         if self.my_status.get(id(self.my_active)) == Status.BRN:
@@ -617,15 +620,24 @@ class ShadowState:
         if my_st == Status.PSN:
             new_my_hp[id(self.my_active)] = max(0.0, new_my_hp.get(id(self.my_active), 0.0) - CHIP_PSN)
         elif my_st == Status.TOX:
-            new_my_hp[id(self.my_active)] = max(0.0, new_my_hp.get(id(self.my_active), 0.0) - CHIP_TOX)
+            # Increment toxic counter
+            new_my_toxic_counter += 1
+            # Toxic damage scales: 1/16, 2/16, 3/16, etc.
+            toxic_damage = new_my_toxic_counter / 16.0
+            new_my_hp[id(self.my_active)] = max(0.0, new_my_hp.get(id(self.my_active), 0.0) - toxic_damage)
 
         opp_st = self.opp_status.get(id(self.opp_active))
         if opp_st == Status.PSN:
             new_opp_hp[id(self.opp_active)] = max(0.0, new_opp_hp.get(id(self.opp_active), 0.0) - CHIP_PSN)
         elif opp_st == Status.TOX:
-            new_opp_hp[id(self.opp_active)] = max(0.0, new_opp_hp.get(id(self.opp_active), 0.0) - CHIP_TOX)
+            # Increment toxic counter
+            new_opp_toxic_counter += 1
+            # Toxic damage scales: 1/16, 2/16, 3/16, etc.
+            toxic_damage = new_opp_toxic_counter / 16.0
+            new_opp_hp[id(self.opp_active)] = max(0.0, new_opp_hp.get(id(self.opp_active), 0.0) - toxic_damage)
 
-        return replace(self, my_hp=new_my_hp, opp_hp=new_opp_hp)
+        return replace(self, my_hp=new_my_hp, opp_hp=new_opp_hp,
+                      my_toxic_counter=new_my_toxic_counter, opp_toxic_counter=new_opp_toxic_counter)
 
     def _sample_hit(self, move: Any, rng: random.Random) -> bool:
         # Check for forced outcome first (for hybrid expansion)
@@ -662,6 +674,10 @@ class ShadowState:
         """
         if self.is_terminal():
             return self
+        
+        # Right before the speed comparison
+        ms = self._effective_speed(self.my_active, "me")
+        os = self._effective_speed(self.opp_active, "opp")
 
         opp_action = self.choose_opp_action(rng)
         order = self._order_for_turn(my_action, opp_action, rng)
@@ -701,16 +717,28 @@ class ShadowState:
         # If an active fainted during the turn, force an automatic replacement.
         # This prevents illegal "fainted active keeps acting / being evaluated" states.
         if not s.is_terminal() and s.my_hp.get(id(s.my_active), 1.0) <= 0.0:
+            if s.debug:
+                print(f"[AUTO-SWITCH] My active {s.my_active.species} fainted (HP: {s.my_hp.get(id(s.my_active), 1.0):.1%})")
             target = s._best_my_switch()
             if target is not None:
+                if s.debug:
+                    print(f"[AUTO-SWITCH] → Switching to {target.species} (HP: {s.my_hp.get(id(target), 1.0):.1%})")
                 s = s._apply_my_switch(target)
+            else:
+                if s.debug:
+                    print(f"[AUTO-SWITCH] → No valid switch target!")
 
         if not s.is_terminal() and s.opp_hp.get(id(s.opp_active), 1.0) <= 0.0:
-            # print(f"[AUTO-SWITCH] Opp active {s.opp_active.species} at {s.opp_hp.get(id(s.opp_active), 1.0):.1%}")
+            if s.debug:
+                print(f"[AUTO-SWITCH] Opp active {s.opp_active.species} fainted (HP: {s.opp_hp.get(id(s.opp_active), 1.0):.1%})")
             target = s._best_opp_switch()
-            # print(f"[AUTO-SWITCH] Switching to {target.species if target else None}")
             if target is not None:
+                if s.debug:
+                    print(f"[AUTO-SWITCH] → Switching to {target.species} (HP: {s.opp_hp.get(id(target), 1.0):.1%})")
                 s = s._apply_opp_switch(target)
+            else:
+                if s.debug:
+                    print(f"[AUTO-SWITCH] → No valid switch target!")
 
         return replace(s, ply=s.ply + 1)
 
@@ -750,10 +778,18 @@ class ShadowState:
             except Exception:
                 pass
 
-        return replace(s, my_active=new_mon, ctx_me=ctx_me, ctx_opp=ctx_opp)
+        # Reset toxic counter on switch
+        return replace(s, my_active=new_mon, ctx_me=ctx_me, ctx_opp=ctx_opp, my_toxic_counter=0)
 
     def _apply_my_move(self, move: Any, rng: random.Random) -> "ShadowState":
         s = self
+
+        my_status = s.my_status.get(id(s.my_active))
+        if my_status == Status.PAR:
+            if rng.random() < 0.25:  # 25% chance to be fully paralyzed
+                s = s._log(f"FULL PARA me:{s.my_active.species}")
+                return s  # Move fails, return immediately
+        
         hit = s._sample_hit(move, rng)
 
         if not hit:
@@ -817,12 +853,20 @@ class ShadowState:
             except Exception:
                 pass
 
-        return replace(s, opp_active=new_mon, ctx_opp=ctx_opp, ctx_me=ctx_me)
+        # Reset toxic counter on switch
+        return replace(s, opp_active=new_mon, ctx_opp=ctx_opp, ctx_me=ctx_me, opp_toxic_counter=0)
 
     def _apply_opp_move(self, move: Any, rng: random.Random) -> "ShadowState":
         # print(f"[_apply_opp_move] START: {self.opp_active.species} using {move.id}")
         # print(f"[_apply_opp_move] Is pivot? {is_pivot_move(move)}")
         s = self
+
+        my_status = s.my_status.get(id(s.my_active))
+        if my_status == Status.PAR:
+            if rng.random() < 0.25:  # 25% chance to be fully paralyzed
+                s = s._log(f"FULL PARA me:{s.my_active.species}")
+                return s  # Move fails, return immediately
+        
         hit = s._sample_hit(move, rng)
 
         if not hit:

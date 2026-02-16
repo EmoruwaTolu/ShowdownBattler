@@ -1,10 +1,3 @@
-"""
-Comprehensive MCTS Test Suite
-- Increased simulations (500)
-- Multiple battle scenarios
-- Config: Hybrid ON, tau=3.0
-"""
-
 import sys
 import os
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -35,8 +28,8 @@ def create_mock_battle(*args, **kwargs):
 # Optimal config from testing
 OPTIMAL_CONFIG = MCTSConfig(
     num_simulations=500,  # Increased!
-    max_depth=3,
-    c_puct=1.6,
+    max_depth=5,
+    c_puct=5.0,
     seed=42,
     use_hybrid_expansion=True,
 )
@@ -191,14 +184,14 @@ def test_all_scenarios():
     clefable._identifier_string = "p2: Clefable"
     clefable.current_hp_fraction = 0.40
     
-    run_scenario(
-        "Offensive Play - Type Advantage",
-        "Garchomp vs weakened Landorus. Should MCTS go for the KO or set up hazards?",
-        [garchomp, weavile],
-        [landorus, clefable],
-        garchomp,
-        landorus
-    )
+    # run_scenario(
+    #     "Offensive Play - Type Advantage",
+    #     "Garchomp vs weakened Landorus. Should MCTS go for the KO or set up hazards?",
+    #     [garchomp, weavile],
+    #     [landorus, clefable],
+    #     garchomp,
+    #     landorus
+    # )
     
     # =========================================================================
     # SCENARIO 2: Setup Sweeper Opportunity
@@ -224,6 +217,110 @@ def test_all_scenarios():
         blissey
     )
     
+    # DEBUG: Examine what happens after Close Combat
+    print("\n" + "=" * 80)
+    print("DEBUG: Examining Close Combat simulation path")
+    print("=" * 80)
+    
+    # Re-run with debug to see the tree
+    battle = create_mock_battle(
+        active_identifier=lucario._identifier_string,
+        active=lucario,
+        opponent_identifier=blissey._identifier_string,
+        opponent=blissey,
+        team={lucario._identifier_string: lucario, tyranitar._identifier_string: tyranitar},
+        opponent_team={blissey._identifier_string: blissey, landorus._identifier_string: landorus}
+    )
+    battle.opponent_team_size = 6
+    battle.available_moves = list(lucario.moves.values())
+    battle.available_switches = [tyranitar]
+    
+    ctx_me = EvalContext(me=lucario, opp=blissey, battle=battle, cache={})
+    ctx_opp = EvalContext(me=blissey, opp=lucario, battle=battle, cache={})
+    
+    # Test damage calculation
+    print("\n=== DAMAGE CALCULATION TEST ===")
+    eq_dmg = estimate_damage_fraction(landorus.moves['earthquake'], landorus, tyranitar, battle)
+    print(f"Landorus Earthquake vs Tyranitar (70% HP): {eq_dmg:.1%} damage")
+    print(f"Result: Tyranitar dies? {eq_dmg >= 0.70} (needs {eq_dmg:.1%} to KO)")
+    
+    # Run search with tree
+    picked, stats = search(
+        battle=battle,
+        ctx_me=ctx_me,
+        ctx_opp=ctx_opp,
+        score_move_fn=score_move,
+        score_switch_fn=score_switch,
+        dmg_fn=estimate_damage_fraction,
+        cfg=OPTIMAL_CONFIG,
+        opp_tau=OPTIMAL_TAU,
+        return_stats=True,
+        return_tree=True,
+    )
+    
+    root = stats['root']
+    
+    # Find Close Combat node
+    cc_node = None
+    sd_node = None
+    for action, child in root.children.items():
+        if action[0] == 'move':
+            move_id = str(action[1].id).lower()
+            if 'closecombat' in move_id:
+                cc_node = child
+            elif 'swordsdance' in move_id:
+                sd_node = child
+    
+    if cc_node:
+        print(f"\n=== CLOSE COMBAT NODE (N={cc_node.N}, Q={cc_node.Q:.3f}) ===")
+        print(f"State after Close Combat:")
+        if cc_node.state:
+            print(f"  My team HP: {[f'{v:.0%}' for v in cc_node.state.my_hp.values()]}")
+            print(f"  Opp team HP: {[f'{v:.0%}' for v in cc_node.state.opp_hp.values()]}")
+            print(f"  Ply: {cc_node.state.ply}")
+        
+        if cc_node.children:
+            print(f"\nActions explored after Close Combat (top 10):")
+            cc_children = sorted(cc_node.children.items(), key=lambda x: x[1].N, reverse=True)
+            for action, child in cc_children[:10]:
+                kind = action[0]
+                obj = action[1]
+                outcome = action[2] if len(action) > 2 else ""
+                name = getattr(obj, 'id', getattr(obj, 'species', 'unknown'))
+                if outcome:
+                    name = f"{name} [{outcome}]"
+                print(f"  {kind:6s} {name:20s} | N={child.N:3d} Q={child.Q:+.3f}")
+        else:
+            print("  (No children - leaf node or terminal)")
+    
+    if sd_node:
+        print(f"\n=== SWORDS DANCE NODE (N={sd_node.N}, Q={sd_node.Q:.3f}) ===")
+        print(f"State after Swords Dance:")
+        if sd_node.state:
+            print(f"  My team HP: {[f'{v:.0%}' for v in sd_node.state.my_hp.values()]}")
+            print(f"  Opp team HP: {[f'{v:.0%}' for v in sd_node.state.opp_hp.values()]}")
+            print(f"  Ply: {sd_node.state.ply}")
+            my_active_boosts = sd_node.state.my_boosts.get(id(sd_node.state.my_active), {})
+            if my_active_boosts:
+                print(f"  My active boosts: {my_active_boosts}")
+        
+        if sd_node.children:
+            print(f"\nActions explored after Swords Dance (top 10):")
+            sd_children = sorted(sd_node.children.items(), key=lambda x: x[1].N, reverse=True)
+            for action, child in sd_children[:10]:
+                kind = action[0]
+                obj = action[1]
+                outcome = action[2] if len(action) > 2 else ""
+                name = getattr(obj, 'id', getattr(obj, 'species', 'unknown'))
+                if outcome:
+                    name = f"{name} [{outcome}]"
+                print(f"  {kind:6s} {name:20s} | N={child.N:3d} Q={child.Q:+.3f}")
+        else:
+            print("  (No children - leaf node or terminal)")
+    
+    print("=" * 80)
+
+    
     # =========================================================================
     # SCENARIO 3: Revenge Killing
     # =========================================================================
@@ -239,14 +336,14 @@ def test_all_scenarios():
     corviknight._identifier_string = "p1: Corviknight"
     corviknight.current_hp_fraction = 0.80
     
-    run_scenario(
-        "Revenge Kill - Ice Shard Priority",
-        "Weavile (full HP) vs weakened Garchomp. Ice Shard should KO. Will MCTS use it?",
-        [weavile2, corviknight],
-        [garchomp2, clefable],
-        weavile2,
-        garchomp2
-    )
+    # run_scenario(
+    #     "Revenge Kill - Ice Shard Priority",
+    #     "Weavile (full HP) vs weakened Garchomp. Ice Shard should KO. Will MCTS use it?",
+    #     [weavile2, corviknight],
+    #     [garchomp2, clefable],
+    #     weavile2,
+    #     garchomp2
+    # )
     
     # =========================================================================
     # SCENARIO 4: Bad Matchup - Should Switch
@@ -263,14 +360,14 @@ def test_all_scenarios():
     rillaboom._identifier_string = "p1: Rillaboom"
     rillaboom.current_hp_fraction = 0.95
     
-    run_scenario(
-        "Bad Matchup - Switch Out",
-        "Heatran vs Swampert (4x weak to Ground). Should MCTS switch to Rillaboom?",
-        [heatran, rillaboom],
-        [swampert, garchomp2],
-        heatran,
-        swampert
-    )
+    # run_scenario(
+    #     "Bad Matchup - Switch Out",
+    #     "Heatran vs Swampert (4x weak to Ground). Should MCTS switch to Rillaboom?",
+    #     [heatran, rillaboom],
+    #     [swampert, garchomp2],
+    #     heatran,
+    #     swampert
+    # )
     
     # =========================================================================
     # SCENARIO 5: Endgame 1v1
@@ -283,14 +380,14 @@ def test_all_scenarios():
     toxapex._identifier_string = "p2: Toxapex"
     toxapex.current_hp_fraction = 0.60
     
-    run_scenario(
-        "Endgame 1v1 - No Switches",
-        "Dragapult vs Toxapex. Last mon standing. What's the play?",
-        [dragapult],
-        [toxapex],
-        dragapult,
-        toxapex
-    )
+    # run_scenario(
+    #     "Endgame 1v1 - No Switches",
+    #     "Dragapult vs Toxapex. Last mon standing. What's the play?",
+    #     [dragapult],
+    #     [toxapex],
+    #     dragapult,
+    #     toxapex
+    # )
     
     print("\n" + "=" * 80)
     print("TEST SUITE COMPLETE")
