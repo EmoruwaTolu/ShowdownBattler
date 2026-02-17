@@ -6,7 +6,7 @@ from contextlib import contextmanager
 import math
 import random
 
-from poke_env.battle import Status, MoveCategory
+from poke_env.battle import Status, MoveCategory, PokemonType
 
 from bot.scoring.helpers import hp_frac, is_fainted
 
@@ -20,6 +20,114 @@ DamageFn = Callable[[Any, Any, Any, Any], float]
 
 def _clamp01(x: float) -> float:
     return max(0.0, min(1.0, float(x)))
+
+
+def _get_item(pokemon: Any) -> Optional[str]:
+    """Get normalized item id string from a Pokemon."""
+    item = getattr(pokemon, 'item', None)
+    if item and isinstance(item, str) and item.strip():
+        return item.lower().replace(' ', '').replace('-', '')
+    return None
+
+
+CHOICE_ITEMS = frozenset({'choiceband', 'choicespecs', 'choicescarf'})
+
+SPIKES_DAMAGE = {1: 1.0 / 8.0, 2: 1.0 / 6.0, 3: 1.0 / 4.0}
+
+
+def _is_grounded(pokemon: Any) -> bool:
+    """Check if a Pokemon is grounded (not Flying-type). Ignores Levitate for simplicity."""
+    try:
+        t1 = getattr(pokemon, 'type_1', None)
+        t2 = getattr(pokemon, 'type_2', None)
+        return not (t1 == PokemonType.FLYING or t2 == PokemonType.FLYING)
+    except Exception:
+        return True
+
+
+def _is_poison_type(pokemon: Any) -> bool:
+    try:
+        t1 = getattr(pokemon, 'type_1', None)
+        t2 = getattr(pokemon, 'type_2', None)
+        return t1 == PokemonType.POISON or t2 == PokemonType.POISON
+    except Exception:
+        return False
+
+
+def _rock_effectiveness(pokemon: Any) -> float:
+    """Rock-type damage multiplier against a Pokemon's types."""
+    try:
+        from poke_env.data import GenData
+        type_chart = GenData.from_gen(9).type_chart
+        mult = 1.0
+        for t in [getattr(pokemon, 'type_1', None), getattr(pokemon, 'type_2', None)]:
+            if t is not None:
+                mult *= PokemonType.damage_multiplier(PokemonType.ROCK, t, type_chart=type_chart)
+        return float(mult)
+    except Exception:
+        return 1.0
+
+
+def _apply_hazards_on_entry(
+    pokemon: Any,
+    side_conditions: Dict[str, int],
+    current_status: Optional[Status],
+) -> Tuple[float, Optional[Status], Optional[Dict[str, int]], Dict[str, int]]:
+    """
+    Calculate hazard effects when a Pokemon switches in.
+
+    Returns:
+        (damage_frac, new_status_or_None, spe_boost_change_or_None, updated_side_conditions)
+    """
+    # Heavy-Duty Boots negates all hazards
+    if _get_item(pokemon) == 'heavydutyboots':
+        return (0.0, None, None, side_conditions)
+
+    dmg = 0.0
+    inflict_status: Optional[Status] = None
+    spe_change: Optional[Dict[str, int]] = None
+    updated_sc = dict(side_conditions)
+    grounded = _is_grounded(pokemon)
+
+    # Stealth Rock: 1/8 * rock effectiveness
+    if updated_sc.get('stealthrock', 0) > 0:
+        dmg += (1.0 / 8.0) * _rock_effectiveness(pokemon)
+
+    # Spikes: grounded only
+    spikes_layers = min(3, max(0, updated_sc.get('spikes', 0)))
+    if spikes_layers > 0 and grounded:
+        dmg += SPIKES_DAMAGE.get(spikes_layers, 0.0)
+
+    # Toxic Spikes: grounded only
+    tspikes_layers = min(2, max(0, updated_sc.get('toxicspikes', 0)))
+    if tspikes_layers > 0 and grounded:
+        if _is_poison_type(pokemon):
+            # Grounded Poison-type absorbs Toxic Spikes
+            updated_sc['toxicspikes'] = 0
+        elif current_status is None:
+            # Only inflict if not already statused
+            if tspikes_layers >= 2:
+                inflict_status = Status.TOX
+            else:
+                inflict_status = Status.PSN
+
+    # Sticky Web: grounded only, -1 spe
+    if updated_sc.get('stickyweb', 0) > 0 and grounded:
+        spe_change = {'spe': -1}
+
+    return (dmg, inflict_status, spe_change, updated_sc)
+
+
+def _side_conditions_to_dict(sc: Any) -> Dict[str, int]:
+    """Convert battle.side_conditions (Dict[SideCondition, int]) to Dict[str, int]."""
+    if not sc:
+        return {}
+    result = {}
+    for key, val in sc.items():
+        # key might be a SideCondition enum or a string
+        name = getattr(key, 'name', str(key)).lower().replace('_', '')
+        result[name] = int(val) if val else 1
+    return result
 
 
 def is_pivot_move(move: Any) -> bool:
@@ -241,6 +349,12 @@ class ShadowState:
     my_toxic_counter: int = 0
     opp_toxic_counter: int = 0
 
+    my_choice_lock: Optional[str] = None   # move id we're locked into
+    opp_choice_lock: Optional[str] = None  # move id opponent is locked into
+
+    my_side_conditions: Dict[str, int] = field(default_factory=dict)
+    opp_side_conditions: Dict[str, int] = field(default_factory=dict)
+
     ply: int = 0
 
     score_move_fn: Optional[ScoreMoveFn] = None
@@ -330,7 +444,11 @@ class ShadowState:
             my_status=my_status,
             opp_status=opp_status,
             my_boosts=my_boosts,
-            opp_boosts=opp_boosts, 
+            opp_boosts=opp_boosts,
+            my_side_conditions=_side_conditions_to_dict(
+                getattr(battle, 'side_conditions', None)),
+            opp_side_conditions=_side_conditions_to_dict(
+                getattr(battle, 'opponent_side_conditions', None)),
             score_move_fn=score_move_fn,
             score_switch_fn=score_switch_fn,
             dmg_fn=dmg_fn,
@@ -441,6 +559,9 @@ class ShadowState:
         st = (self.my_status if side == "me" else self.opp_status).get(id(p))
         if st == Status.PAR:
             s *= 0.5
+        item = _get_item(p)
+        if item == 'choicescarf':
+            s *= 1.5
         return s
 
     def _order_for_turn(self, my_action: Action, opp_action: Action, rng: random.Random) -> int:
@@ -513,6 +634,13 @@ class ShadowState:
             for m in (getattr(self.my_active, "moves", None) or {}).values():
                 actions.append(("move", m))
 
+        # Choice lock: if locked, only allow the locked move
+        if self.my_choice_lock and _get_item(self.my_active) in CHOICE_ITEMS:
+            locked = [a for a in actions if a[0] == "move"
+                      and str(getattr(a[1], 'id', '')) == self.my_choice_lock]
+            if locked:
+                actions = locked
+
         # Switches
         for p in self.my_team:
             if p is self.my_active:
@@ -541,18 +669,12 @@ class ShadowState:
         for m in (getattr(self.opp_active, "moves", None) or {}).values():
             actions.append(("move", m))
 
-        for p in self.opp_team:
-            if p is self.opp_active:
-                continue
-            if is_fainted(p) or self.opp_hp.get(id(p), 1.0) <= 0.0:
-                continue
-            actions.append(("switch", p))
-
-        return actions or [("move", None)]
-
-
-        for m in (getattr(self.opp_active, "moves", None) or {}).values():
-            actions.append(("move", m))
+        # Choice lock: if locked, only allow the locked move
+        if self.opp_choice_lock and _get_item(self.opp_active) in CHOICE_ITEMS:
+            locked = [a for a in actions if a[0] == "move"
+                      and str(getattr(a[1], 'id', '')) == self.opp_choice_lock]
+            if locked:
+                actions = locked
 
         for p in self.opp_team:
             if p is self.opp_active:
@@ -635,6 +757,23 @@ class ShadowState:
             # Toxic damage scales: 1/16, 2/16, 3/16, etc.
             toxic_damage = new_opp_toxic_counter / 16.0
             new_opp_hp[id(self.opp_active)] = max(0.0, new_opp_hp.get(id(self.opp_active), 0.0) - toxic_damage)
+
+        # Leftovers / Black Sludge end-of-turn recovery
+        for active, hp_map in [
+            (self.my_active, new_my_hp),
+            (self.opp_active, new_opp_hp),
+        ]:
+            if hp_map.get(id(active), 0.0) <= 0.0:
+                continue
+            item = _get_item(active)
+            if item == 'leftovers':
+                hp_map[id(active)] = min(1.0, hp_map[id(active)] + 1.0 / 16.0)
+            elif item == 'blacksludge':
+                is_poison = PokemonType.POISON in getattr(active, 'types', [])
+                if is_poison:
+                    hp_map[id(active)] = min(1.0, hp_map[id(active)] + 1.0 / 16.0)
+                else:
+                    hp_map[id(active)] = max(0.0, hp_map[id(active)] - 1.0 / 16.0)
 
         return replace(self, my_hp=new_my_hp, opp_hp=new_opp_hp,
                       my_toxic_counter=new_my_toxic_counter, opp_toxic_counter=new_opp_toxic_counter)
@@ -778,8 +917,31 @@ class ShadowState:
             except Exception:
                 pass
 
-        # Reset toxic counter on switch
-        return replace(s, my_active=new_mon, ctx_me=ctx_me, ctx_opp=ctx_opp, my_toxic_counter=0)
+        # Reset toxic counter and choice lock on switch
+        s = replace(s, my_active=new_mon, ctx_me=ctx_me, ctx_opp=ctx_opp,
+                    my_toxic_counter=0, my_choice_lock=None)
+
+        # Apply entry hazards from OUR side conditions
+        h_dmg, h_status, h_spe, updated_sc = _apply_hazards_on_entry(
+            new_mon, s.my_side_conditions, s.my_status.get(id(new_mon)))
+
+        if h_dmg > 0.0:
+            new_hp = dict(s.my_hp)
+            new_hp[id(new_mon)] = max(0.0, new_hp.get(id(new_mon), 1.0) - h_dmg)
+            s = replace(s, my_hp=new_hp)
+
+        if h_status is not None and s.my_status.get(id(new_mon)) is None:
+            new_st = dict(s.my_status)
+            new_st[id(new_mon)] = h_status
+            s = replace(s, my_status=new_st)
+
+        if h_spe is not None:
+            s = s._apply_boost_changes(h_spe, "me", new_mon)
+
+        if updated_sc != s.my_side_conditions:
+            s = replace(s, my_side_conditions=updated_sc)
+
+        return s
 
     def _apply_my_move(self, move: Any, rng: random.Random) -> "ShadowState":
         s = self
@@ -810,11 +972,24 @@ class ShadowState:
         if hit:
             s = s._maybe_apply_boosts_us(move, rng)
 
+        # Life Orb recoil: 1/10 max HP after dealing damage
+        if hit and float(getattr(move, 'base_power', 0) or 0) > 0:
+            if _get_item(s.my_active) == 'lifeorb':
+                recoil_hp = dict(s.my_hp)
+                recoil_hp[id(s.my_active)] = max(0.0, recoil_hp[id(s.my_active)] - 1.0 / 10.0)
+                s = replace(s, my_hp=recoil_hp)
+
+        # Choice lock: lock into this move if holding a Choice item
+        if move is not None and _get_item(s.my_active) in CHOICE_ITEMS:
+            move_id = str(getattr(move, 'id', '') or '')
+            if move_id:
+                s = replace(s, my_choice_lock=move_id)
+
         if is_pivot_move(move) and hit:
             target = s._best_my_switch()
             if target is not None:
                 s = s._apply_my_switch(target)
-        
+
         # Clear forced outcomes after use (for hybrid expansion)
         if hasattr(s, '_forced_hit'):
             object.__delattr__(s, '_forced_hit')
@@ -853,8 +1028,31 @@ class ShadowState:
             except Exception:
                 pass
 
-        # Reset toxic counter on switch
-        return replace(s, opp_active=new_mon, ctx_opp=ctx_opp, ctx_me=ctx_me, opp_toxic_counter=0)
+        # Reset toxic counter and choice lock on switch
+        s = replace(s, opp_active=new_mon, ctx_opp=ctx_opp, ctx_me=ctx_me,
+                    opp_toxic_counter=0, opp_choice_lock=None)
+
+        # Apply entry hazards from OPPONENT's side conditions
+        h_dmg, h_status, h_spe, updated_sc = _apply_hazards_on_entry(
+            new_mon, s.opp_side_conditions, s.opp_status.get(id(new_mon)))
+
+        if h_dmg > 0.0:
+            new_hp = dict(s.opp_hp)
+            new_hp[id(new_mon)] = max(0.0, new_hp.get(id(new_mon), 1.0) - h_dmg)
+            s = replace(s, opp_hp=new_hp)
+
+        if h_status is not None and s.opp_status.get(id(new_mon)) is None:
+            new_st = dict(s.opp_status)
+            new_st[id(new_mon)] = h_status
+            s = replace(s, opp_status=new_st)
+
+        if h_spe is not None:
+            s = s._apply_boost_changes(h_spe, "opp", new_mon)
+
+        if updated_sc != s.opp_side_conditions:
+            s = replace(s, opp_side_conditions=updated_sc)
+
+        return s
 
     def _apply_opp_move(self, move: Any, rng: random.Random) -> "ShadowState":
         # print(f"[_apply_opp_move] START: {self.opp_active.species} using {move.id}")
@@ -887,14 +1085,24 @@ class ShadowState:
         if hit:
             s = s._maybe_apply_boosts_opp(move, rng)
 
+        # Life Orb recoil: 1/10 max HP after dealing damage
+        if hit and float(getattr(move, 'base_power', 0) or 0) > 0:
+            if _get_item(s.opp_active) == 'lifeorb':
+                recoil_hp = dict(s.opp_hp)
+                recoil_hp[id(s.opp_active)] = max(0.0, recoil_hp[id(s.opp_active)] - 1.0 / 10.0)
+                s = replace(s, opp_hp=recoil_hp)
+
+        # Choice lock: lock into this move if holding a Choice item
+        if move is not None and _get_item(s.opp_active) in CHOICE_ITEMS:
+            move_id = str(getattr(move, 'id', '') or '')
+            if move_id:
+                s = replace(s, opp_choice_lock=move_id)
+
         if is_pivot_move(move) and hit:
-            # print(f"[_apply_opp_move] PIVOT! Switching opponent...")
             target = s._best_opp_switch()
             if target is not None:
                 s = s._apply_opp_switch(target)
-                # print(f"[_apply_opp_move] Switched to {s.opp_active.species}")
-        
-        # print(f"[_apply_opp_move] END: {s.opp_active.species}")
+
         return s
 
 
