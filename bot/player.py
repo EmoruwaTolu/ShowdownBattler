@@ -6,7 +6,7 @@ from bot.scoring.move_score import score_move
 from bot.scoring.switch_score import score_switch
 from bot.scoring.helpers import hp_frac
 
-from bot.model.opponent_model import build_opponent_belief
+from bot.model.opponent_model import build_opponent_belief, build_move_pool
 from bot.mcts.search import mcts_pick_action
 from bot.scoring.damage_score import estimate_damage_fraction
 
@@ -63,6 +63,16 @@ class AdvancedHeuristicPlayer(Player):
 
         include_switches = self.should_consider_switches(battle, ctx, move_scores)
 
+        # Build opponent beliefs and move pools for MCTS
+        opp_beliefs = {}
+        opp_move_pools = {}
+        gen = getattr(battle, 'gen', 9) or 9
+        for p in battle.opponent_team.values():
+            if p is not None:
+                belief = build_opponent_belief(p, gen)
+                opp_beliefs[id(p)] = belief
+                opp_move_pools[id(p)] = build_move_pool(belief, gen)
+
         picked = None
         stats = None
         try:
@@ -83,6 +93,8 @@ class AdvancedHeuristicPlayer(Player):
                 iters=iters,
                 max_depth=4,
                 include_switches=include_switches,
+                opp_beliefs=opp_beliefs,
+                opp_move_pools=opp_move_pools,
             )
 
             if picked:

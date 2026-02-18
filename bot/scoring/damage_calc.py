@@ -206,12 +206,12 @@ def team_synergy_value_burn_section_example(ally, opp, battle, st, dist, phys_p,
         # Get ACTUAL damage to ally using poke-env's calculator
         damage_to_ally = _estimate_damage_to_ally(ally, opp, battle)
         
-        # Calculate KO threshold value (NEW!)
+        # Calculate KO threshold value 
         ko_threshold_value = _burn_ko_threshold_value(
             ally, opp, battle, damage_to_ally, phys_p
         )
         
-        # Setup deterrence (unchanged)
+        # Setup deterrence
         phys_setup_p = (
             sum(w for c, w in dist if getattr(c, "is_physical", False) and getattr(c, "has_setup", False))
             if dist else 0.20
@@ -219,7 +219,6 @@ def team_synergy_value_burn_section_example(ally, opp, battle, st, dist, phys_p,
         stop_sweep = 26.0 * phys_setup_p + 8.0 * setup_p * phys_p
         stop_priority = 10.0 * priority_p * phys_p
         
-        # COMBINE
         benefit = ko_threshold_value + stop_sweep + stop_priority
         
         return benefit

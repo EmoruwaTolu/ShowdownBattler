@@ -9,6 +9,7 @@ import random
 from poke_env.battle import Status, MoveCategory, PokemonType
 
 from bot.scoring.helpers import hp_frac, is_fainted
+from bot.model.opponent_model import determinize_opponent
 
 Action = Tuple[str, Any]  # ("move", Move) or ("switch", Pokemon)
 
@@ -20,6 +21,14 @@ DamageFn = Callable[[Any, Any, Any, Any], float]
 
 def _clamp01(x: float) -> float:
     return max(0.0, min(1.0, float(x)))
+
+
+def _safe_gen(battle: Any) -> int:
+    try:
+        g = getattr(battle, 'gen', 9)
+        return int(g) if g is not None else 9
+    except (TypeError, ValueError):
+        return 9
 
 
 def _get_item(pokemon: Any) -> Optional[str]:
@@ -355,6 +364,10 @@ class ShadowState:
     my_side_conditions: Dict[str, int] = field(default_factory=dict)
     opp_side_conditions: Dict[str, int] = field(default_factory=dict)
 
+    opp_beliefs: Optional[Dict[int, Any]] = None       # pokemon_id -> OpponentBelief
+    opp_move_pools: Optional[Dict[int, Dict[str, Any]]] = None  # pokemon_id -> {move_id: Move}
+    gen: int = 9
+
     ply: int = 0
 
     score_move_fn: Optional[ScoreMoveFn] = None
@@ -391,7 +404,9 @@ class ShadowState:
         crit_chance: float = 1.0 / 24.0,
         crit_multiplier: float = 1.5,
         debug: bool = False,
-        cache: Optional[Any] = None
+        cache: Optional[Any] = None,
+        opp_beliefs: Optional[Dict[int, Any]] = None,
+        opp_move_pools: Optional[Dict[int, Dict[str, Any]]] = None,
     ) -> "ShadowState":
         me = ctx_me.me
         opp = ctx_me.opp
@@ -460,6 +475,9 @@ class ShadowState:
             crit_multiplier=crit_multiplier,
             debug=bool(debug),
             cache=cache,
+            opp_beliefs=opp_beliefs,
+            opp_move_pools=opp_move_pools,
+            gen=_safe_gen(battle),
         )
 
     @contextmanager
@@ -686,9 +704,16 @@ class ShadowState:
         return actions or [("move", None)]
 
     def choose_opp_action(self, rng: random.Random) -> Action:
-        actions = self.legal_actions_opp()
-        scores: List[float] = []
+        opp_id = id(self.opp_active)
+        belief = (self.opp_beliefs or {}).get(opp_id)
+        move_pool = (self.opp_move_pools or {}).get(opp_id)
 
+        if belief and move_pool:
+            actions = self._belief_actions_opp(belief, move_pool, rng)
+        else:
+            actions = self.legal_actions_opp()
+
+        scores: List[float] = []
         with self._patched_status(), self._patched_boosts():
             for k, o in actions:
                 if k == "move":
@@ -697,6 +722,51 @@ class ShadowState:
                     scores.append(float(self.score_switch_fn(o, self.battle, self.ctx_opp)))
 
         return self._softmax(actions, scores, self.opp_tau, rng)
+
+    def _belief_actions_opp(self, belief: Any, move_pool: Dict[str, Any],
+                            rng: random.Random) -> List[Action]:
+        """Build opponent action list using belief-sampled moves."""
+
+        # Forced replacement: fainted active can only switch
+        if self.opp_hp.get(id(self.opp_active), 1.0) <= 0.0:
+            return self.legal_actions_opp()
+
+        # Determinize: sample a role and 4-move subset
+        det = determinize_opponent(belief, rng)
+
+        # Build action list from sampled moves
+        seen_ids: set = set()
+        actions: List[Action] = []
+
+        for mid in det.moves4:
+            mv = move_pool.get(mid)
+            if mv is not None and mid not in seen_ids:
+                seen_ids.add(mid)
+                actions.append(("move", mv))
+
+        # Also include revealed moves (always available, might not be in sampled set)
+        for m in (getattr(self.opp_active, "moves", None) or {}).values():
+            mid = str(getattr(m, 'id', ''))
+            if mid not in seen_ids:
+                seen_ids.add(mid)
+                actions.append(("move", m))
+
+        # Apply choice lock filter
+        if self.opp_choice_lock and _get_item(self.opp_active) in CHOICE_ITEMS:
+            locked = [a for a in actions if a[0] == "move"
+                      and str(getattr(a[1], 'id', '')) == self.opp_choice_lock]
+            if locked:
+                actions = locked
+
+        # Add switches
+        for p in self.opp_team:
+            if p is self.opp_active:
+                continue
+            if is_fainted(p) or self.opp_hp.get(id(p), 1.0) <= 0.0:
+                continue
+            actions.append(("switch", p))
+
+        return actions or [("move", None)]
 
     @staticmethod
     def _softmax(actions: List[Action], scores: List[float], tau: float, rng: random.Random) -> Action:

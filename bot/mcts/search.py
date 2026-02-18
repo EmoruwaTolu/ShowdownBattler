@@ -170,13 +170,18 @@ def select_child(node: Node, c_puct: float) -> Tuple[Action, Node]:
                 
                 if u > best_u:
                     best_u = u
-                    # Select the least-visited branch to explore
-                    min_visits = min(child.N for _, child in action_children)
+                    # Select branch proportionally to probability
+                    # Pick the branch that is most under-visited relative
+                    # to its probability share
+                    best_deficit = -1e18
                     for a, child in action_children:
-                        if child.N == min_visits:
+                        target_frac = child.prior / total_prior if total_prior > 0 else 1.0 / len(action_children)
+                        actual_frac = child.N / total_n if total_n > 0 else 0.0
+                        deficit = target_frac - actual_frac
+                        if deficit > best_deficit:
+                            best_deficit = deficit
                             best_a = a
                             best_child = child
-                            break
 
     return best_a, best_child
 
@@ -227,6 +232,20 @@ def should_branch_move(move: Any, state: ShadowState, cfg: MCTSConfig) -> bool:
     return False
 
 
+def _crit_changes_ko(state: ShadowState, move: Any) -> bool:
+    """Check if a crit changes the KO outcome (normal doesn't KO but crit does, or vice versa)."""
+    try:
+        with state._patched_status(), state._patched_boosts():
+            dmg_frac = float(state.dmg_fn(move, state.my_active, state.opp_active, state.battle))
+        opp_hp = state.opp_active_hp()
+        crit_dmg = dmg_frac * state.crit_multiplier
+        normal_kos = dmg_frac >= opp_hp
+        crit_kos = crit_dmg >= opp_hp
+        return normal_kos != crit_kos
+    except Exception:
+        return True  # If we can't tell, assume it matters
+
+
 def create_move_branches(
     state: ShadowState,
     move: Any,
@@ -236,42 +255,56 @@ def create_move_branches(
     """
     Create explicit branches for a move's possible outcomes.
     Returns: List of (probability, next_state, outcome_label) tuples
+
+    Optimization: merges hit+crit into hit when the crit doesn't change
+    the KO outcome (both KO or both don't KO).
     """
     accuracy = getattr(move, 'accuracy', 1.0) or 1.0
     if accuracy > 1.0:
         accuracy /= 100.0
     accuracy = max(0.0, min(1.0, accuracy))
-    
+
     crit_chance = state.crit_chance
-    
+
     branches = []
-    
+
     # Calculate probabilities
     p_miss = 1.0 - accuracy
     p_hit_crit = accuracy * crit_chance
     p_hit_no_crit = accuracy * (1.0 - crit_chance)
-    
-    # Branch 1: Hit + Crit
-    if p_hit_crit >= cfg.min_branch_probability:
-        rng_crit = random.Random(hash((id(base_rng), "hit_crit")))
-        state_temp = state.with_forced_outcome(hit=True, crit=True)
-        next_state = state_temp.step(("move", move), rng=rng_crit)
-        branches.append((p_hit_crit, next_state, "hit+crit"))
-    
-    # Branch 2: Hit + No Crit
-    if p_hit_no_crit >= cfg.min_branch_probability:
-        rng_hit = random.Random(hash((id(base_rng), "hit_no_crit")))
-        state_temp = state.with_forced_outcome(hit=True, crit=False)
-        next_state = state_temp.step(("move", move), rng=rng_hit)
-        branches.append((p_hit_no_crit, next_state, "hit"))
-    
-    # Branch 3: Miss
+
+    # Check if crit actually changes the KO outcome
+    crit_matters = _crit_changes_ko(state, move)
+
+    if crit_matters:
+        # Separate branches for crit and non-crit
+        if p_hit_crit >= cfg.min_branch_probability:
+            rng_crit = random.Random(hash((id(base_rng), "hit_crit")))
+            state_temp = state.with_forced_outcome(hit=True, crit=True)
+            next_state = state_temp.step(("move", move), rng=rng_crit)
+            branches.append((p_hit_crit, next_state, "hit+crit"))
+
+        if p_hit_no_crit >= cfg.min_branch_probability:
+            rng_hit = random.Random(hash((id(base_rng), "hit_no_crit")))
+            state_temp = state.with_forced_outcome(hit=True, crit=False)
+            next_state = state_temp.step(("move", move), rng=rng_hit)
+            branches.append((p_hit_no_crit, next_state, "hit"))
+    else:
+        # Crit doesn't change outcome — merge into single "hit" branch
+        p_hit = p_hit_crit + p_hit_no_crit
+        if p_hit >= cfg.min_branch_probability:
+            rng_hit = random.Random(hash((id(base_rng), "hit_no_crit")))
+            state_temp = state.with_forced_outcome(hit=True, crit=False)
+            next_state = state_temp.step(("move", move), rng=rng_hit)
+            branches.append((p_hit, next_state, "hit"))
+
+    # Miss branch
     if p_miss >= cfg.min_branch_probability:
         rng_miss = random.Random(hash((id(base_rng), "miss")))
         state_temp = state.with_forced_outcome(hit=False, crit=False)
         next_state = state_temp.step(("move", move), rng=rng_miss)
         branches.append((p_miss, next_state, "miss"))
-    
+
     return branches
 
 
@@ -415,6 +448,8 @@ def search(
     allow_switches: bool = True,
     return_stats: bool = False,
     return_tree: bool = False,
+    opp_beliefs: Optional[Dict[int, Any]] = None,
+    opp_move_pools: Optional[Dict[int, Dict[str, Any]]] = None,
 ) -> Union[Action, Tuple[Action, Dict[str, Any]]]:
     """
     Runs PUCT MCTS and returns best root action.
@@ -437,7 +472,9 @@ def search(
         model_crit=cfg.model_crit,
         crit_chance=cfg.crit_chance,
         crit_multiplier=cfg.crit_multiplier,
-        debug=False
+        debug=False,
+        opp_beliefs=opp_beliefs,
+        opp_move_pools=opp_move_pools,
     )
     root = Node(root_state, parent=None, prior=1.0)
 
@@ -591,6 +628,8 @@ def mcts_pick_action(
     model_crit: bool = True,
     crit_chance: float = 1.0 / 24.0,
     crit_multiplier: float = 1.5,
+    opp_beliefs: Optional[Dict[int, Any]] = None,
+    opp_move_pools: Optional[Dict[int, Dict[str, Any]]] = None,
 ) -> Tuple[Optional[Action], Optional[Dict[str, Any]]]:
     
     cfg = MCTSConfig(
@@ -619,6 +658,8 @@ def mcts_pick_action(
         status_threshold=status_threshold,
         allow_switches=bool(include_switches),
         return_stats=True,
+        opp_beliefs=opp_beliefs,
+        opp_move_pools=opp_move_pools,
     )
     return picked, stats
 

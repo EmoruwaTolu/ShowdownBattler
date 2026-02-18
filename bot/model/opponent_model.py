@@ -96,6 +96,32 @@ class OpponentBelief:
         keep = [(c, w) for c, w in self.dist if (not c.abilities) or (aid in c.abilities)]
         self._filter_and_renorm(keep)
 
+    def observe_hazard_interaction(self, has_hazards: bool, took_damage: bool) -> None:
+        """
+        Infer item from hazard interaction on switch-in.
+
+        If hazards are present:
+        - took_damage=False → must have Heavy-Duty Boots → filter to HDB candidates
+        - took_damage=True → doesn't have HDB → penalize HDB candidates
+        """
+        if not has_hazards:
+            return
+
+        hdb_id = "heavydutyboots"
+
+        if not took_damage:
+            # Must have HDB
+            self.observe_item(hdb_id)
+        else:
+            # Doesn't have HDB - heavily penalize candidates with HDB
+            adjusted = []
+            for c, w in self.dist:
+                if c.items and hdb_id in c.items:
+                    adjusted.append((c, w * 0.1))
+                else:
+                    adjusted.append((c, w))
+            self._filter_and_renorm(adjusted)
+
     def observe_tera(self, tera_type: Optional[str]) -> None:
         if not tera_type:
             return
@@ -443,6 +469,26 @@ def physical_prob(dist: List[Tuple[SetCandidate, float]]) -> float:
     if not dist:
         return 0.0
     return float(sum(w for c, w in dist if c.is_physical))
+
+def build_move_pool(belief: OpponentBelief, gen: int) -> Dict[str, Any]:
+    """
+    Pre-create Move objects for all candidate moves across all roles.
+    Returns: dict of move_id -> Move object
+    """
+    from poke_env.battle import Move
+
+    all_move_ids: Set[str] = set()
+    for cand, _ in belief.dist:
+        all_move_ids.update(cand.moves)
+
+    pool: Dict[str, Any] = {}
+    for mid in all_move_ids:
+        try:
+            pool[mid] = Move(mid, gen=gen)
+        except Exception:
+            continue
+    return pool
+
 
 def determinize_opponent(belief: OpponentBelief, rng: random.Random) -> DeterminizedOpponent:
     """
