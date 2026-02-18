@@ -139,6 +139,11 @@ def _side_conditions_to_dict(sc: Any) -> Dict[str, int]:
     return result
 
 
+HAZARD_REMOVAL_OWN_SIDE = frozenset({'rapidspin', 'tidyup', 'mortalspin'})
+HAZARD_REMOVAL_BOTH_SIDES = frozenset({'defog'})
+HAZARD_KEYS = frozenset({'stealthrock', 'spikes', 'toxicspikes', 'stickyweb'})
+
+
 def is_pivot_move(move: Any) -> bool:
     mid = str(getattr(move, "id", "") or getattr(move, "name", "")).lower().replace(" ", "")
     return mid in {"voltswitch", "uturn", "flipturn", "partingshot"}
@@ -189,60 +194,63 @@ def status_infliction(move: Any) -> Optional[Tuple[Status, float]]:
 def get_move_boosts(move: Any) -> Optional[Tuple[Optional[Dict[str, int]], Optional[Dict[str, int]], float]]:
     """
     Extract stat boost changes from a move.
-    
+
     Returns tuple of (self_boosts, target_boosts, chance) or None:
     - self_boosts: boosts applied to user (e.g., Swords Dance: {'atk': 2})
     - target_boosts: boosts applied to opponent (e.g., Charm: {'atk': -2})
     - chance: probability of applying (1.0 for guaranteed, 0.2 for 20%, etc.)
-    
-    Examples:
-    - Swords Dance: ({'atk': 2}, None, 1.0)
-    - Dragon Dance: ({'atk': 1, 'spe': 1}, None, 1.0)
-    - Draco Meteor: ({'spa': -2}, None, 1.0)
-    - Charm: (None, {'atk': -2}, 1.0)
-    - Crunch: (None, {'def': -1}, 0.2)  # 20% chance
+
+    poke-env stores boosts in three different places:
+    - move.boosts: status moves; who is affected is given by move.target ('self' = user, else = target)
+    - move.self_boost: guaranteed self-boosts on damaging moves (Close Combat, Draco Meteor)
+    - move.secondary[i]['self']['boosts']: secondary self-boosts (Rapid Spin, Trailblaze)
+    - move.secondary[i]['boosts']: secondary target-boosts (Crunch def drop)
     """
-    # Check for guaranteed self-boost (e.g., Swords Dance, Dragon Dance)
+    # 1. Status moves with direct boosts (Swords Dance, Dragon Dance, Charm, Screech, etc.)
     boosts = getattr(move, 'boosts', None)
     if boosts:
-        return (boosts, None, 1.0)
-    
-    # Check move.self for self-inflicted changes (e.g., Draco Meteor, Superpower)
-    # NOTE: for the future I'd probably want to check abilities here and see if Contrary or any abilities that influence stat drops are involved
+        target_who = (getattr(move, 'target', None) or '').lower() if move else ''
+        if target_who == 'self':
+            return (boosts, None, 1.0)   # user (e.g. Swords Dance, Dragon Dance)
+        # target is foe / normal / etc. → effect applies to the move's target (opponent when we use it)
+        return (None, boosts, 1.0)   # target (e.g. Charm, Screech, Metal Sound)
+
+    # 2. Guaranteed self-boost on damaging moves (Close Combat, Draco Meteor, Overheat, Superpower)
+    #    poke-env uses move.self_boost for these
+    self_boost = getattr(move, 'self_boost', None)
+    if self_boost and isinstance(self_boost, dict):
+        return (self_boost, None, 1.0)
+
+    # 3. Fallback: check move.self dict (some poke-env versions)
     self_data = getattr(move, 'self', None)
     if self_data and isinstance(self_data, dict):
         self_boosts = self_data.get('boosts', None)
         if self_boosts:
             return (self_boosts, None, 1.0)
-    
-    # Check secondary effects for chance-based boosts
+
+    # 4. Secondary effects (chance-based or guaranteed-as-secondary)
     secondary = getattr(move, 'secondary', None)
     if secondary:
-        if isinstance(secondary, list):
-            for sec in secondary:
-                if isinstance(sec, dict):
-                    sec_boosts = sec.get('boosts', None)
-                    if sec_boosts:
-                        chance = sec.get('chance', 100) / 100.0
-                        
-                        # Check if it's a self-boost or target-boost
-                        # If 'self' key exists in secondary, it's a self-boost
-                        if sec.get('self'):
-                            return (sec_boosts, None, chance)
-                        else:
-                            # Most secondary boosts affect the target
-                            return (None, sec_boosts, chance)
-        
-        elif isinstance(secondary, dict):
-            # Sometimes secondary is a dict, not a list
-            sec_boosts = secondary.get('boosts', None)
+        sec_list = secondary if isinstance(secondary, list) else [secondary]
+        for sec in sec_list:
+            if not isinstance(sec, dict):
+                continue
+            chance = sec.get('chance', 100) / 100.0
+
+            # 4a. Secondary self-boosts (Rapid Spin +1 Spe, Trailblaze +1 Spe, Power-Up Punch +1 Atk)
+            #     Format: {'chance': 100, 'self': {'boosts': {'spe': 1}}}
+            self_sec = sec.get('self')
+            if isinstance(self_sec, dict):
+                self_sec_boosts = self_sec.get('boosts')
+                if self_sec_boosts:
+                    return (self_sec_boosts, None, chance)
+
+            # 4b. Secondary target-boosts (Crunch -1 Def, Lava Plume 30% burn has no boosts)
+            #     Format: {'chance': 20, 'boosts': {'def': -1}}
+            sec_boosts = sec.get('boosts', None)
             if sec_boosts:
-                chance = secondary.get('chance', 100) / 100.0
-                if secondary.get('self'):
-                    return (sec_boosts, None, chance)
-                else:
-                    return (None, sec_boosts, chance)
-    
+                return (None, sec_boosts, chance)
+
     return None
 
 
@@ -1049,6 +1057,20 @@ class ShadowState:
                 recoil_hp[id(s.my_active)] = max(0.0, recoil_hp[id(s.my_active)] - 1.0 / 10.0)
                 s = replace(s, my_hp=recoil_hp)
 
+        # Hazard removal on hit
+        if hit and move is not None:
+            mid = str(getattr(move, 'id', '') or '').lower()
+            if mid in HAZARD_REMOVAL_OWN_SIDE:
+                # Rapid Spin / Mortal Spin / Tidy Up: clear our side
+                cleared = {k: v for k, v in s.my_side_conditions.items() if k not in HAZARD_KEYS}
+                if cleared != s.my_side_conditions:
+                    s = replace(s, my_side_conditions=cleared)
+            elif mid in HAZARD_REMOVAL_BOTH_SIDES:
+                # Defog: clear both sides
+                my_cleared = {k: v for k, v in s.my_side_conditions.items() if k not in HAZARD_KEYS}
+                opp_cleared = {k: v for k, v in s.opp_side_conditions.items() if k not in HAZARD_KEYS}
+                s = replace(s, my_side_conditions=my_cleared, opp_side_conditions=opp_cleared)
+
         # Choice lock: lock into this move if holding a Choice item
         if move is not None and _get_item(s.my_active) in CHOICE_ITEMS:
             move_id = str(getattr(move, 'id', '') or '')
@@ -1161,6 +1183,20 @@ class ShadowState:
                 recoil_hp = dict(s.opp_hp)
                 recoil_hp[id(s.opp_active)] = max(0.0, recoil_hp[id(s.opp_active)] - 1.0 / 10.0)
                 s = replace(s, opp_hp=recoil_hp)
+
+        # Hazard removal on hit
+        if hit and move is not None:
+            mid = str(getattr(move, 'id', '') or '').lower()
+            if mid in HAZARD_REMOVAL_OWN_SIDE:
+                # Rapid Spin / Mortal Spin / Tidy Up: clear opponent's side
+                cleared = {k: v for k, v in s.opp_side_conditions.items() if k not in HAZARD_KEYS}
+                if cleared != s.opp_side_conditions:
+                    s = replace(s, opp_side_conditions=cleared)
+            elif mid in HAZARD_REMOVAL_BOTH_SIDES:
+                # Defog: clear both sides
+                my_cleared = {k: v for k, v in s.my_side_conditions.items() if k not in HAZARD_KEYS}
+                opp_cleared = {k: v for k, v in s.opp_side_conditions.items() if k not in HAZARD_KEYS}
+                s = replace(s, my_side_conditions=my_cleared, opp_side_conditions=opp_cleared)
 
         # Choice lock: lock into this move if holding a Choice item
         if move is not None and _get_item(s.opp_active) in CHOICE_ITEMS:
