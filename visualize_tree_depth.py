@@ -70,25 +70,43 @@ def visualize_tree_depth(root, max_depth=4, show_opponent_moves=False):
         
         if my_boost_str:
             my_str += f"[{my_boost_str.strip()}]"
-        
+
+        # Add volatile indicators
+        my_vol = getattr(state, 'my_volatiles', {}).get(id(me), {})
+        if my_vol.get('sleep_turns'):
+            my_str += f"(slp:{my_vol['sleep_turns']})"
+        if my_vol.get('confusion_turns'):
+            my_str += "(cnf)"
+        if my_vol.get('protect'):
+            my_str += "(prt)"
+
         # Format opponent side
         opp_str = f"{opp_species} {opp_hp:.2f}"
-        
+
         # Add status
         if opp_status:
             status_name = str(opp_status).split('.')[-1].lower()[:3]
             opp_str += f"({status_name})"
-        
+
         # Add significant boosts
         opp_boost_str = ""
         for stat in ['atk', 'def', 'spa', 'spd', 'spe']:
             val = opp_boosts.get(stat, 0)
             if val != 0:
                 opp_boost_str += f"{stat[:2]}{val:+d} "
-        
+
         if opp_boost_str:
             opp_str += f"[{opp_boost_str.strip()}]"
-        
+
+        # Add volatile indicators
+        opp_vol = getattr(state, 'opp_volatiles', {}).get(id(opp), {})
+        if opp_vol.get('sleep_turns'):
+            opp_str += f"(slp:{opp_vol['sleep_turns']})"
+        if opp_vol.get('confusion_turns'):
+            opp_str += "(cnf)"
+        if opp_vol.get('protect'):
+            opp_str += "(prt)"
+
         return f"{my_str} vs {opp_str}"
     def count_nodes_at_depth(node, current_depth, max_depth, counts):
         """Count nodes at each depth level"""

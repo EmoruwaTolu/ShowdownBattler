@@ -135,7 +135,18 @@ def estimate_damage_fraction(move: Any, me: Any, opp: Any, battle: Any) -> float
     if me_identifier is None or opp_identifier is None:
         # Couldn't find Pokemon in battle - return conservative estimate
         return 0.25
-    
+
+    # Ensure the Pokemon the calc will see have correct item (mock battles / lookups)
+    try:
+        att = battle.get_pokemon(me_identifier)
+        def_ = battle.get_pokemon(opp_identifier)
+        if att is not None and getattr(me, "item", None) is not None:
+            att.item = (getattr(me, "item", None) or "").strip().lower().replace(" ", "").replace("-", "") or None
+        if def_ is not None and getattr(opp, "item", None) is not None:
+            def_.item = (getattr(opp, "item", None) or "").strip().lower().replace(" ", "").replace("-", "") or None
+    except Exception:
+        pass
+
     try:
         # Use poke-env's damage calculator
         # This already handles multi-hit moves and returns total damage!

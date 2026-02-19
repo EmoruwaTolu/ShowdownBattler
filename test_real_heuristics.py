@@ -79,10 +79,17 @@ def create_mock_pokemon(
         mon.types = [PokemonType.NORMAL]
         mon.original_types = [PokemonType.NORMAL]
     
-    # Ability and item
+    # Ability and item (normalize item so damage calc sees it: poke-env uses lowercase, no spaces/hyphens)
     mon.ability = ability
-    mon.item = item
+    if item and isinstance(item, str) and item.strip():
+        mon.item = item.strip().lower().replace(" ", "").replace("-", "")
+    else:
+        mon.item = None
     mon.possible_abilities = [ability] if ability else []
+    # Eviolite in damage calc requires defender._data.pokedex[species].get("evos", []) to be non-empty
+    if getattr(mon, "item", None) == "eviolite":
+        mon._data = type("_Data", (), {"pokedex": {species: {"evos": ["x"]}}})()
+
     
     # Status and effects
     mon.status = None
@@ -245,18 +252,24 @@ def create_mock_battle(
     battle.format.gen = 9
     
     # get_pokemon method (REQUIRED for calculate_damage)
+    # Match poke-env's identifier normalization: "p1: X" -> "p1 X" before lookup
     def get_pokemon(identifier: str):
-        """Look up Pokemon by identifier - with detailed error logging"""
-        if identifier in team:
-            return team[identifier]
-        elif identifier in opponent_team:
-            return opponent_team[identifier]
-        # If not found, this is a problem - log it
+        """Look up Pokemon by identifier. Normalize like real Battle for compatibility."""
+        if not identifier:
+            return None
+        normalized = identifier
+        if len(identifier) > 3 and identifier[3] != " ":
+            normalized = identifier[:2] + identifier[3:]
+        for d in (team, opponent_team):
+            if normalized in d:
+                return d[normalized]
+            if identifier in d:
+                return d[identifier]
         print(f"WARNING: get_pokemon() called with unknown identifier: '{identifier}'")
         print(f"  Available in team: {list(team.keys())}")
         print(f"  Available in opponent_team: {list(opponent_team.keys())}")
         return None
-    
+
     battle.get_pokemon = get_pokemon
     
     # is_grounded method (REQUIRED for some move calcs)

@@ -237,7 +237,7 @@ def create_pokemon_from_randbats(species_name: str, data: Dict, gen_data, role_n
     if not move_names:
         raise ValueError(f"No moves found for {species_name} - {role_name}")
     
-    # Get ability and item (but we won't use them since heuristics don't account for them)
+    # Get ability and item (item is used by damage calc and shadow sim; ability not used yet)
     abilities = role.get("abilities", data.get("abilities", []))
     ability = abilities[0] if abilities else None
     
@@ -260,7 +260,8 @@ def create_pokemon_from_randbats(species_name: str, data: Dict, gen_data, role_n
         'spe': calculate_stat(base_stats['spe'], level),
     }
     
-    # Create Pokemon w/o ability/item (heuristics don't use them yet)
+    # Create Pokemon with item from randbats (used by damage calc and shadow sim).
+    # Ability not passed — we're not considering abilities yet.
     # Don't set identifier here - caller will set it based on which team
     mon = create_mock_pokemon(
         species=species_name,
@@ -269,8 +270,8 @@ def create_pokemon_from_randbats(species_name: str, data: Dict, gen_data, role_n
         level=level,
         types=types,
         stats=stats,
-        ability=None,  # Don't set ability
-        item=None,     # Don't set item
+        ability=None,
+        item=item,
     )
     
     # Create moves (pick up to 4 random moves from the role)
@@ -354,30 +355,31 @@ def test_random_randbats_matchup():
         opponent_species, randbats_data[opponent_species], gen_data
     )
     
-    # Species is already set correctly in create_mock_pokemon but we need to set the correct identifiers to match the team dict keys
-    player_mon._identifier_string = f"p1: {player_species}"
-    opponent_mon._identifier_string = f"p2: {opponent_species}"
+    # Use same identifier format as poke-env Battle (role + space + species) so damage calc lookups find the right Pokemon with item
+    player_ident = f"p1 {player_species}"
+    opp_ident = f"p2 {opponent_species}"
+    player_mon._identifier_string = player_ident
+    opponent_mon._identifier_string = opp_ident
     
     print(f"\n{player_species} ({player_role}):")
     print(f"Ability: {player_ability} (not used in heuristics)")
-    print(f"Item: {player_item} (not used in heuristics)")
+    print(f"Item: {player_item}")
     print(f"Moves: {', '.join(player_moves)}")
     print(f"Types: {', '.join(str(t).split('.')[-1] for t in player_mon.types)}")
     
     print(f"\n{opponent_species} ({opp_role}):")
     print(f"Ability: {opp_ability} (not used in heuristics)")
-    print(f"Item: {opp_item} (not used in heuristics)")
+    print(f"Item: {opp_item}")
     print(f"Moves: {', '.join(opp_moves)}")
     print(f"Types: {', '.join(str(t).split('.')[-1] for t in opponent_mon.types)}")
     
-    # Create battle
-    team = {f"p1: {player_species}": player_mon}
-    opp_team = {f"p2: {opponent_species}": opponent_mon}
-    
+    # Create battle (identifiers: "p1 Species" / "p2 Species" to match poke-env get_pokemon normalization)
+    team = {player_ident: player_mon}
+    opp_team = {opp_ident: opponent_mon}
     battle = create_mock_battle(
-        active_identifier=f"p1: {player_species}",
+        active_identifier=player_ident,
         active=player_mon,
-        opponent_identifier=f"p2: {opponent_species}",
+        opponent_identifier=opp_ident,
         opponent=opponent_mon,
         team=team,
         opponent_team=opp_team
@@ -396,13 +398,13 @@ def test_random_randbats_matchup():
     
     print("\nDEBUG: Checking Pokemon setup")
     print(f"player_mon object id: {id(player_mon)}")
-    print(f"team[key] object id: {id(team[f'p1: {player_species}'])}")
-    print(f"Same object? {player_mon is team[f'p1: {player_species}']}")
+    print(f"team[key] object id: {id(team[player_ident])}")
+    print(f"Same object? {player_mon is team[player_ident]}")
     print(f"player_mon.species: {player_mon.species}")
     
     print(f"\nopponent_mon object id: {id(opponent_mon)}")
-    print(f"opp_team[key] object id: {id(opp_team[f'p2: {opponent_species}'])}")
-    print(f"Same object? {opponent_mon is opp_team[f'p2: {opponent_species}']}")
+    print(f"opp_team[key] object id: {id(opp_team[opp_ident])}")
+    print(f"Same object? {opponent_mon is opp_team[opp_ident]}")
     print(f"opponent_mon.species: {opponent_mon.species}")
     
     # Test identifier lookup directly

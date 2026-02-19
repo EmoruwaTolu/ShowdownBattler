@@ -31,6 +31,14 @@ def _safe_gen(battle: Any) -> int:
         return 9
 
 
+def _safe_float(val: Any, default: float = 0.0) -> float:
+    """Safely convert a value to float, handling Mock objects and None."""
+    try:
+        return float(val) if val is not None else default
+    except (TypeError, ValueError):
+        return default
+
+
 def _get_item(pokemon: Any) -> Optional[str]:
     """Get normalized item id string from a Pokemon."""
     item = getattr(pokemon, 'item', None)
@@ -143,10 +151,18 @@ HAZARD_REMOVAL_OWN_SIDE = frozenset({'rapidspin', 'tidyup', 'mortalspin'})
 HAZARD_REMOVAL_BOTH_SIDES = frozenset({'defog'})
 HAZARD_KEYS = frozenset({'stealthrock', 'spikes', 'toxicspikes', 'stickyweb'})
 
+PROTECT_MOVES = frozenset({
+    'protect', 'detect', 'kingsshield', 'banefulbunker',
+    'spikyshield', 'silktrap', 'obstruct',
+})
+
 
 def is_pivot_move(move: Any) -> bool:
     mid = str(getattr(move, "id", "") or getattr(move, "name", "")).lower().replace(" ", "")
-    return mid in {"voltswitch", "uturn", "flipturn", "partingshot"}
+    return mid in {
+        "voltswitch", "uturn", "flipturn", "partingshot",
+        "teleport", "chillyreception", "batonpass", "shedtail",
+    }
 
 
 def move_priority(move: Any) -> int:
@@ -154,6 +170,20 @@ def move_priority(move: Any) -> int:
         return int(getattr(move, "priority", 0) or 0)
     except Exception:
         return 0
+
+
+def _check_flinch(action: Any, rng: random.Random) -> bool:
+    """Check if a move action causes flinch. Only meaningful for first-mover."""
+    if not isinstance(action, tuple) or action[0] != "move" or action[1] is None:
+        return False
+    secondary = getattr(action[1], 'secondary', None)
+    if not secondary or not isinstance(secondary, list):
+        return False
+    for sec in secondary:
+        if isinstance(sec, dict) and sec.get('volatileStatus') == 'flinch':
+            chance = sec.get('chance', 0) / 100.0
+            return rng.random() < chance
+    return False
 
 def status_infliction(move: Any) -> Optional[Tuple[Status, float]]:
     """
@@ -369,6 +399,15 @@ class ShadowState:
     my_choice_lock: Optional[str] = None   # move id we're locked into
     opp_choice_lock: Optional[str] = None  # move id opponent is locked into
 
+    # Volatile statuses (per-pokemon, cleared on switch)
+    # Keys: 'sleep_turns' (int), 'confusion_turns' (int)
+    my_volatiles: Dict[int, Dict[str, Any]] = field(default_factory=dict)
+    opp_volatiles: Dict[int, Dict[str, Any]] = field(default_factory=dict)
+
+    # Protect consecutive-use counter (for diminishing success rate)
+    my_protect_count: int = 0
+    opp_protect_count: int = 0
+
     my_side_conditions: Dict[str, int] = field(default_factory=dict)
     opp_side_conditions: Dict[str, int] = field(default_factory=dict)
 
@@ -580,14 +619,25 @@ class ShadowState:
     def is_terminal(self) -> bool:
         return all(v <= 0.0 for v in self.my_hp.values()) or all(v <= 0.0 for v in self.opp_hp.values())
 
+    # Speed stage multipliers (same as game: 0->1, +1->1.5, -1->2/3, etc.)
+    _SPEED_STAGE_MULT = {
+        -6: 2.0 / 8, -5: 2.0 / 7, -4: 2.0 / 6, -3: 2.0 / 5, -2: 2.0 / 4, -1: 2.0 / 3,
+        0: 1.0, 1: 1.5, 2: 2.0, 3: 2.5, 4: 3.0, 5: 3.5, 6: 4.0,
+    }
+
     def _effective_speed(self, p: Any, side: str) -> float:
-        s = float((p.stats or {}).get('spe', 100)) #use the pokemon's actual stats not base stats
+        """Effective speed for turn order: base stat, status, item, and simulated boost stages."""
+        s = float((p.stats or {}).get('spe', 100))
         st = (self.my_status if side == "me" else self.opp_status).get(id(p))
         if st == Status.PAR:
             s *= 0.5
         item = _get_item(p)
         if item == 'choicescarf':
             s *= 1.5
+        # Apply speed boost from simulation state so turn order is correct after Dragon Dance etc.
+        boosts = (self.my_boosts if side == "me" else self.opp_boosts).get(id(p), {})
+        spe_stage = boosts.get('spe', 0)
+        s *= self._SPEED_STAGE_MULT.get(max(-6, min(6, spe_stage)), 1.0)
         return s
 
     def _order_for_turn(self, my_action: Action, opp_action: Action, rng: random.Random) -> int:
@@ -667,6 +717,23 @@ class ShadowState:
             if locked:
                 actions = locked
 
+        # Sleep-aware move filtering
+        if self.my_status.get(id(self.my_active)) == Status.SLP:
+            my_vol = self.my_volatiles.get(id(self.my_active), {})
+            sleep_turns = my_vol.get('sleep_turns', 0)
+            if sleep_turns > 1:
+                # Will still be asleep after decrement — only sleep-usable moves
+                sleep_moves = [a for a in actions if a[0] == "move"
+                               and getattr(a[1], 'sleep_usable', False)]
+                if sleep_moves:
+                    actions = sleep_moves
+            elif sleep_turns == 1:
+                # Guaranteed wake — use normal moves, not Sleep Talk
+                normal_moves = [a for a in actions if a[0] == "move"
+                                and not getattr(a[1], 'sleep_usable', False)]
+                if normal_moves:
+                    actions = normal_moves
+
         # Switches
         for p in self.my_team:
             if p is self.my_active:
@@ -701,6 +768,21 @@ class ShadowState:
                       and str(getattr(a[1], 'id', '')) == self.opp_choice_lock]
             if locked:
                 actions = locked
+
+        # Sleep-aware move filtering
+        if self.opp_status.get(id(self.opp_active)) == Status.SLP:
+            opp_vol = self.opp_volatiles.get(id(self.opp_active), {})
+            sleep_turns = opp_vol.get('sleep_turns', 0)
+            if sleep_turns > 1:
+                sleep_moves = [a for a in actions if a[0] == "move"
+                               and getattr(a[1], 'sleep_usable', False)]
+                if sleep_moves:
+                    actions = sleep_moves
+            elif sleep_turns == 1:
+                normal_moves = [a for a in actions if a[0] == "move"
+                                and not getattr(a[1], 'sleep_usable', False)]
+                if normal_moves:
+                    actions = normal_moves
 
         for p in self.opp_team:
             if p is self.opp_active:
@@ -905,27 +987,59 @@ class ShadowState:
         # print(f"Opp action: {opp_action[0]} {getattr(opp_action[1], 'id', getattr(opp_action[1], 'species', '?'))}")
         # print(f"Order: {'+1 (we first)' if order == 1 else '-1 (opp first)'}")
 
+        # Clear protect volatiles from previous turn
         s = self
+        my_vol = s.my_volatiles.get(id(s.my_active), {})
+        opp_vol = s.opp_volatiles.get(id(s.opp_active), {})
+        my_had_protect = my_vol.get('protect', False)
+        opp_had_protect = opp_vol.get('protect', False)
+        if my_had_protect:
+            new_vol = dict(s.my_volatiles)
+            updated = {k: v for k, v in my_vol.items() if k != 'protect'}
+            new_vol[id(s.my_active)] = updated
+            s = replace(s, my_volatiles=new_vol)
+        if opp_had_protect:
+            new_vol = dict(s.opp_volatiles)
+            updated = {k: v for k, v in opp_vol.items() if k != 'protect'}
+            new_vol[id(s.opp_active)] = updated
+            s = replace(s, opp_volatiles=new_vol)
+
+        # Track whether each side uses Protect this turn (for counter reset)
+        my_uses_protect = (my_action[0] == "move" and my_action[1] is not None
+                          and str(getattr(my_action[1], 'id', '') or '').lower() in PROTECT_MOVES)
+        opp_uses_protect = (opp_action[0] == "move" and opp_action[1] is not None
+                           and str(getattr(opp_action[1], 'id', '') or '').lower() in PROTECT_MOVES)
+
+        # Never let the second mover act if the first mover KO'd them (no damage/status after KO)
+        HP_ALIVE = 1e-9
+
         if order == +1:
-            # print(">>> Applying our action...")
             s = s._apply_my_action(my_action, rng)
-            # Don't allow fainted Pokemon to use moves (but allow switches)
-            # print(f"After our action: {s.my_active.species} {s.my_active_hp():.0%} vs {s.opp_active.species} {s.opp_active_hp():.0%}")
-        
             if not s.is_terminal():
-                if opp_action[0] == "switch" or s.opp_hp.get(id(s.opp_active), 0.0) > 0.0:
-                    # print(">>> Applying opponent's action...")
-                    s = s._apply_opp_action(opp_action, rng)
-                    # print(f"After opp action: {s.my_active.species} {s.my_active_hp():.0%} vs {s.opp_active.species} {s.opp_active_hp():.0%}")
-                # else:
-                    # print(">>> Opponent's action SKIPPED (fainted)")
+                opp_hp = s.opp_hp.get(id(s.opp_active), 0.0)
+                if opp_hp > HP_ALIVE:
+                    # Check flinch: our move may have flinched the opponent
+                    if _check_flinch(my_action, rng):
+                        s = s._log(f"FLINCH opp:{s.opp_active.species}")
+                    else:
+                        s = s._apply_opp_action(opp_action, rng)
 
         else:
             s = s._apply_opp_action(opp_action, rng)
-            # Don't allow fainted Pokemon to use moves (but allow switches)
             if not s.is_terminal():
-                if my_action[0] == "switch" or s.my_hp.get(id(s.my_active), 0.0) > 0.0:
-                    s = s._apply_my_action(my_action, rng)
+                my_hp = s.my_hp.get(id(s.my_active), 0.0)
+                if my_hp > HP_ALIVE:
+                    # Check flinch: opponent's move may have flinched us
+                    if _check_flinch(opp_action, rng):
+                        s = s._log(f"FLINCH me:{s.my_active.species}")
+                    else:
+                        s = s._apply_my_action(my_action, rng)
+
+        # Reset protect count if side didn't use Protect this turn
+        if not my_uses_protect and s.my_protect_count > 0:
+            s = replace(s, my_protect_count=0)
+        if not opp_uses_protect and s.opp_protect_count > 0:
+            s = replace(s, opp_protect_count=0)
 
         # End of full turn
         if not s.is_terminal():
@@ -995,9 +1109,12 @@ class ShadowState:
             except Exception:
                 pass
 
-        # Reset toxic counter and choice lock on switch
+        # Reset toxic counter, choice lock, volatiles, and protect count on switch
+        new_vol = dict(s.my_volatiles)
+        new_vol.pop(id(s.my_active), None)  # Old mon's volatiles cleared
         s = replace(s, my_active=new_mon, ctx_me=ctx_me, ctx_opp=ctx_opp,
-                    my_toxic_counter=0, my_choice_lock=None)
+                    my_toxic_counter=0, my_choice_lock=None,
+                    my_volatiles=new_vol, my_protect_count=0)
 
         # Apply entry hazards from OUR side conditions
         h_dmg, h_status, h_spe, updated_sc = _apply_hazards_on_entry(
@@ -1025,21 +1142,124 @@ class ShadowState:
         s = self
 
         my_status = s.my_status.get(id(s.my_active))
+
+        # Sleep check 
+        if my_status == Status.SLP:
+            my_vol = s.my_volatiles.get(id(s.my_active), {})
+            sleep_turns = my_vol.get('sleep_turns', 0)
+            if sleep_turns > 0:
+                new_turns = sleep_turns - 1
+                new_vol = dict(s.my_volatiles)
+                if new_turns <= 0:
+                    # Wake up — clear sleep status + volatile, act normally
+                    updated = {k: v for k, v in my_vol.items() if k != 'sleep_turns'}
+                    new_vol[id(s.my_active)] = updated
+                    new_st = dict(s.my_status)
+                    new_st[id(s.my_active)] = None
+                    s = replace(s, my_status=new_st, my_volatiles=new_vol)
+                    my_status = None  # update local var
+                    s = s._log(f"WAKE me:{s.my_active.species}")
+                else:
+                    # Still asleep
+                    new_vol[id(s.my_active)] = {**my_vol, 'sleep_turns': new_turns}
+                    s = replace(s, my_volatiles=new_vol)
+                    if getattr(move, 'sleep_usable', False):
+                        s = s._log(f"SLEEPTALK me:{s.my_active.species}")
+                        # Fall through to execute the move
+                    else:
+                        s = s._log(f"ASLEEP me:{s.my_active.species} ({new_turns} left)")
+                        return s
+
+        # Freeze check
+        if my_status == Status.FRZ:
+            move_type = getattr(move, 'type', None)
+            is_fire = move_type is not None and move_type == PokemonType.FIRE
+            if is_fire or rng.random() < 0.20:
+                new_st = dict(s.my_status)
+                new_st[id(s.my_active)] = None
+                s = replace(s, my_status=new_st)
+                my_status = None
+                s = s._log(f"THAW me:{s.my_active.species}")
+            else:
+                s = s._log(f"FROZEN me:{s.my_active.species}")
+                return s
+
+        # Confusion check 
+        my_vol = s.my_volatiles.get(id(s.my_active), {})
+        conf_turns = my_vol.get('confusion_turns', 0)
+        if conf_turns > 0:
+            new_vol = dict(s.my_volatiles)
+            new_turns = conf_turns - 1
+            if new_turns <= 0:
+                updated = {k: v for k, v in my_vol.items() if k != 'confusion_turns'}
+            else:
+                updated = {**my_vol, 'confusion_turns': new_turns}
+            new_vol[id(s.my_active)] = updated
+            s = replace(s, my_volatiles=new_vol)
+            if rng.random() < 1.0 / 3.0:
+                self_dmg = 0.05
+                new_hp = dict(s.my_hp)
+                new_hp[id(s.my_active)] = max(0.0, new_hp[id(s.my_active)] - self_dmg)
+                s = replace(s, my_hp=new_hp)
+                s = s._log(f"CONFUSED-SELFHIT me:{s.my_active.species}")
+                return s
+
+        # Paralysis check 
         if my_status == Status.PAR:
-            if rng.random() < 0.25:  # 25% chance to be fully paralyzed
+            if rng.random() < 0.25:
                 s = s._log(f"FULL PARA me:{s.my_active.species}")
-                return s  # Move fails, return immediately
-        
+                return s
+
+        # Protect check 
+        if move is not None:
+            mid = str(getattr(move, 'id', '') or '').lower()
+            if mid in PROTECT_MOVES:
+                success_rate = 1.0 / (3 ** s.my_protect_count)
+                if rng.random() < success_rate:
+                    new_vol = dict(s.my_volatiles)
+                    existing = new_vol.get(id(s.my_active), {})
+                    new_vol[id(s.my_active)] = {**existing, 'protect': True}
+                    s = replace(s, my_volatiles=new_vol, my_protect_count=s.my_protect_count + 1)
+                    s = s._log(f"PROTECT me:{s.my_active.species}")
+                else:
+                    s = replace(s, my_protect_count=0)
+                    s = s._log(f"PROTECT-FAIL me:{s.my_active.species}")
+                return s
+
+        # Check if opponent has Protect up — block damaging moves
+        opp_vol = s.opp_volatiles.get(id(s.opp_active), {})
+        if opp_vol.get('protect') and float(getattr(move, 'base_power', 0) or 0) > 0:
+            s = s._log(f"BLOCKED-BY-PROTECT me:{getattr(move,'id','move')}")
+            return s
+
+        # Recovery moves (Recover, Roost, Slack Off, etc.) — heal 50% max HP
+        move_heal = _safe_float(getattr(move, 'heal', 0))
+        if move_heal > 0:
+            new_hp = dict(s.my_hp)
+            new_hp[id(s.my_active)] = min(1.0, new_hp[id(s.my_active)] + move_heal)
+            s = replace(s, my_hp=new_hp)
+            s = s._log(f"HEAL me:{s.my_active.species} +{move_heal:.0%}")
+            return s
+
         hit = s._sample_hit(move, rng)
 
         if not hit:
             s = s._log(f"MISS me:{getattr(move,'id','move')}")
+            # Crash damage on miss (High Jump Kick, Jump Kick)
+            if (move is not None
+                    and (getattr(move, 'entry', None) or {}).get('hasCrashDamage')):
+                crash_hp = dict(s.my_hp)
+                crash_hp[id(s.my_active)] = max(0.0, crash_hp[id(s.my_active)] - 0.5)
+                s = replace(s, my_hp=crash_hp)
+                s = s._log(f"CRASH me:{s.my_active.species} -50%")
 
+        opp_hp_before = s.opp_active_hp()
         new_hp = dict(s.opp_hp)
         new_hp[id(s.opp_active)], did_crit = apply_expected_damage(
-            s, move, s.my_active, s.opp_active, s.opp_active_hp(), rng=rng, hit=hit
+            s, move, s.my_active, s.opp_active, opp_hp_before, rng=rng, hit=hit
         )
         s = replace(s, opp_hp=new_hp)
+        dmg_dealt = opp_hp_before - s.opp_active_hp()
 
         if did_crit:
             s = s._log(f"CRIT me:{getattr(move,'id','move')}")
@@ -1049,6 +1269,27 @@ class ShadowState:
 
         if hit:
             s = s._maybe_apply_boosts_us(move, rng)
+
+        if hit:
+            s = s._maybe_apply_confusion(move, "opp", rng)
+
+        # Drain healing (Giga Drain, Drain Punch, etc.)
+        if hit and dmg_dealt > 0:
+            drain_frac = _safe_float(getattr(move, 'drain', 0))
+            if drain_frac > 0:
+                heal_amt = dmg_dealt * drain_frac
+                drain_hp = dict(s.my_hp)
+                drain_hp[id(s.my_active)] = min(1.0, drain_hp[id(s.my_active)] + heal_amt)
+                s = replace(s, my_hp=drain_hp)
+
+        # Move recoil (Brave Bird, Flare Blitz, etc.)
+        if hit and dmg_dealt > 0:
+            recoil_frac = _safe_float(getattr(move, 'recoil', 0))
+            if recoil_frac > 0:
+                recoil_amt = dmg_dealt * recoil_frac
+                recoil_hp = dict(s.my_hp)
+                recoil_hp[id(s.my_active)] = max(0.0, recoil_hp[id(s.my_active)] - recoil_amt)
+                s = replace(s, my_hp=recoil_hp)
 
         # Life Orb recoil: 1/10 max HP after dealing damage
         if hit and float(getattr(move, 'base_power', 0) or 0) > 0:
@@ -1120,9 +1361,12 @@ class ShadowState:
             except Exception:
                 pass
 
-        # Reset toxic counter and choice lock on switch
+        # Reset toxic counter, choice lock, volatiles, and protect count on switch
+        new_vol = dict(s.opp_volatiles)
+        new_vol.pop(id(s.opp_active), None)  # Old mon's volatiles cleared
         s = replace(s, opp_active=new_mon, ctx_opp=ctx_opp, ctx_me=ctx_me,
-                    opp_toxic_counter=0, opp_choice_lock=None)
+                    opp_toxic_counter=0, opp_choice_lock=None,
+                    opp_volatiles=new_vol, opp_protect_count=0)
 
         # Apply entry hazards from OPPONENT's side conditions
         h_dmg, h_status, h_spe, updated_sc = _apply_hazards_on_entry(
@@ -1147,26 +1391,124 @@ class ShadowState:
         return s
 
     def _apply_opp_move(self, move: Any, rng: random.Random) -> "ShadowState":
-        # print(f"[_apply_opp_move] START: {self.opp_active.species} using {move.id}")
-        # print(f"[_apply_opp_move] Is pivot? {is_pivot_move(move)}")
         s = self
 
-        my_status = s.my_status.get(id(s.my_active))
-        if my_status == Status.PAR:
-            if rng.random() < 0.25:  # 25% chance to be fully paralyzed
-                s = s._log(f"FULL PARA me:{s.my_active.species}")
-                return s  # Move fails, return immediately
-        
+        opp_status = s.opp_status.get(id(s.opp_active))
+
+        # Sleep check
+        if opp_status == Status.SLP:
+            opp_vol = s.opp_volatiles.get(id(s.opp_active), {})
+            sleep_turns = opp_vol.get('sleep_turns', 0)
+            if sleep_turns > 0:
+                new_turns = sleep_turns - 1
+                new_vol = dict(s.opp_volatiles)
+                if new_turns <= 0:
+                    updated = {k: v for k, v in opp_vol.items() if k != 'sleep_turns'}
+                    new_vol[id(s.opp_active)] = updated
+                    new_st = dict(s.opp_status)
+                    new_st[id(s.opp_active)] = None
+                    s = replace(s, opp_status=new_st, opp_volatiles=new_vol)
+                    opp_status = None
+                    s = s._log(f"WAKE opp:{s.opp_active.species}")
+                else:
+                    new_vol[id(s.opp_active)] = {**opp_vol, 'sleep_turns': new_turns}
+                    s = replace(s, opp_volatiles=new_vol)
+                    if getattr(move, 'sleep_usable', False):
+                        s = s._log(f"SLEEPTALK opp:{s.opp_active.species}")
+                    else:
+                        s = s._log(f"ASLEEP opp:{s.opp_active.species} ({new_turns} left)")
+                        return s
+
+        # Freeze check 
+        if opp_status == Status.FRZ:
+            move_type = getattr(move, 'type', None)
+            is_fire = move_type is not None and move_type == PokemonType.FIRE
+            if is_fire or rng.random() < 0.20:
+                new_st = dict(s.opp_status)
+                new_st[id(s.opp_active)] = None
+                s = replace(s, opp_status=new_st)
+                opp_status = None
+                s = s._log(f"THAW opp:{s.opp_active.species}")
+            else:
+                s = s._log(f"FROZEN opp:{s.opp_active.species}")
+                return s
+
+        # Confusion check 
+        opp_vol = s.opp_volatiles.get(id(s.opp_active), {})
+        conf_turns = opp_vol.get('confusion_turns', 0)
+        if conf_turns > 0:
+            new_vol = dict(s.opp_volatiles)
+            new_turns = conf_turns - 1
+            if new_turns <= 0:
+                updated = {k: v for k, v in opp_vol.items() if k != 'confusion_turns'}
+            else:
+                updated = {**opp_vol, 'confusion_turns': new_turns}
+            new_vol[id(s.opp_active)] = updated
+            s = replace(s, opp_volatiles=new_vol)
+            if rng.random() < 1.0 / 3.0:
+                self_dmg = 0.05
+                new_hp = dict(s.opp_hp)
+                new_hp[id(s.opp_active)] = max(0.0, new_hp[id(s.opp_active)] - self_dmg)
+                s = replace(s, opp_hp=new_hp)
+                s = s._log(f"CONFUSED-SELFHIT opp:{s.opp_active.species}")
+                return s
+
+        # Paralysis check
+        if opp_status == Status.PAR:
+            if rng.random() < 0.25:
+                s = s._log(f"FULL PARA opp:{s.opp_active.species}")
+                return s
+
+        # Protect check
+        if move is not None:
+            mid = str(getattr(move, 'id', '') or '').lower()
+            if mid in PROTECT_MOVES:
+                success_rate = 1.0 / (3 ** s.opp_protect_count)
+                if rng.random() < success_rate:
+                    new_vol = dict(s.opp_volatiles)
+                    existing = new_vol.get(id(s.opp_active), {})
+                    new_vol[id(s.opp_active)] = {**existing, 'protect': True}
+                    s = replace(s, opp_volatiles=new_vol, opp_protect_count=s.opp_protect_count + 1)
+                    s = s._log(f"PROTECT opp:{s.opp_active.species}")
+                else:
+                    s = replace(s, opp_protect_count=0)
+                    s = s._log(f"PROTECT-FAIL opp:{s.opp_active.species}")
+                return s
+
+        # Check if we have Protect up — block opponent's damaging moves
+        my_vol = s.my_volatiles.get(id(s.my_active), {})
+        if my_vol.get('protect') and float(getattr(move, 'base_power', 0) or 0) > 0:
+            s = s._log(f"BLOCKED-BY-PROTECT opp:{getattr(move,'id','move')}")
+            return s
+
+        # Recovery moves (Recover, Roost, Slack Off, etc.)
+        move_heal = _safe_float(getattr(move, 'heal', 0))
+        if move_heal > 0:
+            new_hp = dict(s.opp_hp)
+            new_hp[id(s.opp_active)] = min(1.0, new_hp[id(s.opp_active)] + move_heal)
+            s = replace(s, opp_hp=new_hp)
+            s = s._log(f"HEAL opp:{s.opp_active.species} +{move_heal:.0%}")
+            return s
+
         hit = s._sample_hit(move, rng)
 
         if not hit:
             s = s._log(f"MISS opp:{getattr(move,'id','move')}")
+            # Crash damage on miss (High Jump Kick, Jump Kick)
+            if (move is not None
+                    and (getattr(move, 'entry', None) or {}).get('hasCrashDamage')):
+                crash_hp = dict(s.opp_hp)
+                crash_hp[id(s.opp_active)] = max(0.0, crash_hp[id(s.opp_active)] - 0.5)
+                s = replace(s, opp_hp=crash_hp)
+                s = s._log(f"CRASH opp:{s.opp_active.species} -50%")
 
+        my_hp_before = s.my_active_hp()
         new_hp = dict(s.my_hp)
         new_hp[id(s.my_active)], did_crit = apply_expected_damage(
-            s, move, s.opp_active, s.my_active, s.my_active_hp(), rng=rng, hit=hit
+            s, move, s.opp_active, s.my_active, my_hp_before, rng=rng, hit=hit
         )
         s = replace(s, my_hp=new_hp)
+        dmg_dealt = my_hp_before - s.my_active_hp()
 
         if did_crit:
             s = s._log(f"CRIT opp:{getattr(move,'id','move')}")
@@ -1176,6 +1518,27 @@ class ShadowState:
 
         if hit:
             s = s._maybe_apply_boosts_opp(move, rng)
+
+        if hit:
+            s = s._maybe_apply_confusion(move, "me", rng)
+
+        # Drain healing (Giga Drain, Drain Punch, etc.)
+        if hit and dmg_dealt > 0:
+            drain_frac = _safe_float(getattr(move, 'drain', 0))
+            if drain_frac > 0:
+                heal_amt = dmg_dealt * drain_frac
+                drain_hp = dict(s.opp_hp)
+                drain_hp[id(s.opp_active)] = min(1.0, drain_hp[id(s.opp_active)] + heal_amt)
+                s = replace(s, opp_hp=drain_hp)
+
+        # Move recoil (Brave Bird, Flare Blitz, etc.)
+        if hit and dmg_dealt > 0:
+            recoil_frac = _safe_float(getattr(move, 'recoil', 0))
+            if recoil_frac > 0:
+                recoil_amt = dmg_dealt * recoil_frac
+                recoil_hp = dict(s.opp_hp)
+                recoil_hp[id(s.opp_active)] = max(0.0, recoil_hp[id(s.opp_active)] - recoil_amt)
+                s = replace(s, opp_hp=recoil_hp)
 
         # Life Orb recoil: 1/10 max HP after dealing damage
         if hit and float(getattr(move, 'base_power', 0) or 0) > 0:
@@ -1230,14 +1593,62 @@ class ShadowState:
                 return self
             mp = dict(self.my_status)
             mp[id(defender)] = st
-            return replace(self, my_status=mp)
+            s = replace(self, my_status=mp)
+            # Set sleep counter when SLP is inflicted (Gen 9: 1-3 turns)
+            if st == Status.SLP:
+                vol = dict(s.my_volatiles)
+                existing = vol.get(id(defender), {})
+                vol[id(defender)] = {**existing, 'sleep_turns': rng.randint(1, 3)}
+                s = replace(s, my_volatiles=vol)
+            return s
         else:
             if self.opp_status.get(id(defender)) is not None:
                 return self
             mp = dict(self.opp_status)
             mp[id(defender)] = st
-            return replace(self, opp_status=mp)
+            s = replace(self, opp_status=mp)
+            # Set sleep counter when SLP is inflicted (Gen 9: 1-3 turns)
+            if st == Status.SLP:
+                vol = dict(s.opp_volatiles)
+                existing = vol.get(id(defender), {})
+                vol[id(defender)] = {**existing, 'sleep_turns': rng.randint(1, 3)}
+                s = replace(s, opp_volatiles=vol)
+            return s
         
+    def _maybe_apply_confusion(self, move: Any, side: str, rng: random.Random) -> "ShadowState":
+        """Check if move inflicts confusion and apply it."""
+        chance = 0.0
+
+        # Check volatile_status (status moves like Confuse Ray)
+        vol_status = getattr(move, 'volatile_status', None)
+        if vol_status and 'confusion' in str(vol_status).lower():
+            chance = 1.0
+        else:
+            # Check secondary effects (Hurricane, Dynamic Punch, etc.)
+            secondary = getattr(move, 'secondary', None)
+            if secondary and isinstance(secondary, list):
+                for sec in secondary:
+                    if isinstance(sec, dict) and sec.get('volatileStatus') == 'confusion':
+                        chance = sec.get('chance', 100) / 100.0
+                        break
+
+        if chance == 0.0 or chance < self.status_threshold:
+            return self
+        if chance < 1.0 and rng.random() >= chance:
+            return self
+
+        # Apply confusion (2-5 turns in Gen 9)
+        target_id = id(self.my_active) if side == "me" else id(self.opp_active)
+        vol_key = "my_volatiles" if side == "me" else "opp_volatiles"
+        vol_map = dict(getattr(self, vol_key))
+        existing = vol_map.get(target_id, {})
+        if 'confusion_turns' not in existing:
+            vol_map[target_id] = {**existing, 'confusion_turns': rng.randint(2, 5)}
+            species = self.my_active.species if side == "me" else self.opp_active.species
+            s = replace(self, **{vol_key: vol_map})
+            return s._log(f"CONFUSED {side}:{species}")
+        return self
+
     def _apply_boost_changes(self, boost_changes: Dict[str, int], side: str, pokemon: Any) -> "ShadowState":
         """
         Apply boost changes to a Pokemon, clamping to [-6, +6].
