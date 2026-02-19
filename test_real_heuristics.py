@@ -171,26 +171,77 @@ def create_mock_move(
     move.current_pp = 16
     move.max_pp = 16
     
+    # Look up full move data from GenData for recoil/drain/heal/weather/terrain/etc.
+    from poke_env.data import GenData
+    gen_data = GenData.from_gen(9)
+    move_data = gen_data.moves.get(move_id, {})
+
     # Entry dict (REQUIRED for calculate_damage)
     move.entry = {
-        'flags': {},  # e.g., {'contact': 1, 'punch': 1}
+        'flags': move_data.get('flags', {}),
         'basePower': base_power,
         'type': move_type.name,
         'category': category.name,
-        'critRatio': crit_ratio,  # Also add to entry dict
+        'critRatio': crit_ratio,
     }
-    
+    # Copy extra entry fields the sim reads (recoil, drain, heal, hasCrashDamage, etc.)
+    for key in ('recoil', 'drain', 'heal', 'hasCrashDamage', 'weather', 'terrain',
+                'pseudoWeather', 'sideCondition', 'selfSwitch', 'volatileStatus',
+                'secondary', 'self'):
+        if key in move_data:
+            move.entry[key] = move_data[key]
+
     # Multi-hit (REQUIRED)
     move.n_hit = (1, 1)  # Single hit
-    
+
+    # Computed property values matching poke-env Move behavior
+    raw_recoil = move_data.get('recoil')
+    move.recoil = raw_recoil[0] / raw_recoil[1] if raw_recoil else 0.0
+
+    raw_drain = move_data.get('drain')
+    move.drain = raw_drain[0] / raw_drain[1] if raw_drain else 0.0
+
+    raw_heal = move_data.get('heal')
+    move.heal = raw_heal[0] / raw_heal[1] if raw_heal else 0.0
+
+    # Weather/terrain/side_condition/pseudo_weather setting (for shadow state field effects)
+    move.weather = None
+    if 'weather' in move_data:
+        from poke_env.battle import Weather as W
+        try:
+            move.weather = W[move_data['weather'].upper()]
+        except (KeyError, AttributeError):
+            pass
+
+    move.terrain = None
+    if 'terrain' in move_data:
+        from poke_env.battle import Field as F
+        try:
+            move.terrain = F.from_showdown_message(move_data['terrain'])
+        except (KeyError, AttributeError):
+            pass
+
+    move.pseudo_weather = move_data.get('pseudoWeather', None)
+
+    move.side_condition = None
+    if 'sideCondition' in move_data:
+        from poke_env.battle import SideCondition as SC
+        try:
+            move.side_condition = SC.from_data(move_data['sideCondition'])
+        except (KeyError, AttributeError):
+            pass
+
+    move.volatile_status = move_data.get('volatileStatus', None)
+    move.sleep_usable = move_data.get('sleepUsable', False)
+    move.self_boost = move_data.get('self', {}).get('boosts', None) if isinstance(move_data.get('self'), dict) else None
+
     # Other attributes
     move.breaks_protect = False
     move.ignore_defensive = False
-    move.target = None
-    move.recoil = None
+    move.target = move_data.get('target', None)
     move.is_stellar_first_use = False
-    move.flags = {}
-    
+    move.flags = move_data.get('flags', {})
+
     return move
 
 

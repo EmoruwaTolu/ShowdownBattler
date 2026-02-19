@@ -105,12 +105,14 @@ def _base_speed(mon: Any) -> float:
         return 80.0
 
 
-def _speed_order(me: Any, opp: Any) -> int:
+def _speed_order(me: Any, opp: Any, *, me_speed: float | None = None, opp_speed: float | None = None) -> int:
     """
     +1 if we likely act first (faster), -1 if they likely act first, 0 if tie/unknown.
     Deadzone avoids flip-flopping near ties.
+    If me_speed/opp_speed provided, use those instead of base stats.
     """
-    ms, os = _base_speed(me), _base_speed(opp)
+    ms = me_speed if me_speed is not None else _base_speed(me)
+    os = opp_speed if opp_speed is not None else _base_speed(opp)
     if ms >= os * 1.05:
         return +1
     if os >= ms * 1.05:
@@ -163,6 +165,8 @@ def evaluate_race_for_move(
     *,
     me_override: Any | None = None,
     opp_override: Any | None = None,
+    me_speed: float | None = None,
+    opp_speed: float | None = None,
 ) -> DamageRace:
     """
     Priority-aware "race" evaluation for THIS move.
@@ -205,8 +209,8 @@ def evaluate_race_for_move(
 
     prio = int(getattr(move, "priority", 0) or 0)
 
-    # Baseline speed order
-    order = _speed_order(me, opp)
+    # Baseline speed order (use shadow-state speeds if provided)
+    order = _speed_order(me, opp, me_speed=me_speed, opp_speed=opp_speed)
 
     # Our move having priority means we act first *this turn* (ignoring opponent priority)
     effective_order = order

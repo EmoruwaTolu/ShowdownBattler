@@ -4,7 +4,7 @@ import os
 import re
 from typing import Any, Optional
 
-from poke_env.battle import Status, MoveCategory
+from poke_env.battle import Status, MoveCategory, Field
 from bot.model.opponent_model import build_opponent_belief
 from bot.scoring.race import evaluate_race_for_move
 
@@ -319,9 +319,125 @@ def _calculate_boost_state_value(boosts: dict) -> float:
     return value
 
 
-# ============================================================================
-# Perfect Detection Helper Functions (using randbats database)
-# ============================================================================
+_HAZARD_WEIGHTS = {
+    'stealthrock': 0.06,
+    'spikes': 0.03,       # per layer
+    'toxicspikes': 0.03,  # per layer
+    'stickyweb': 0.04,
+}
+
+def _physical_ratio(team, hp_map) -> float:
+    """Fraction of alive team that is physical-leaning. Returns 0.0-1.0."""
+    phys = 0
+    alive = 0
+    for mon in team:
+        if float(hp_map.get(id(mon), 0.0)) <= 0.0:
+            continue
+        alive += 1
+        if is_physical_attacker_perfect(mon):
+            phys += 1
+    if alive == 0:
+        return 0.5
+    return phys / alive
+
+
+def _screen_survival_bonus(state: Any, screen: str, side: str, turns_left: int) -> float:
+    """
+    Extra value when a screen changes KO thresholds for the active matchup.
+    Scales with remaining turns — a screen about to expire matters less.
+    Returns 0.0 ~ 0.08 bonus.
+    """
+    if side == "me":
+        defender = state.my_active
+        defender_hp = float(state.my_hp.get(id(defender), 0.0))
+        attacker = state.opp_active
+    else:
+        defender = state.opp_active
+        defender_hp = float(state.opp_hp.get(id(defender), 0.0))
+        attacker = state.my_active
+
+    if defender_hp <= 0.0:
+        return 0.0
+
+    # Check if the screen's category matches the opponent's best threat
+    if screen == 'reflect':
+        if not is_physical_attacker_perfect(attacker):
+            return 0.0
+    elif screen == 'lightscreen':
+        if is_physical_attacker_perfect(attacker):
+            return 0.0
+
+    # Base bonus by defender HP
+    if defender_hp < 0.30:
+        base = 0.02  # screen helps less when already low
+    elif defender_hp < 0.60:
+        base = 0.05  # decent value, buys a turn
+    else:
+        base = 0.03  # healthy, screen is insurance
+
+    # Scale by remaining turns (out of max 5): 1 turn left → 20%, 5 turns → 100%
+    turn_factor = min(1.0, turns_left / 5.0)
+    return base * turn_factor
+
+
+def evaluate_field_conditions(state: Any) -> float:
+    """Evaluate strategic value of field conditions beyond damage modifiers."""
+    value = 0.0
+    my_sc = getattr(state, 'my_side_conditions', {})
+    opp_sc = getattr(state, 'opp_side_conditions', {})
+    fields = getattr(state, 'shadow_fields', {})
+
+    # Opponent attack profile determines how much each screen matters
+    opp_phys = _physical_ratio(state.opp_team, state.opp_hp)
+    my_phys = _physical_ratio(state.my_team, state.my_hp)
+
+    # Reflect: valuable proportional to opponent's physical ratio
+    # Light Screen: valuable proportional to opponent's special ratio
+    reflect_weight = 0.015 + 0.015 * opp_phys       # 0.015 (all special) to 0.030 (all physical)
+    lscreen_weight = 0.015 + 0.015 * (1 - opp_phys) # 0.015 (all physical) to 0.030 (all special)
+
+    # Our screens vs their screens (per remaining turn)
+    value += reflect_weight * my_sc.get('reflect', 0)
+    value += lscreen_weight * my_sc.get('lightscreen', 0)
+
+    # Their screens against us (mirrored)
+    opp_reflect_weight = 0.015 + 0.015 * my_phys
+    opp_lscreen_weight = 0.015 + 0.015 * (1 - my_phys)
+    value -= opp_reflect_weight * opp_sc.get('reflect', 0)
+    value -= opp_lscreen_weight * opp_sc.get('lightscreen', 0)
+
+    # Survival bonus: extra value when screen changes KO threshold, scaled by turns left
+    for scr in ('reflect', 'lightscreen'):
+        my_turns = my_sc.get(scr, 0)
+        opp_turns = opp_sc.get(scr, 0)
+        if my_turns > 0:
+            value += _screen_survival_bonus(state, scr, 'me', my_turns)
+        if opp_turns > 0:
+            value -= _screen_survival_bonus(state, scr, 'opp', opp_turns)
+
+    # Aurora Veil (both physical+special, always valuable)
+    value += 0.025 * my_sc.get('auroraveil', 0)
+    value -= 0.025 * opp_sc.get('auroraveil', 0)
+
+    # Tailwind (speed doubling = tempo advantage)
+    value += 0.03 * my_sc.get('tailwind', 0)
+    value -= 0.03 * opp_sc.get('tailwind', 0)
+
+    # Trick Room (benefits slow teams)
+    if Field.TRICK_ROOM in fields:
+        my_spe = state._effective_speed(state.my_active, "me")
+        opp_spe = state._effective_speed(state.opp_active, "opp")
+        if my_spe < opp_spe:
+            value += 0.08  # TR benefits us
+        elif opp_spe < my_spe:
+            value -= 0.08  # TR benefits them
+
+    # Hazard asymmetry: their hazards = good for us, ours = bad for us
+    my_hazard_cost = sum(_HAZARD_WEIGHTS.get(k, 0) * v for k, v in my_sc.items() if k in _HAZARD_WEIGHTS)
+    opp_hazard_cost = sum(_HAZARD_WEIGHTS.get(k, 0) * v for k, v in opp_sc.items() if k in _HAZARD_WEIGHTS)
+    value += opp_hazard_cost - my_hazard_cost
+
+    return _tanh01(value / 0.3)
 
 def is_physical_attacker_perfect(mon: Any) -> bool:
     """
@@ -485,7 +601,7 @@ def evaluate_state(state: Any) -> float:
 
     gen = int(getattr(state.battle, "gen", 9) or 9)
 
-    with state._patched_status(), state._patched_boosts():
+    with state._patched_status(), state._patched_boosts(), state._patched_fields():
         #   Team value (belief-weighted)  
         my_value = team_value(state.my_team, state.my_hp, state.my_boosts, gen, status_map=state.my_status)
         opp_value_known = team_value(state.opp_team, state.opp_hp, state.opp_boosts, gen, status_map=state.opp_status)
@@ -515,7 +631,16 @@ def evaluate_state(state: Any) -> float:
 
         race_term = 0.0
         if best_mv is not None and state.ctx_me is not None:
-            race = evaluate_race_for_move(state.battle, state.ctx_me, best_mv)
+            # Compute shadow-state-aware speeds for race eval
+            my_eff_speed = state._effective_speed(state.my_active, "me")
+            opp_eff_speed = state._effective_speed(state.opp_active, "opp")
+            # Trick Room: swap speeds so race eval treats slower as faster
+            if Field.TRICK_ROOM in getattr(state, 'shadow_fields', {}):
+                my_eff_speed, opp_eff_speed = opp_eff_speed, my_eff_speed
+            race = evaluate_race_for_move(
+                state.battle, state.ctx_me, best_mv,
+                me_speed=my_eff_speed, opp_speed=opp_eff_speed,
+            )
             race_term = _tanh01((race.ttd_me - race.tko_opp) / 1.5)
 
         #   Escape hatch only when losing the race  
@@ -542,7 +667,9 @@ def evaluate_state(state: Any) -> float:
         elif my_active_hp < 0.35:
             boost_term *= 0.70
 
-        # === PERFECT: Context-aware status evaluation ===
+        # Field conditions (screens, tailwind, trick room, hazards)
+        field_term = evaluate_field_conditions(state)
+
         status_term = 0.0
         
         # Opponent status (good for us)
@@ -610,23 +737,25 @@ def evaluate_state(state: Any) -> float:
         elif my_active_hp < 0.30:
             sac_penalty += 0.05
 
-    #   Dynamic weights  
+    #   Dynamic weights
     if ahead >= 2:
-        w_team = 0.34
-        w_numbers = 0.08
+        w_team = 0.32
+        w_numbers = 0.06
         w_race = 0.30
         w_switch = 0.05
         w_boost = 0.08
         w_active = 0.04
         w_progress = 0.15
+        w_field = 0.06
     else:
-        w_team = 0.38
-        w_numbers = 0.10
+        w_team = 0.36
+        w_numbers = 0.08
         w_race = 0.25
         w_switch = 0.10
         w_boost = 0.10
         w_active = 0.07
         w_progress = 0.00
+        w_field = 0.08
 
     value = (
         w_team * team_term +
@@ -636,6 +765,7 @@ def evaluate_state(state: Any) -> float:
         w_boost * boost_term +
         w_active * active_preserve +
         w_progress * progress_term +
+        w_field * field_term +
         status_term
     ) - tempo_penalty - sac_penalty
 

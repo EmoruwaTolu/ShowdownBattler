@@ -6,7 +6,7 @@ from contextlib import contextmanager
 import math
 import random
 
-from poke_env.battle import Status, MoveCategory, PokemonType
+from poke_env.battle import Status, MoveCategory, PokemonType, Weather, Field, SideCondition
 
 from bot.scoring.helpers import hp_frac, is_fainted
 from bot.model.opponent_model import determinize_opponent
@@ -155,6 +155,25 @@ PROTECT_MOVES = frozenset({
     'protect', 'detect', 'kingsshield', 'banefulbunker',
     'spikyshield', 'silktrap', 'obstruct',
 })
+
+TIMED_SIDE_CONDITIONS = frozenset({
+    'reflect', 'lightscreen', 'auroraveil', 'tailwind',
+})
+
+# Build mapping from lowercase-no-underscore name -> SideCondition enum
+_SC_NAME_TO_ENUM: Dict[str, SideCondition] = {}
+for _sc in SideCondition:
+    _SC_NAME_TO_ENUM[_sc.name.lower().replace('_', '')] = _sc
+
+
+def _dict_to_side_conditions(sc_dict: Dict[str, int]) -> Dict[SideCondition, int]:
+    """Convert our Dict[str, int] back to Dict[SideCondition, int] for battle patching."""
+    result = {}
+    for name, val in sc_dict.items():
+        enum_val = _SC_NAME_TO_ENUM.get(name)
+        if enum_val is not None:
+            result[enum_val] = val
+    return result
 
 
 def is_pivot_move(move: Any) -> bool:
@@ -352,7 +371,7 @@ def apply_expected_damage(
         return float(defender_hp), False
 
     try:
-        with state._patched_status(), state._patched_boosts():
+        with state._patched_status(), state._patched_boosts(), state._patched_fields():
             dmg_frac = float(state.dmg_fn(move, attacker, defender, state.battle))
     except Exception:
         dmg_frac = 0.0
@@ -410,6 +429,10 @@ class ShadowState:
 
     my_side_conditions: Dict[str, int] = field(default_factory=dict)
     opp_side_conditions: Dict[str, int] = field(default_factory=dict)
+
+    # Weather/fields tracking (mirrors battle._weather and battle._fields format)
+    shadow_weather: Dict[Any, int] = field(default_factory=dict)
+    shadow_fields: Dict[Any, int] = field(default_factory=dict)
 
     opp_beliefs: Optional[Dict[int, Any]] = None       # pokemon_id -> OpponentBelief
     opp_move_pools: Optional[Dict[int, Dict[str, Any]]] = None  # pokemon_id -> {move_id: Move}
@@ -511,6 +534,8 @@ class ShadowState:
                 getattr(battle, 'side_conditions', None)),
             opp_side_conditions=_side_conditions_to_dict(
                 getattr(battle, 'opponent_side_conditions', None)),
+            shadow_weather=dict(getattr(battle, 'weather', {}) or {}),
+            shadow_fields=dict(getattr(battle, 'fields', {}) or {}),
             score_move_fn=score_move_fn,
             score_switch_fn=score_switch_fn,
             dmg_fn=dmg_fn,
@@ -582,6 +607,52 @@ class ShadowState:
                 if p_id in original_opp:
                     p.boosts = original_opp[p_id]
     
+    @contextmanager
+    def _patched_fields(self):
+        """Temporarily patch battle weather/fields/side_conditions from shadow state.
+
+        Works with both real Battle objects (private _attrs) and Mock battles
+        (public attrs set directly).
+        """
+        battle = self.battle
+
+        # Detect real Battle (has _weather as a dict) vs Mock (only public weather)
+        use_private = isinstance(getattr(battle, '_weather', None), dict)
+
+        if use_private:
+            old_weather = battle._weather
+            old_fields = battle._fields
+            old_sc = battle._side_conditions
+            old_opp_sc = battle._opponent_side_conditions
+            try:
+                battle._weather = dict(self.shadow_weather)
+                battle._fields = dict(self.shadow_fields)
+                battle._side_conditions = _dict_to_side_conditions(self.my_side_conditions)
+                battle._opponent_side_conditions = _dict_to_side_conditions(self.opp_side_conditions)
+                yield
+            finally:
+                battle._weather = old_weather
+                battle._fields = old_fields
+                battle._side_conditions = old_sc
+                battle._opponent_side_conditions = old_opp_sc
+        else:
+            # Mock / simple object: patch public attributes
+            old_weather = getattr(battle, 'weather', {})
+            old_fields = getattr(battle, 'fields', {})
+            old_sc = getattr(battle, 'side_conditions', {})
+            old_opp_sc = getattr(battle, 'opponent_side_conditions', {})
+            try:
+                battle.weather = dict(self.shadow_weather)
+                battle.fields = dict(self.shadow_fields)
+                battle.side_conditions = _dict_to_side_conditions(self.my_side_conditions)
+                battle.opponent_side_conditions = _dict_to_side_conditions(self.opp_side_conditions)
+                yield
+            finally:
+                battle.weather = old_weather
+                battle.fields = old_fields
+                battle.side_conditions = old_sc
+                battle.opponent_side_conditions = old_opp_sc
+
     def with_forced_outcome(self, hit: Optional[bool] = None, crit: Optional[bool] = None) -> "ShadowState":
         """
         Return a copy of this state with forced outcomes for the next move.
@@ -638,6 +709,10 @@ class ShadowState:
         boosts = (self.my_boosts if side == "me" else self.opp_boosts).get(id(p), {})
         spe_stage = boosts.get('spe', 0)
         s *= self._SPEED_STAGE_MULT.get(max(-6, min(6, spe_stage)), 1.0)
+        # Tailwind: 2x speed
+        sc = self.my_side_conditions if side == "me" else self.opp_side_conditions
+        if 'tailwind' in sc:
+            s *= 2.0
         return s
 
     def _order_for_turn(self, my_action: Action, opp_action: Action, rng: random.Random) -> int:
@@ -676,7 +751,12 @@ class ShadowState:
         ms = self._effective_speed(self.my_active, "me")
         os = self._effective_speed(self.opp_active, "opp")
 
+        # Trick Room reverses speed ordering for moves
+        trick_room = Field.TRICK_ROOM in self.shadow_fields
+
         if ms != os:
+            if trick_room:
+                return +1 if ms < os else -1  # slower moves first
             return +1 if ms > os else -1
 
         # speed tie
@@ -935,8 +1015,57 @@ class ShadowState:
                 else:
                     hp_map[id(active)] = max(0.0, hp_map[id(active)] - 1.0 / 16.0)
 
+        # Sandstorm chip: 1/16 to non-Rock/Steel/Ground actives
+        if Weather.SANDSTORM in self.shadow_weather:
+            for active, hp_map in [(self.my_active, new_my_hp), (self.opp_active, new_opp_hp)]:
+                if hp_map.get(id(active), 0.0) <= 0.0:
+                    continue
+                types = getattr(active, 'types', [])
+                immune = any(t in (PokemonType.ROCK, PokemonType.STEEL, PokemonType.GROUND) for t in types)
+                if not immune:
+                    hp_map[id(active)] = max(0.0, hp_map[id(active)] - 1.0 / 16.0)
+
+        # Grassy Terrain heal: 1/16 to grounded actives
+        if Field.GRASSY_TERRAIN in self.shadow_fields:
+            for active, hp_map in [(self.my_active, new_my_hp), (self.opp_active, new_opp_hp)]:
+                if hp_map.get(id(active), 0.0) <= 0.0:
+                    continue
+                if _is_grounded(active):
+                    hp_map[id(active)] = min(1.0, hp_map[id(active)] + 1.0 / 16.0)
+
+        # Decrement weather counters
+        new_weather = {}
+        for w, t in self.shadow_weather.items():
+            t2 = t + 1
+            if t2 < 5:
+                new_weather[w] = t2
+
+        # Decrement field counters (terrain, trick room)
+        new_fields = {}
+        for f, t in self.shadow_fields.items():
+            t2 = t + 1
+            if t2 < 5:
+                new_fields[f] = t2
+
+        # Decrement timed side conditions (screens, tailwind)
+        def _dec_sc(sc_dict: Dict[str, int]) -> Dict[str, int]:
+            new = {}
+            for k, v in sc_dict.items():
+                if k in TIMED_SIDE_CONDITIONS:
+                    if v > 1:
+                        new[k] = v - 1
+                    # else: expired, drop it
+                else:
+                    new[k] = v  # hazards don't expire
+            return new
+
+        new_my_sc = _dec_sc(self.my_side_conditions)
+        new_opp_sc = _dec_sc(self.opp_side_conditions)
+
         return replace(self, my_hp=new_my_hp, opp_hp=new_opp_hp,
-                      my_toxic_counter=new_my_toxic_counter, opp_toxic_counter=new_opp_toxic_counter)
+                      my_toxic_counter=new_my_toxic_counter, opp_toxic_counter=new_opp_toxic_counter,
+                      shadow_weather=new_weather, shadow_fields=new_fields,
+                      my_side_conditions=new_my_sc, opp_side_conditions=new_opp_sc)
 
     def _sample_hit(self, move: Any, rng: random.Random) -> bool:
         # Check for forced outcome first (for hybrid expansion)
@@ -1079,6 +1208,50 @@ class ShadowState:
     def _apply_opp_action(self, action: Action, rng: random.Random) -> "ShadowState":
         return self._apply_opp_switch(action[1]) if action[0] == "switch" else self._apply_opp_move(action[1], rng)
 
+    def _apply_field_effects(self, move: Any, side: str) -> "ShadowState":
+        """Detect and apply weather/terrain/screen/tailwind/trick room setting from a move."""
+        s = self
+        if move is None:
+            return s
+
+        # Weather-setting moves
+        move_weather = getattr(move, 'weather', None)
+        if move_weather:
+            s = replace(s, shadow_weather={move_weather: 0})
+
+        # Terrain-setting moves (replace existing terrain, keep non-terrain fields)
+        move_terrain = getattr(move, 'terrain', None)
+        if move_terrain:
+            new_fields = {k: v for k, v in s.shadow_fields.items()
+                          if not getattr(k, 'is_terrain', False)}
+            new_fields[move_terrain] = 0
+            s = replace(s, shadow_fields=new_fields)
+
+        # Trick Room (pseudo_weather) — toggles on/off
+        pw = getattr(move, 'pseudo_weather', None)
+        if pw and 'trickroom' in str(pw).lower().replace(' ', '').replace('_', ''):
+            new_fields = dict(s.shadow_fields)
+            if Field.TRICK_ROOM in new_fields:
+                del new_fields[Field.TRICK_ROOM]
+            else:
+                new_fields[Field.TRICK_ROOM] = 0
+            s = replace(s, shadow_fields=new_fields)
+
+        # Side condition setting moves (Reflect, Light Screen, Aurora Veil, Tailwind)
+        sc = getattr(move, 'side_condition', None)
+        if sc:
+            sc_name = getattr(sc, 'name', str(sc)).lower().replace('_', '')
+            duration = 4 if sc_name == 'tailwind' else 5
+            if side == "me":
+                new_sc = dict(s.my_side_conditions)
+                new_sc[sc_name] = duration
+                s = replace(s, my_side_conditions=new_sc)
+            else:
+                new_sc = dict(s.opp_side_conditions)
+                new_sc[sc_name] = duration
+                s = replace(s, opp_side_conditions=new_sc)
+
+        return s
 
     def _apply_my_switch(self, new_mon: Any) -> "ShadowState":
         if new_mon is None:
@@ -1210,7 +1383,15 @@ class ShadowState:
                 s = s._log(f"FULL PARA me:{s.my_active.species}")
                 return s
 
-        # Protect check 
+        # Psychic Terrain: priority moves fail against grounded targets
+        if (move is not None
+                and Field.PSYCHIC_TERRAIN in s.shadow_fields
+                and move_priority(move) > 0
+                and _is_grounded(s.opp_active)):
+            s = s._log(f"PSYCHIC-TERRAIN-BLOCK me:{getattr(move,'id','move')}")
+            return s
+
+        # Protect check
         if move is not None:
             mid = str(getattr(move, 'id', '') or '').lower()
             if mid in PROTECT_MOVES:
@@ -1311,6 +1492,9 @@ class ShadowState:
                 my_cleared = {k: v for k, v in s.my_side_conditions.items() if k not in HAZARD_KEYS}
                 opp_cleared = {k: v for k, v in s.opp_side_conditions.items() if k not in HAZARD_KEYS}
                 s = replace(s, my_side_conditions=my_cleared, opp_side_conditions=opp_cleared)
+
+        # Field effects: weather/terrain/screens/tailwind/trick room setting
+        s = s._apply_field_effects(move, "me")
 
         # Choice lock: lock into this move if holding a Choice item
         if move is not None and _get_item(s.my_active) in CHOICE_ITEMS:
@@ -1459,6 +1643,14 @@ class ShadowState:
                 s = s._log(f"FULL PARA opp:{s.opp_active.species}")
                 return s
 
+        # Psychic Terrain: priority moves fail against grounded targets
+        if (move is not None
+                and Field.PSYCHIC_TERRAIN in s.shadow_fields
+                and move_priority(move) > 0
+                and _is_grounded(s.my_active)):
+            s = s._log(f"PSYCHIC-TERRAIN-BLOCK opp:{getattr(move,'id','move')}")
+            return s
+
         # Protect check
         if move is not None:
             mid = str(getattr(move, 'id', '') or '').lower()
@@ -1561,6 +1753,9 @@ class ShadowState:
                 opp_cleared = {k: v for k, v in s.opp_side_conditions.items() if k not in HAZARD_KEYS}
                 s = replace(s, my_side_conditions=my_cleared, opp_side_conditions=opp_cleared)
 
+        # Field effects: weather/terrain/screens/tailwind/trick room setting
+        s = s._apply_field_effects(move, "opp")
+
         # Choice lock: lock into this move if holding a Choice item
         if move is not None and _get_item(s.opp_active) in CHOICE_ITEMS:
             move_id = str(getattr(move, 'id', '') or '')
@@ -1583,6 +1778,15 @@ class ShadowState:
         st, prob = info
         if prob < self.status_threshold:
             return self
+
+        # Terrain-based status immunity
+        if _is_grounded(defender):
+            # Electric Terrain: grounded Pokemon can't fall asleep
+            if st == Status.SLP and Field.ELECTRIC_TERRAIN in self.shadow_fields:
+                return self
+            # Misty Terrain: grounded Pokemon can't be statused
+            if Field.MISTY_TERRAIN in self.shadow_fields:
+                return self
 
         # stochastic proc
         if prob < 1.0 and rng.random() >= float(prob):

@@ -107,7 +107,42 @@ def visualize_tree_depth(root, max_depth=4, show_opponent_moves=False):
         if opp_vol.get('protect'):
             opp_str += "(prt)"
 
-        return f"{my_str} vs {opp_str}"
+        # Field condition tags
+        field_tags = []
+        sw = getattr(state, 'shadow_weather', {})
+        for w in sw:
+            wn = str(w).split('.')[-1].upper()
+            if 'SUNNY' in wn:
+                field_tags.append("sun")
+            elif 'RAIN' in wn:
+                field_tags.append("rain")
+            elif 'SAND' in wn:
+                field_tags.append("sand")
+            elif 'SNOW' in wn or 'HAIL' in wn:
+                field_tags.append("snow")
+            else:
+                field_tags.append(wn[:4].lower())
+        sf = getattr(state, 'shadow_fields', {})
+        for f in sf:
+            fn = str(f).split('.')[-1]
+            if 'TRICK' in fn:
+                field_tags.append("TR")
+            elif 'TERRAIN' in fn:
+                field_tags.append(fn.replace('_TERRAIN', '')[:4].lower())
+        my_sc = getattr(state, 'my_side_conditions', {})
+        opp_sc = getattr(state, 'opp_side_conditions', {})
+        if 'tailwind' in my_sc:
+            field_tags.append("tw")
+        if 'tailwind' in opp_sc:
+            field_tags.append("tw!")
+        for sc_name in ('reflect', 'lightscreen', 'auroraveil'):
+            if sc_name in my_sc:
+                field_tags.append(sc_name[:3])
+            if sc_name in opp_sc:
+                field_tags.append(sc_name[:3] + "!")
+
+        field_str = f" [{','.join(field_tags)}]" if field_tags else ""
+        return f"{my_str}{field_str} vs {opp_str}"
     def count_nodes_at_depth(node, current_depth, max_depth, counts):
         """Count nodes at each depth level"""
         if current_depth > max_depth:
