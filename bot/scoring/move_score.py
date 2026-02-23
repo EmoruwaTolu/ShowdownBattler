@@ -9,10 +9,108 @@ from bot.scoring.damage_score import (
     ko_probability_from_fraction,
 )
 from bot.scoring.helpers import hp_frac, is_slower
+from bot.scoring.opponent_pressure import estimate_opponent_pressure
 from bot.scoring.status_score import score_status_move
 from bot.scoring.secondary_score import score_secondaries
-from poke_env.battle import MoveCategory, SideCondition
+from poke_env.battle import MoveCategory, SideCondition, Status
 from bot.mcts.shadow_state import get_move_boosts
+
+# Canonical set of moves that apply the lockedmove volatile status.
+# These lock the user in for 2-3 turns with no choice; confusion at the end.
+_LOCK_MOVE_IDS: frozenset = frozenset({"outrage", "thrash", "petaldance", "ragingfury"})
+
+
+def _is_lock_move(move: Any) -> bool:
+    """
+    True if this move locks the user in for multiple turns (Outrage, Thrash, etc.)
+
+    Uses move ID as the primary signal — it's always reliably set on both real
+    and mock Move objects. volatile_status is checked as a secondary fallback
+    to catch any moves not in the explicit list.
+    """
+    move_id = str(getattr(move, "id", "") or "").lower().replace(" ", "").replace("-", "")
+    if move_id in _LOCK_MOVE_IDS:
+        return True
+    # Fallback: check volatile_status attribute and raw entry data
+    volatile = getattr(move, "volatile_status", None)
+    if volatile is not None and "locked" in str(volatile).lower():
+        return True
+    try:
+        entry = getattr(move, "entry", {}) or {}
+        self_vs = str((entry.get("self", {}) or {}).get("volatileStatus", "")).lower()
+        if "lockedmove" in self_vs:
+            return True
+    except Exception:
+        pass
+    return False
+
+
+def _lock_immune_penalty(move: Any, me: Any, opp: Any, battle: Any, ko_prob: float) -> float:
+    """
+    Additional penalty for lock-in moves (Outrage, Thrash, etc.) when the opponent
+    has alive bench members that are immune or strongly resist the move type.
+
+    The core problem: if we're locked into Outrage and Clefable is on the bench,
+    the opponent can freely pivot to Clefable, waste our turns, and punish freely.
+
+    Scaled by:
+    - bench_hp: a healthier immune pivot is a safer/more dangerous switch-in
+    - (1 - ko_prob): if we're about to KO the active, they can't switch in time
+    - being slower: opponent can predict-switch on the current turn itself
+    """
+    if not _is_lock_move(move):
+        return 0.0
+    if ko_prob >= 0.90:
+        return 0.0  # near-guaranteed KO: lock ends when they faint
+
+    opp_team = getattr(battle, "opponent_team", {}) or {}
+    penalty = 0.0
+
+    for opp_mon in opp_team.values():
+        if opp_mon is opp:
+            continue  # skip the active opponent
+        bench_hp = float(getattr(opp_mon, "current_hp_fraction", 0) or 0)
+        if bench_hp <= 0:
+            continue
+
+        try:
+            dmg = float(estimate_damage_fraction(move, me, opp_mon, battle))
+        except Exception:
+            continue  # can't compute: don't assume immunity
+
+        if dmg < 0.01:
+            # Immune pivot: free switch-in, we waste 2+ turns doing nothing
+            penalty += 22.0 * bench_hp * (1.0 - ko_prob)
+        elif dmg < 0.025:
+            # Strong resist (~0.25x): still a highly favourable switch-in for them
+            penalty += 7.0 * bench_hp * (1.0 - ko_prob)
+
+    # Being slower means opponent can prediction-switch on the current turn
+    if penalty > 0 and is_slower(me, opp):
+        penalty *= 1.25
+
+    return min(penalty, 40.0)
+
+
+def _opp_priority_ko_threat(opp: Any, me: Any, battle: Any) -> bool:
+    """True if opponent has a known damaging priority move that can KO our active mon."""
+    my_hp = hp_frac(me)
+    if my_hp <= 0.0:
+        return False
+    try:
+        for mv in (getattr(opp, 'moves', {}) or {}).values():
+            if mv is None:
+                continue
+            if int(getattr(mv, 'priority', 0) or 0) > 0 and int(getattr(mv, 'base_power', 0) or 0) > 0:
+                try:
+                    if float(estimate_damage_fraction(mv, opp, me, battle)) >= my_hp:
+                        return True
+                except Exception:
+                    pass
+    except Exception:
+        pass
+    return False
+
 
 def score_move(move: Any, battle: Any, ctx: EvalContext) -> float:
     me = ctx.me
@@ -38,8 +136,9 @@ def score_move(move: Any, battle: Any, ctx: EvalContext) -> float:
     # Expected damage
     score = (dmg_frac * 100.0) * accuracy
 
-    # Small "reliability" bonus
-    score += 5.0 * (accuracy - 0.85) / 0.15 if accuracy >= 0.85 else -10.0
+    # Small "reliability" bonus — capped at +2 to avoid over-rewarding 100% accuracy
+    # on top of already-accurate expected-damage math
+    score += min(2.0, 5.0 * (accuracy - 0.85) / 0.15) if accuracy >= 0.85 else -10.0
 
     # KO Bonus
     ko_prob = ko_probability_from_fraction(dmg_frac, opp_hp)
@@ -71,8 +170,47 @@ def score_move(move: Any, battle: Any, ctx: EvalContext) -> float:
         recoil_penalty = min(20.0, abs(recoil) * 50.0)
         score -= recoil_penalty
 
+    # Recharge penalty: moves like Hyper Beam/Blast Burn force a wasted turn after use.
+    # KO prob scales it down — if they're fainting, the lost turn doesn't matter.
+    flags = getattr(move, "flags", set()) or set()
+    has_recharge = "recharge" in flags or bool(getattr(move, "recharge", False))
+    if has_recharge:
+        score -= 15.0 * max(0.0, 1.0 - ko_prob)
+
+    # Self-lock penalty: moves like Outrage/Thrash lock you in for 2-3 turns,
+    # removing all switching/pivoting options until the lock breaks.
+    if _is_lock_move(move):
+        score -= 10.0 * max(0.0, 1.0 - ko_prob)
+
+    # Immune-pivot penalty: if the opponent has an alive bench member that is
+    # immune (or strongly resists) the lock move, they can freely pivot to it
+    # and wall us for the remainder of the lock duration.
+    score -= _lock_immune_penalty(move, me, opp, battle, ko_prob)
+
     # Crit is probably affecting stability, will soon change to not boost moves with regular crit chance jusr moves with a heightened one
     score += min(3.0, calculate_crit_bonus(move, battle, ctx, dmg_frac, ko_prob))
+
+    # Priority KO threat: if opponent likely has a priority move that KOs us this turn
+    # and our move has no priority, we'll be dead before this move fires.
+    move_priority = int(getattr(move, "priority", 0) or 0)
+    if move_priority <= 0:
+        if _opp_priority_ko_threat(opp, me, battle):
+            # Known revealed KO threat — heavy but not absolute
+            # (could be choice-locked, low-likelihood to click, etc.)
+            score *= 0.20
+        else:
+            # Belief-based: unrevealed priority move may exist; scale by how low our HP is.
+            # Smooth linear factor avoids hard oscillation when HP hovers near a threshold.
+            # hp_factor: 0.0 at 67%+ HP, grows to 1.0 at 0% HP.
+            my_hp_val = hp_frac(me)
+            try:
+                pressure = estimate_opponent_pressure(battle, ctx)
+                hp_factor = max(0.0, 1.0 - my_hp_val * 1.5)
+                p_threat = min(1.0, pressure.priority_p) * hp_factor
+                if p_threat > 0.05:
+                    score *= (1.0 - 0.6 * p_threat)
+            except Exception:
+                pass
 
     return float(score)
 
@@ -99,13 +237,13 @@ def calculate_crit_bonus(move: Any, battle: Any, ctx: Any, base_damage_frac: flo
     if move.category == MoveCategory.STATUS:
         return 0.0
     
-    # Get crit rate
+    # Get crit rate — only apply bonus for truly high-crit moves (ratio >= 2)
+    # ratio 0 (4.17%) and ratio 1 / Focus Energy (12.5%) are too low to be meaningful
+    # and create "coinflip-chasing" instability in close lines
     crit_ratio = getattr(move, 'crit_ratio', 0) or 0
-    crit_chance = get_crit_chance(crit_ratio)
-    
-    # If no meaningful crit chance, no bonus
-    if crit_chance < 0.08:  # Less than high-crit moves
+    if crit_ratio < 2:
         return 0.0
+    crit_chance = get_crit_chance(crit_ratio)
     
     bonus = 0.0
     
@@ -211,9 +349,7 @@ def score_setup_move(move: Any, battle: Any, ctx: EvalContext) -> float:
     opp = ctx.opp
     current_boosts = getattr(me, "boosts", {}) or {}
 
-    # ---------------------------
     # Base value with diminishing returns
-    # ---------------------------
     boost_value = 0.0
 
     for stat, stages in self_boosts.items():
@@ -248,20 +384,22 @@ def score_setup_move(move: Any, battle: Any, ctx: EvalContext) -> float:
     if boost_value <= 0.0:
         return 0.0
 
-    # ---------------------------
     # Risk: can we survive the turn we spend setting up?
-    # ---------------------------
     my_hp = float(getattr(me, "current_hp_fraction", 1.0) or 1.0)
     opp_hp = float(getattr(opp, "current_hp_fraction", 1.0) or 1.0)
 
     opp_max_damage = 0.0
+    _found_any_dmg = False
     for opp_move in getattr(opp, "moves", {}).values():
         try:
             dmg = float(estimate_damage_fraction(opp_move, opp, me, battle))
             opp_max_damage = max(opp_max_damage, dmg)
+            _found_any_dmg = True
         except Exception:
-            # keep conservative fallback but don't overwrite a found value
-            opp_max_damage = max(opp_max_damage, 0.5)
+            pass  # skip; don't inject per-move fallback
+    if not _found_any_dmg:
+        # No moves calculated at all — use a modest estimate rather than 0.5
+        opp_max_damage = 0.35
 
     # risk scaling (slightly harsher than before)
     if opp_max_damage >= my_hp:
@@ -273,24 +411,64 @@ def score_setup_move(move: Any, battle: Any, ctx: EvalContext) -> float:
     else:
         boost_value *= 1.10
 
-    # ---------------------------
-    # Speed: reward only if it flips speed order
-    # ---------------------------
+    # 2HKO hard gate: if opponent can KO us in ≤2 hits and setup doesn't include
+    # a speed boost (which could let us move first and avoid the second hit),
+    # setup is almost always a misplay — we'll be KO'd before the boosts pay off.
+    if opp_max_damage > 0:
+        setup_has_speed = self_boosts.get('spe', 0) > 0
+        htk = math.ceil(my_hp / opp_max_damage)
+        if htk <= 2 and not setup_has_speed:
+            boost_value *= 0.30
+
+    # Belief-based priority gate: the revealed-move scan above misses unrevealed
+    # priority moves. If belief says opponent likely has priority and we're low HP,
+    # setup is nearly pointless — we'll be KO'd before we can use the boosts.
+    # Smooth hp_factor avoids hard oscillation near a threshold.
     try:
-        my_spe = float(me.stats.get("spe", 100) or 100)
-        opp_spe = float(opp.stats.get("spe", 100) or 100)
+        pressure = estimate_opponent_pressure(battle, ctx)
+        hp_factor = max(0.0, 1.0 - my_hp * 1.5)  # 0.0 at 67%+ HP, 1.0 at 0%
+        p_prio_ko = min(1.0, pressure.priority_p) * hp_factor
+        if p_prio_ko > 0.1:
+            boost_value *= max(0.10, 1.0 - 0.85 * p_prio_ko)
+    except Exception:
+        pass
+
+    # Speed: reward only if it flips speed order
+    # Account for paralysis, Choice Scarf, and Tailwind
+    try:
+        def _eff_spe_base(pokemon: Any) -> float:
+            """Base effective speed: stat × status × item × side condition."""
+            spe = float((pokemon.stats or {}).get("spe", 100) or 100)
+            if getattr(pokemon, "status", None) == Status.PAR:
+                spe *= 0.5
+            item = str(getattr(pokemon, "item", "") or "").lower().replace(" ", "").replace("-", "")
+            if item == "choicescarf":
+                spe *= 1.5
+            return spe
+
+        my_spe = _eff_spe_base(me)
+        opp_spe = _eff_spe_base(opp)
+
+        # Tailwind doubles speed for that side
+        try:
+            my_side = getattr(battle, "side_conditions", {}) or {}
+            opp_side = getattr(battle, "opponent_side_conditions", {}) or {}
+            if SideCondition.TAILWIND in my_side:
+                my_spe *= 2.0
+            if SideCondition.TAILWIND in opp_side:
+                opp_spe *= 2.0
+        except Exception:
+            pass
 
         cur_spe_stage = int(current_boosts.get("spe", 0))
         gained_spe = int(self_boosts.get("spe", 0))
 
         def spe_multiplier(stage: int) -> float:
-            # Pokémon stage multipliers
-            if stage >= 0:
-                return (2.0 + stage) / 2.0
-            return 2.0 / (2.0 - stage)
+            stage = max(-6, min(6, stage))
+            return (2.0 + stage) / 2.0 if stage >= 0 else 2.0 / (2.0 - stage)
 
         before = my_spe * spe_multiplier(cur_spe_stage)
-        after = my_spe * spe_multiplier(min(6, cur_spe_stage + gained_spe))
+        after = my_spe * spe_multiplier(cur_spe_stage + gained_spe)
 
         was_slower = before < opp_spe
         becomes_faster = after >= opp_spe
@@ -304,20 +482,16 @@ def score_setup_move(move: Any, battle: Any, ctx: EvalContext) -> float:
     except Exception:
         pass
 
-    # ---------------------------
-    # Multi-stat boost bonus (toned down)
-    # ---------------------------
+    # Multi-stat boost bonus
     num_boosted_stats = sum(1 for v in self_boosts.values() if v > 0)
     if num_boosted_stats >= 2:
-        boost_value *= 1.10  # was 1.3 (too high)
+        boost_value *= 1.10 
 
-    # ---------------------------
-    # HP situation (toned down)
-    # ---------------------------
+    # HP situation
     if my_hp > 0.8 and opp_hp > 0.6:
-        boost_value *= 1.05  # was 1.2
+        boost_value *= 1.05 
     elif opp_hp < 0.3:
-        boost_value *= 0.45  # was 0.3 (still downweight, but less extreme)
+        boost_value *= 0.45
 
     # Horizon factor for depth=3: discourage repeated setup
     atk_stage = int(current_boosts.get("atk", 0))

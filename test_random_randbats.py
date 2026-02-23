@@ -166,6 +166,14 @@ def get_move_crit_ratio(move_name: str, gen_data) -> int:
     # critRatio field: 0 (normal), 1 (Focus Energy), 2 (high crit moves), 3+ (always crit)
     return move_info.get("critRatio", 0)
 
+
+def get_move_priority(move_name: str, gen_data) -> int:
+    """Get priority for a move from GenData (e.g. Ice Shard=1, most moves=0)."""
+    move_info = get_move_info(move_name, gen_data)
+    if not move_info:
+        return 0
+    return int(move_info.get("priority", 0) or 0)
+
 def get_move_status(move_name: str, gen_data) -> Optional[Status]:
     """Get status effect for a move from GenData."""
     move_info = get_move_info(move_name, gen_data)
@@ -289,7 +297,8 @@ def create_pokemon_from_randbats(species_name: str, data: Dict, gen_data, role_n
         move_status = get_move_status(move_name, gen_data)
         move_secondary = get_move_secondary(move_name, gen_data)
         move_boosts = get_move_boosts(move_name, gen_data)
-        move_self = get_move_self(move_name, gen_data)  
+        move_self = get_move_self(move_name, gen_data)
+        move_priority = get_move_priority(move_name, gen_data)
         
         move = create_mock_move(
             move_id=move_id,
@@ -297,6 +306,7 @@ def create_pokemon_from_randbats(species_name: str, data: Dict, gen_data, role_n
             move_type=move_type,
             base_power=move_power,
             accuracy=move_acc,
+            priority=move_priority,
             crit_ratio=move_crit,
             status=move_status,
             secondary=move_secondary,

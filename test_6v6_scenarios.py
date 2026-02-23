@@ -27,7 +27,7 @@ from bot.scoring.switch_score import score_switch as score_switch_core
 def score_switch(target, battle, ctx):
     s = score_switch_core(target, battle, ctx)
     # uncomment to log only top-level calls if spammy:
-    print("switch", getattr(target, "species", "?"), "score", s)
+    # print("switch", getattr(target, "species", "?"), "score", s)
     return s
 
 # Patch create_mock_battle to add gen attribute
@@ -102,30 +102,35 @@ def test_6v6_team_awareness():
         #     "opp_active": 0,
         #     "expected": "Should play aggressively - we're up 5v2!"
         # },
-        {
-            "name": "Unseen Pokemon Caution",
-            "description": "Should account for unseen opponent Pokemon",
-            "our_team": ["Dragonite", "Garchomp", "Toxapex", "Corviknight", "Heatran", "Weavile"],
-            "our_hp": [0.90, 0.85, 0.80, 0.75, 0.70, 0.65],  # All healthy
-            "our_boosts": [{}, {}, {}, {}, {}, {}],
-            "our_active": 0,
-            "opp_team": ["Landorus-Therian", "Clefable"],  # Only 2 seen (4 unseen!)
-            "opp_hp": [0.70, 0.50],
-            "opp_active": 0,
-            "expected": "Should be cautious - opponent has 4 unseen Pokemon"
-        },
         # {
-        #     "name": "Strategic Switching",
-        #     "description": "Should switch to preserve low HP important Pokemon",
+        #     "name": "Unseen Pokemon Caution",
+        #     "description": "Should account for unseen opponent Pokemon",
         #     "our_team": ["Dragonite", "Garchomp", "Toxapex", "Corviknight", "Heatran", "Weavile"],
-        #     "our_hp": [0.25, 0.90, 0.85, 0.80, 0.75, 0.70],  # Dragonite low
-        #     "our_boosts": [{"atk": 3, "spe": 3}, {}, {}, {}, {}, {}],  # But heavily boosted!
-        #     "our_active": 0,  # Dragonite active at 25% HP
-        #     "opp_team": ["Weavile", "Clefable", "Greninja", "Kingambit", "Great Tusk", "Zapdos"],
-        #     "opp_hp": [1.00, 0.90, 0.85, 0.80, 0.75, 0.70],  # All healthy
-        #     "opp_active": 0,  # Weavile (threatens with Ice Shard)
-        #     "expected": "Should switch out +3 Dragonite to preserve win condition"
+        #     "our_hp": [0.90, 0.85, 0.80, 0.75, 0.70, 0.65],  # All healthy
+        #     "our_boosts": [{}, {}, {}, {}, {}, {}],
+        #     "our_active": 0,
+        #     "opp_team": ["Landorus-Therian", "Clefable"],  # Only 2 seen (4 unseen!)
+        #     "opp_hp": [0.70, 0.50],
+        #     "opp_active": 0,
+        #     "expected": "Should be cautious - opponent has 4 unseen Pokemon"
         # },
+        {
+            "name": "Strategic Switching",
+            "description": "Should switch to preserve low HP important Pokemon",
+            "our_team": ["Dragonite", "Garchomp", "Toxapex", "Corviknight", "Heatran", "Weavile"],
+            "our_hp": [0.25, 0.90, 0.85, 0.80, 0.75, 0.70],  # Dragonite low
+            "our_boosts": [{"atk": 3, "spe": 3}, {}, {}, {}, {}, {}],  # But heavily boosted!
+            "our_active": 0,  # Dragonite active at 25% HP
+            "opp_team": ["Weavile", "Clefable", "Greninja", "Kingambit", "Great Tusk", "Zapdos"],
+            "opp_hp": [1.00, 0.90, 0.85, 0.80, 0.75, 0.70],  # All healthy
+            "opp_active": 0,  # Weavile (threatens with Ice Shard)
+            "expected": "Should switch out +3 Dragonite to preserve win condition",
+            # Ensure opponent active has Ice Shard (priority KO threat) — randbats may give other moveset
+            "opp_active_inject_moves": [
+                {"id": "iceshard", "category": MoveCategory.PHYSICAL, "type": PokemonType.ICE,
+                 "base_power": 40, "priority": 1},
+            ],
+        },
     ]
     
     for scenario in scenarios:
@@ -172,75 +177,90 @@ def run_6v6_scenario(scenario: dict, gen_data, randbats_data):
         
         opp_team_mons.append(mon)
         opp_team_dict[f"p2: {species}"] = mon
-    
+
+    # Inject any forced moves onto the opponent active (for deterministic test scenarios)
+    inject_specs = scenario.get('opp_active_inject_moves', [])
+    if inject_specs:
+        target = opp_team_mons[scenario.get('opp_active', 0)]
+        for spec in inject_specs:
+            mid = spec['id']
+            if mid not in target.moves:
+                m = create_mock_move(
+                    mid, spec['category'], spec['type'],
+                    base_power=spec.get('base_power', 0),
+                    priority=spec.get('priority', 0),
+                )
+                target.moves[mid] = m
+                print(f"  [Injected {mid} into opponent {getattr(target, 'species', '?')} for test validity]")
+
     # Set active Pokemon
     our_active = our_team_mons[scenario['our_active']]
     opp_active = opp_team_mons[scenario['opp_active']]
     
     # Display teams
-    # print("\n" + "-" * 80)
-    # print("OUR TEAM")
-    # print("-" * 80)
-    # for i, mon in enumerate(our_team_mons):
-    #     species = scenario['our_team'][i]
-    #     hp = scenario['our_hp'][i]
-    #     boosts = scenario['our_boosts'][i]
-    #     active_marker = "← ACTIVE" if i == scenario['our_active'] else ""
+    print("\n" + "-" * 80)
+    print("OUR TEAM")
+    print("-" * 80)
+    for i, mon in enumerate(our_team_mons):
+        species = scenario['our_team'][i]
+        hp = scenario['our_hp'][i]
+        boosts = scenario['our_boosts'][i]
+        active_marker = "← ACTIVE" if i == scenario['our_active'] else ""
         
-    #     boost_str = ""
-    #     if boosts:
-    #         boost_parts = [f"{stat}{val:+d}" for stat, val in boosts.items() if val != 0]
-    #         if boost_parts:
-    #             boost_str = f" [{', '.join(boost_parts)}]"
+        boost_str = ""
+        if boosts:
+            boost_parts = [f"{stat}{val:+d}" for stat, val in boosts.items() if val != 0]
+            if boost_parts:
+                boost_str = f" [{', '.join(boost_parts)}]"
         
-    #     print(f"  {i+1}. {species:20s} {hp:>5.0%} HP{boost_str} {active_marker}")
+        print(f"  {i+1}. {species:20s} {hp:>5.0%} HP{boost_str} {active_marker}")
         
-    #     # Display moveset
-    #     moves_list = list(mon.moves.values())
-    #     if moves_list:
-    #         move_names = [getattr(m, 'id', 'unknown') for m in moves_list]
-    #         print(f"      Moves: {', '.join(move_names)}")
+        # Display moveset
+        moves_list = list(mon.moves.values())
+        if moves_list:
+            move_names = [getattr(m, 'id', 'unknown') for m in moves_list]
+            print(f"      Moves: {', '.join(move_names)}")
         
-    #     # Display ability and item
-    #     ability = getattr(mon, 'ability', None)
-    #     item = getattr(mon, 'item', None)
-    #     if ability or item:
-    #         details = []
-    #         if ability:
-    #             details.append(f"Ability: {ability}")
-    #         if item:
-    #             details.append(f"Item: {item}")
-    #         print(f"      {' | '.join(details)}")
+        # Display ability and item
+        ability = getattr(mon, 'ability', None)
+        item = getattr(mon, 'item', None)
+        if ability or item:
+            details = []
+            if ability:
+                details.append(f"Ability: {ability}")
+            if item:
+                details.append(f"Item: {item}")
+            print(f"      {' | '.join(details)}")
     
-    # print("\n" + "-" * 80)
-    # print("OPPONENT TEAM")
-    # print("-" * 80)
-    # for i, mon in enumerate(opp_team_mons):
-    #     species = scenario['opp_team'][i]
-    #     hp = scenario['opp_hp'][i]
-    #     active_marker = "← ACTIVE" if i == scenario['opp_active'] else ""
-    #     print(f"  {i+1}. {species:20s} {hp:>5.0%} HP {active_marker}")
+    print("\n" + "-" * 80)
+    print("OPPONENT TEAM")
+    print("-" * 80)
+    for i, mon in enumerate(opp_team_mons):
+        species = scenario['opp_team'][i]
+        hp = scenario['opp_hp'][i]
+        active_marker = "← ACTIVE" if i == scenario['opp_active'] else ""
+        print(f"  {i+1}. {species:20s} {hp:>5.0%} HP {active_marker}")
         
-    #     # Display moveset
-    #     moves_list = list(mon.moves.values())
-    #     if moves_list:
-    #         move_names = [getattr(m, 'id', 'unknown') for m in moves_list]
-    #         print(f"      Moves: {', '.join(move_names)}")
+        # Display moveset
+        moves_list = list(mon.moves.values())
+        if moves_list:
+            move_names = [getattr(m, 'id', 'unknown') for m in moves_list]
+            print(f"      Moves: {', '.join(move_names)}")
         
-    #     # Display ability and item
-    #     ability = getattr(mon, 'ability', None)
-    #     item = getattr(mon, 'item', None)
-    #     if ability or item:
-    #         details = []
-    #         if ability:
-    #             details.append(f"Ability: {ability}")
-    #         if item:
-    #             details.append(f"Item: {item}")
-    #         print(f"      {' | '.join(details)}")
+        # Display ability and item
+        ability = getattr(mon, 'ability', None)
+        item = getattr(mon, 'item', None)
+        if ability or item:
+            details = []
+            if ability:
+                details.append(f"Ability: {ability}")
+            if item:
+                details.append(f"Item: {item}")
+            print(f"      {' | '.join(details)}")
     
-    # unseen = 6 - len(scenario['opp_team'])
-    # if unseen > 0:
-    #     print(f"  ... and {unseen} unseen Pokemon")
+    unseen = 6 - len(scenario['opp_team'])
+    if unseen > 0:
+        print(f"  ... and {unseen} unseen Pokemon")
     
     # Team value analysis
     print("\n" + "-" * 80)
@@ -399,7 +419,7 @@ def run_6v6_scenario(scenario: dict, gen_data, randbats_data):
     print("\n" + "-" * 80)
     print("RUNNING MCTS")
     print("-" * 80)
-    
+
     cfg = MCTSConfig(
         num_simulations=400,
         max_depth=4,
@@ -407,9 +427,31 @@ def run_6v6_scenario(scenario: dict, gen_data, randbats_data):
         seed=42,
         use_hybrid_expansion=False,
     )
-    
+
     battle.available_moves = list(our_active.moves.values())
     battle.available_switches = [mon for mon in our_team_mons if mon != our_active and mon.current_hp_fraction > 0]
+
+    # Print heuristic scores for all actions at root state
+    print("\nHeuristic scores (before MCTS):")
+    raw_scores = []
+    for move in battle.available_moves:
+        try:
+            s = score_move(move, battle, ctx_me)
+        except Exception:
+            s = float('nan')
+        raw_scores.append((getattr(move, 'id', '?'), s, 'move'))
+    for sw in battle.available_switches:
+        try:
+            s = score_switch(sw, battle, ctx_me)
+        except Exception:
+            s = float('nan')
+        raw_scores.append((getattr(sw, 'species', getattr(sw, 'id', '?')), s, 'switch'))
+    raw_scores.sort(key=lambda x: -x[1])
+    print(f"  {'Action':<24} {'Score':>8}   Type")
+    print("  " + "-" * 42)
+    for name, sc, kind in raw_scores:
+        tag = "→" if kind == 'switch' else " "
+        print(f"  {tag} {name:<22}  {sc:+8.2f}   {kind}")
     
     from bot.mcts.shadow_state import ShadowState
     
@@ -450,10 +492,10 @@ def run_6v6_scenario(scenario: dict, gen_data, randbats_data):
             else:
                 switches.append((name, visits, q_val, pct))
         
-        # if moves:
-        #     print("Moves:")
-        #     for name, visits, q_val, pct in moves[:5]:
-        #         print(f"    {name:20s}: {visits:4d} visits ({pct:5.1f}%), Q={q_val:+.3f}")
+        if moves:
+            print("Moves:")
+            for name, visits, q_val, pct in moves[:5]:
+                print(f"    {name:20s}: {visits:4d} visits ({pct:5.1f}%), Q={q_val:+.3f}")
         
         if switches:
             print("Switches:")
@@ -461,35 +503,35 @@ def run_6v6_scenario(scenario: dict, gen_data, randbats_data):
                 print(f"    → {name:20s}: {visits:4d} visits ({pct:5.1f}%), Q={q_val:+.3f}")
         
         # Interpretation
-        # print("\n" + "-" * 80)
-        # print("INTERPRETATION")
-        # print("-" * 80)
+        print("\n" + "-" * 80)
+        print("INTERPRETATION")
+        print("-" * 80)
         
-        # top_action = max(stats['root'].children.items(), key=lambda x: x[1].N)
-        # top_kind, top_obj = top_action[0]
-        # top_name = getattr(top_obj, 'id', getattr(top_obj, 'species', 'unknown'))
-        # top_visits = top_action[1].N
+        top_action = max(stats['root'].children.items(), key=lambda x: x[1].N)
+        top_kind, top_obj = top_action[0]
+        top_name = getattr(top_obj, 'id', getattr(top_obj, 'species', 'unknown'))
+        top_visits = top_action[1].N
         
-        # if top_kind == 'switch':
-        #     print(f"\n✓ MCTS chose to SWITCH to {top_name}")
-        #     print(f"  This suggests:")
-        #     print(f"  - Current active Pokemon should be preserved")
-        #     print(f"  - {top_name} is a better matchup")
-        #     print(f"  - Team-aware decision making")
-        # else:
-        #     print(f"\n✓ MCTS chose to use {top_name}")
-        #     print(f"  This suggests:")
-        #     print(f"  - Current matchup is favorable")
-        #     print(f"  - Pressing advantage is correct")
+        if top_kind == 'switch':
+            print(f"\n✓ MCTS chose to SWITCH to {top_name}")
+            print(f"  This suggests:")
+            print(f"  - Current active Pokemon should be preserved")
+            print(f"  - {top_name} is a better matchup")
+            print(f"  - Team-aware decision making")
+        else:
+            print(f"\n✓ MCTS chose to use {top_name}")
+            print(f"  This suggests:")
+            print(f"  - Current matchup is favorable")
+            print(f"  - Pressing advantage is correct")
         
-        # # Check if it matches expectation
-        # print(f"\nExpected behavior: {scenario['expected']}")
+        # Check if it matches expectation
+        print(f"\nExpected behavior: {scenario['expected']}")
         
-        # # Tree visualization
-        # print("\n" + "-" * 80)
-        # print("TREE VISUALIZATION (Top Actions)")
-        # print("-" * 80)
-        # visualize_tree_depth(stats['root'], max_depth=2)
+        # Tree visualization
+        print("\n" + "-" * 80)
+        print("TREE VISUALIZATION (Top Actions)")
+        print("-" * 80)
+        visualize_tree_depth(stats['root'], max_depth=2)
         
     except Exception as e:
         print(f"\n❌ MCTS Failed: {e}")

@@ -41,6 +41,10 @@ class MCTSConfig:
     crit_matters_min_normal: float = 0.60
     min_branch_probability: float = 0.01 # Probability before we consider a branch
 
+    # Switch exploration
+    switch_prior_boost: float = 1.5
+    prior_ceiling: float = 0.5  # Cap max prior per action; 1.0 = no cap
+
 
 class Node:
     __slots__ = ("state", "parent", "prior", "children", "N", "W")
@@ -72,9 +76,16 @@ def softmax(scores: List[float], tau: float = 12.0) -> List[float]:
     return [e / z for e in exps]
 
 
-def action_priors(state: ShadowState, actions: List[Action]) -> Dict[Action, float]:
+def action_priors(
+    state: ShadowState,
+    actions: List[Action],
+    switch_prior_boost: float = 1.0,
+    prior_ceiling: float = 1.0,
+) -> Dict[Action, float]:
     """
     Convert heuristic scores into priors P(a|s) for PUCT.
+    switch_prior_boost: multiply switch priors by this, then renormalize (1.0 = no boost).
+    prior_ceiling: cap max prior per action; redistribute excess (1.0 = no cap).
     """
     scores: List[float] = []
     with state._patched_status(), state._patched_boosts():
@@ -88,7 +99,37 @@ def action_priors(state: ShadowState, actions: List[Action]) -> Dict[Action, flo
 
     priors: Dict[Action, float] = {}
     for a, p in zip(actions, probs):
-        priors[a] = float(p)
+        kind = a[0]
+        if kind == "switch" or kind == "switch_unknown":
+            priors[a] = float(p) * switch_prior_boost
+        else:
+            priors[a] = float(p)
+    total = sum(priors.values())
+    if total > 0:
+        priors = {a: p / total for a, p in priors.items()}
+
+    # Prior ceiling: cap dominant actions so others get more exploration
+    if prior_ceiling < 1.0 and priors:
+        capped = {a: min(p, prior_ceiling) for a, p in priors.items()}
+        total_capped = sum(capped.values())
+        excess = 1.0 - total_capped
+        if excess > 1e-9:
+            recipients = [a for a in priors if capped[a] < prior_ceiling]
+            if recipients:
+                headroom = {a: prior_ceiling - capped[a] for a in recipients}
+                total_headroom = sum(headroom.values())
+                if total_headroom > 1e-9:
+                    for a in recipients:
+                        capped[a] += excess * (headroom[a] / total_headroom)
+                else:
+                    u = excess / len(recipients)
+                    for a in recipients:
+                        capped[a] += u
+            else:
+                # All at ceiling; renormalize to sum to 1
+                s = sum(capped.values()) or 1.0
+                capped = {a: p / s for a, p in capped.items()}
+            priors = capped
     return priors
 
 
@@ -321,7 +362,11 @@ def expand(node: Node, rng: random.Random, cfg: MCTSConfig, is_root: bool) -> No
     if not actions:
         return
 
-    priors = action_priors(node.state, actions)
+    priors = action_priors(
+        node.state, actions,
+        switch_prior_boost=cfg.switch_prior_boost,
+        prior_ceiling=cfg.prior_ceiling,
+    )
     if is_root:
         priors = add_dirichlet_noise(priors, cfg.dirichlet_alpha, cfg.dirichlet_eps, rng)
     
@@ -429,7 +474,10 @@ def action_name(a: Action) -> Tuple[str, str]:
         if outcome:
             name += f" [{outcome}]"
         return "move", name
-    
+
+    if kind == "switch_unknown":
+        return "switch", f"??{obj}" if isinstance(obj, int) else "??unknown"
+
     name = str(getattr(obj, "species", "") or getattr(obj, "name", "") or "switch")
     return "switch", name
 

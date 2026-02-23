@@ -154,6 +154,83 @@ class DeterminizedOpponent:
     candidate: SetCandidate
     moves4: Tuple[str, str, str, str]
 
+
+@dataclass
+class TeamBelief:
+    """
+    Team-level belief over unseen opponent slots.
+    pool: species_key -> weight (P(species) for remaining unseen mons)
+    """
+    revealed_species: Set[str]
+    pool: Dict[str, float]
+
+    def has_mass(self) -> bool:
+        """True if there is nonzero probability mass to sample from."""
+        return sum(self.pool.values()) > 1e-9
+
+    def without(self, species_key: str) -> "TeamBelief":
+        """Return a new TeamBelief with this species removed (without replacement)."""
+        new_pool = {k: v for k, v in self.pool.items() if to_id_str(k) != to_id_str(species_key)}
+        total = sum(new_pool.values())
+        if total <= 0:
+            return TeamBelief(revealed_species=self.revealed_species, pool={})
+        return TeamBelief(
+            revealed_species=self.revealed_species,
+            pool={k: v / total for k, v in new_pool.items()},
+        )
+
+
+def build_team_belief(gen: int, revealed_species: Set[str]) -> TeamBelief:
+    """
+    Build TeamBelief from RandBats prior, excluding revealed species.
+    pool is P(species) for unseen slots, renormalized.
+    """
+    data = _load_randbats_json(gen)
+    if not data:
+        return TeamBelief(revealed_species=revealed_species, pool={})
+    revealed_norm = {to_id_str(s) for s in revealed_species if s}
+    pool: Dict[str, float] = {}
+    for species_key in data.keys():
+        if not species_key:
+            continue
+        if to_id_str(species_key) in revealed_norm:
+            continue
+        pool[species_key] = 1.0
+    total = sum(pool.values())
+    if total <= 0:
+        return TeamBelief(revealed_species=revealed_species, pool={})
+    normalized = {k: v / total for k, v in pool.items()}
+    return TeamBelief(revealed_species=revealed_species, pool=normalized)
+
+
+def sample_unseen_mon_from_team_belief(
+    team_belief: TeamBelief,
+    gen: int,
+    rng: random.Random,
+) -> Tuple[Optional[Any], Optional[TeamBelief]]:
+    """
+    Sample a Pokémon from team_belief.pool (species) then RandBats set prior.
+    Returns (mon, new_team_belief) with species removed from pool (without replacement).
+    """
+    if not team_belief.has_mass():
+        return (None, None)
+    species_key = rng.choices(
+        list(team_belief.pool.keys()),
+        weights=list(team_belief.pool.values()),
+        k=1,
+    )[0]
+    candidates = lookup_randbats_candidates(species_key, gen)
+    if not candidates:
+        cand = None
+    else:
+        cand = rng.choice(candidates)
+    if cand is None:
+        return (None, team_belief.without(species_key))
+    mon = _create_pokemon_proxy(cand, species_key, gen, rng)
+    new_belief = team_belief.without(species_key)
+    return (mon, new_belief)
+
+
 _DEFAULT_DATA_DIR = os.path.normpath(
     os.path.join(os.path.dirname(__file__), "..", "data", "randbats")
 )
@@ -522,3 +599,138 @@ def determinize_opponent(belief: OpponentBelief, rng: random.Random) -> Determin
 
     sampled4 = tuple(sorted(sampled)[:4])
     return DeterminizedOpponent(candidate=cand, moves4=sampled4)
+
+
+def sample_unseen_mon(
+    gen: int,
+    known_species_ids: Set[str],
+    rng: random.Random,
+) -> Any:
+    """
+    Sample a Pokémon from the RandBats prior, excluding known species.
+    Returns a Pokémon-like proxy suitable for damage calc and heuristic scoring.
+    """
+    data = _load_randbats_json(gen)
+    if not data:
+        return None
+
+    known_norm = {to_id_str(s) for s in known_species_ids if s}
+    available = [k for k in data.keys() if k and to_id_str(k) not in known_norm]
+    if not available:
+        return None
+
+    species_key = rng.choice(available)
+    candidates = lookup_randbats_candidates(species_key, gen)
+    if not candidates:
+        return None
+
+    cand = rng.choice(candidates)
+    return _create_pokemon_proxy(cand, species_key, gen, rng)
+
+
+def _create_pokemon_proxy(cand: SetCandidate, species_key: str, gen: int, rng: random.Random) -> Any:
+    """Create a lightweight Pokémon proxy from a SetCandidate."""
+    from types import SimpleNamespace
+    from poke_env.battle import Move, PokemonType
+    from poke_env.data import GenData
+
+    data = _load_randbats_json(gen)
+    try:
+        gd = GenData.from_gen(gen)
+    except Exception:
+        return None
+
+    # Types and base stats from GenData pokedex
+    sid = to_id_str(species_key)
+    entry = (gd.pokedex or {}).get(species_key) or (gd.pokedex or {}).get(sid) or {}
+    if isinstance(entry, dict):
+        type_list = entry.get("types", ["Normal"])
+        try:
+            t1 = PokemonType.from_name(str(type_list[0])) if type_list else PokemonType.NORMAL
+            t2 = PokemonType.from_name(str(type_list[1])) if len(type_list) > 1 else None
+        except Exception:
+            t1, t2 = PokemonType.NORMAL, None
+        base_stats_raw = entry.get("baseStats", {})
+        base_stats = {
+            "hp": int(base_stats_raw.get("hp", 100)),
+            "atk": int(base_stats_raw.get("atk", 100)),
+            "def": int(base_stats_raw.get("def", 100)),
+            "spa": int(base_stats_raw.get("spa", 100)),
+            "spd": int(base_stats_raw.get("spd", 100)),
+            "spe": int(base_stats_raw.get("spe", 100)),
+        }
+    else:
+        t1, t2 = PokemonType.NORMAL, None
+        base_stats = {"hp": 100, "atk": 100, "def": 100, "spa": 100, "spd": 100, "spe": 100}
+
+    level = 50
+    try:
+        entry = (data or {}).get(species_key, {})
+        level = int(entry.get("level", 50))
+    except Exception:
+        pass
+
+    # Stat calculation (simple: base * 2 + 5 at level 50, hp uses different formula)
+    def _stat(v: int, is_hp: bool = False) -> int:
+        if is_hp:
+            return int(2 * v * level / 100 + level + 10)
+        return int((2 * v * level / 100 + 5))
+
+    stats = {
+        "hp": _stat(base_stats["hp"], True),
+        "atk": _stat(base_stats["atk"]),
+        "def": _stat(base_stats["def"]),
+        "spa": _stat(base_stats["spa"]),
+        "spd": _stat(base_stats["spd"]),
+        "spe": _stat(base_stats["spe"]),
+    }
+
+    # Item and ability from candidate
+    item = list(cand.items)[0] if cand.items else None
+    ability = list(cand.abilities)[0] if cand.abilities else None
+
+    # Moves: sample 4 from candidate
+    move_list = list(cand.moves)
+    if len(move_list) >= 4:
+        chosen = rng.sample(move_list, 4)
+    else:
+        chosen = list(move_list)
+        while len(chosen) < 4 and move_list:
+            chosen.append(rng.choice(move_list))
+
+    moves_dict: Dict[str, Any] = {}
+    for mid in chosen:
+        try:
+            moves_dict[mid] = Move(mid, gen=gen)
+        except Exception:
+            continue
+
+    mon = SimpleNamespace()
+    mon.species = species_key
+    mon.base_species = species_key
+    mon.stats = stats
+    mon.base_stats = base_stats
+    mon.boosts = {"atk": 0, "def": 0, "spa": 0, "spd": 0, "spe": 0, "accuracy": 0, "evasion": 0}
+    mon.current_hp_fraction = 1.0
+    mon.max_hp = stats["hp"]
+    mon.current_hp = stats["hp"]
+    mon.level = level
+    mon.type_1 = t1
+    mon.type_2 = t2
+    mon.types = [t1] + ([t2] if t2 else [])
+    mon.original_types = mon.types.copy()
+    mon.ability = ability
+    mon.item = to_id_str(item) if item else None
+    mon.status = None
+    mon.effects = {}
+    mon.weight = 100.0
+    mon.is_terastallized = False
+    mon.tera_type = None
+    mon.gender = None
+    mon.fainted = False
+    mon.moves = moves_dict
+    mon._identifier_string = f"p2: {species_key}"
+    mon.identifier = lambda role=None: mon._identifier_string
+    mon._data = type("_Data", (), {"pokedex": {species_key: {"evos": []}}})()
+
+    return mon

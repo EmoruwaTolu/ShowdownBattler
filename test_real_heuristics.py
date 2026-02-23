@@ -231,7 +231,10 @@ def create_mock_move(
         except (KeyError, AttributeError):
             pass
 
-    move.volatile_status = move_data.get('volatileStatus', None)
+    # volatile_status may be at the top level OR nested in the 'self' dict
+    # (e.g. Outrage: move_data['self']['volatileStatus'] = 'lockedmove')
+    _vs = move_data.get('volatileStatus') or (move_data.get('self') or {}).get('volatileStatus')
+    move.volatile_status = _vs or None
     move.sleep_usable = move_data.get('sleepUsable', False)
     move.self_boost = move_data.get('self', {}).get('boosts', None) if isinstance(move_data.get('self'), dict) else None
 

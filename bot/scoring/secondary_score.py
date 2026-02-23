@@ -11,6 +11,7 @@ from bot.scoring.status_score import (
     sleep_immediate_value,
     freeze_immediate_value,
     status_is_applicable,
+    _absorber_multiplier,
 )
 
 
@@ -85,7 +86,11 @@ def score_secondaries(move: Any, battle: Any, ctx: EvalContext, ko_prob: float, 
         
         # Get status value, it will be the same as pure status moves!
         status_value = get_status_value(status, me, opp)
-        
+
+        # Discount if opponent bench has an immune absorber that can pivot in
+        absorber_mult = _absorber_multiplier(status, move, battle, opp, me=me)
+        status_value *= max(0.65, absorber_mult)
+
         # Expected value formula:
         # EV = chance × accuracy × (1 - ko_prob) × status_value
         ev = chance * accuracy * no_ko_prob * status_value

@@ -16,6 +16,19 @@ from bot.mcts.randbats_analyzer import (
     has_priority_moves as rb_has_priority,
 )
 
+try:
+    from poke_env.data import GenData
+    _TYPE_CHART = GenData.from_gen(9).type_chart
+except Exception:
+    _TYPE_CHART = {}
+
+def _safe_mon_types(p: Any) -> set:
+    """Return the types of a Pokemon as a set of PokemonType values."""
+    try:
+        return set(p.types or [])
+    except Exception:
+        return set()
+
 def _tanh01(x: float) -> float:
     # maps to (-1, 1)
     return math.tanh(float(x))
@@ -245,6 +258,61 @@ def compute_info_terms(state: Any, opp_known: int, opp_total: int) -> tuple[floa
     info_term = float(max(0.0, min(1.0, raw)))
     return roster_reveal, set_certainty, info_term
 
+def _per_mon_threat_score(belief: Any, hp: float, status: Any) -> float:
+    """Compute per-mon threat score from belief, HP, and status. Internal helper."""
+    if belief is None or not getattr(belief, "dist", None):
+        return 0.0
+
+    E_setup = 0.0
+    E_prio = 0.0
+    E_speed = 0.0
+    E_phys = 0.0
+    for cand, prob in belief.dist:
+        pr = float(prob)
+        E_setup += pr * (1.0 if getattr(cand, "has_setup", False) else 0.0)
+        E_prio  += pr * (1.0 if getattr(cand, "has_priority", False) else 0.0)
+        E_speed += pr * float(getattr(cand, "speed_mult", 1.0))
+        E_phys  += pr * float(getattr(cand, "physical_threat", 0.6))
+
+    speed_excess = max(0.0, E_speed - 1.0)
+
+    if status == Status.PAR:
+        speed_excess *= 0.55
+    if status == Status.BRN:
+        E_phys *= 0.60
+    if status in (Status.PSN, Status.TOX):
+        E_setup *= 0.75
+
+    hp_factor = max(0.35, min(1.0, hp / 0.80))
+
+    return (
+        0.70 * E_setup +
+        0.55 * E_prio +
+        0.60 * speed_excess +
+        0.50 * E_phys
+    ) * hp_factor
+
+
+def compute_top_threats(state: Any, k: int = 2) -> list:
+    """Returns top-k (pokemon, threat_score) pairs from alive opponent team, sorted descending."""
+    beliefs = getattr(state, "opp_beliefs", {}) or {}
+    opp_team = getattr(state, "opp_team", []) or []
+    opp_hp = getattr(state, "opp_hp", {}) or {}
+    opp_status = getattr(state, "opp_status", {}) or {}
+
+    scores = []
+    for p in opp_team:
+        hp = float(opp_hp.get(id(p), 0.0))
+        if hp <= 0.0:
+            continue
+        b = beliefs.get(id(p))
+        st = opp_status.get(id(p))
+        score = _per_mon_threat_score(b, hp, st)
+        scores.append((p, score))
+    scores.sort(key=lambda x: -x[1])
+    return scores[:k]
+
+
 def compute_belief_threat_term(state: Any) -> float:
     """
     Negative is bad for us (more likely sweep pressure).
@@ -260,53 +328,67 @@ def compute_belief_threat_term(state: Any) -> float:
         hp = float(opp_hp.get(id(p), 0.0))
         if hp <= 0.0:
             continue
-
         b = beliefs.get(id(p))
-        if b is None or not getattr(b, "dist", None):
-            continue
-
-        # Expected tags under belief
-        E_setup = 0.0
-        E_prio = 0.0
-        E_speed = 0.0
-        E_phys = 0.0
-        for cand, prob in b.dist:
-            pr = float(prob)
-            E_setup += pr * (1.0 if getattr(cand, "has_setup", False) else 0.0)
-            E_prio  += pr * (1.0 if getattr(cand, "has_priority", False) else 0.0)
-            E_speed += pr * float(getattr(cand, "speed_mult", 1.0))
-            E_phys  += pr * float(getattr(cand, "physical_threat", 0.6))
-
-        # Normalize speed_mult around 1.0 so it's a "threatiness" bump, not absolute speed.
-        speed_excess = max(0.0, E_speed - 1.0)
-
-        # Status discounts
         st = opp_status.get(id(p))
-        # Para reduces speed-sweep pressure
-        if st == Status.PAR:
-            speed_excess *= 0.55
-        # Burn reduces physical threat
-        if st == Status.BRN:
-            E_phys *= 0.60
-        # Toxic/poison reduce setup-sweep pressure a bit (timer)
-        if st in (Status.PSN, Status.TOX):
-            E_setup *= 0.75
-
-        # HP discount: low HP threats matter less
-        hp_factor = max(0.35, min(1.0, hp / 0.80))
-
-        threat = (
-            0.70 * E_setup +
-            0.55 * E_prio +
-            0.60 * speed_excess +
-            0.50 * E_phys
-        ) * hp_factor
-
-        total += threat
+        total += _per_mon_threat_score(b, hp, st)
 
     # Map to a bounded negative term
     # (0 threat => 0, higher threat => more negative)
     return -_tanh01(total / 2.4)
+
+
+def _bench_has_answer(state: Any, threat_mon: Any) -> bool:
+    """Check if any alive team mon can handle this threat via type matchup."""
+    if not _TYPE_CHART:
+        return True
+
+    my_team = getattr(state, "my_team", []) or []
+    my_hp = getattr(state, "my_hp", {}) or {}
+    threat_types = _safe_mon_types(threat_mon)
+
+    if not threat_types:
+        return True  # Unknown type — assume covered
+
+    for p in my_team:
+        if float(my_hp.get(id(p), 0.0)) <= 0.0:
+            continue
+        p_types = _safe_mon_types(p)
+        if not p_types:
+            continue
+        try:
+            # Does p resist any of the threat's STAB types?
+            for threat_type in threat_types:
+                incoming = 1.0
+                for pt in p_types:
+                    incoming *= float(PokemonType.damage_multiplier(threat_type, pt, type_chart=_TYPE_CHART))
+                if incoming <= 0.5:
+                    return True
+
+            # Can p hit the threat super-effectively with any of its STAB types?
+            for p_type in p_types:
+                outgoing = 1.0
+                for tt in threat_types:
+                    outgoing *= float(PokemonType.damage_multiplier(p_type, tt, type_chart=_TYPE_CHART))
+                if outgoing >= 2.0:
+                    return True
+        except Exception:
+            continue
+
+    return False
+
+
+def evaluate_threat_coverage(state: Any, top_threats: list) -> float:
+    """Positive = bench covers top threats; negative = uncovered threats."""
+    if not top_threats:
+        return 0.0
+    score = 0.0
+    for threat_mon, threat_score in top_threats:
+        if _bench_has_answer(state, threat_mon):
+            score += 0.05 * threat_score   # Reward: we have an answer
+        else:
+            score -= 0.10 * threat_score   # Penalty: uncovered threat
+    return max(-0.25, min(0.10, score))
+
 
 def compute_setup_too_early_penalty(boost_term: float, uncertainty: float, opp_unseen: int) -> float:
     """
@@ -1045,7 +1127,29 @@ def has_priority_move_perfect(mon: Any) -> bool:
             if priority > 0 and getattr(move, 'base_power', 0) > 0:
                 return True
         return False
-    
+
+
+def _identify_my_wincon(state: Any) -> Optional[Any]:
+    """Return the best alive setup sweeper (win condition), or None."""
+    my_team = getattr(state, "my_team", []) or []
+    my_hp = getattr(state, "my_hp", {}) or {}
+
+    best, best_score = None, 0.0
+    for p in my_team:
+        hp = float(my_hp.get(id(p), 0.0))
+        if hp <= 0.0:
+            continue
+        score = 0.0
+        if has_setup_potential_perfect(p):
+            score += 0.6
+        if is_fast_sweeper_perfect(p):
+            score += 0.3
+        score *= hp  # discount by current HP
+        if score > best_score:
+            best_score, best = score, p
+    return best
+
+
 def _removal_prob_for_belief(belief: Any) -> float:
     if belief is None or not getattr(belief, "dist", None):
         return 0.0
@@ -1153,6 +1257,13 @@ def evaluate_state(state: Any) -> float:
 
     my_active_hp = float(state.my_hp.get(id(state.my_active), 0.0))
     opp_active_hp = float(state.opp_hp.get(id(state.opp_active), 0.0))
+
+    # Auto-switch masking fix: step() computes the faint penalty BEFORE auto-switching and
+    # stores it here.  Without this, after the swap my_active_hp > 0 and the -0.90 faint
+    # branch below never fires — MCTS only sees a tiny material diff and undervalues switching.
+    pre_eval = getattr(state, 'pre_autoswitch_eval', None)
+    if pre_eval is not None:
+        return max(-1.0, min(1.0, float(pre_eval)))
 
     try:
         gen = int(getattr(state.battle, "gen", 9) or 9)
@@ -1285,6 +1396,62 @@ def evaluate_state(state: Any) -> float:
         # Threat term
         threat_term = compute_belief_threat_term(state)
 
+        # Top threats + bench coverage
+        top_threats = compute_top_threats(state, k=2)
+        coverage_term = evaluate_threat_coverage(state, top_threats)
+
+        # Win condition tracking
+        wincon = _identify_my_wincon(state)
+        wincon_term = 0.0
+        if wincon is not None:
+            wc_hp = float(state.my_hp.get(id(wincon), 0.0))
+            if wincon is not state.my_active and wc_hp > 0.60:
+                wincon_term = 0.06 * wc_hp        # healthy bench sweeper = positive outlook
+            elif wincon is state.my_active:
+                my_boosts_wc = state.my_boosts.get(id(wincon), {}) or {}
+                if any(v >= 2 for v in my_boosts_wc.values()):
+                    wincon_term = 0.08             # active + boosted = very good
+
+            # Counter-reveal bonus: opp's active exposes the specific check to our bench wincon.
+            # Knowing their counter means our game plan is still intact — we can play around it.
+            opp_active_now = getattr(state, "opp_active", None)
+            if wincon is not state.my_active and opp_active_now is not None and _TYPE_CHART:
+                try:
+                    wc_stab = _safe_mon_types(wincon)
+                    opp_types = _safe_mon_types(opp_active_now)
+                    if wc_stab and opp_types:
+                        counter_revealed = False
+                        for wt in wc_stab:
+                            mult = 1.0
+                            for ot in opp_types:
+                                mult *= float(PokemonType.damage_multiplier(wt, ot, type_chart=_TYPE_CHART))
+                            if mult <= 0.5:
+                                counter_revealed = True
+                                break
+                        if counter_revealed:
+                            wincon_term += 0.025   # they showed their answer; we know the matchup
+                except Exception:
+                    pass
+
+        # Priority-vs-setup: priority users are more valuable as patient revenge options
+        # when the opponent has a setup sweeper threat alive.
+        top_setup_threat_score = 0.0
+        beliefs_loc = getattr(state, "opp_beliefs", {}) or {}
+        for _p, _sc in top_threats:
+            _b = beliefs_loc.get(id(_p))
+            if _b and getattr(_b, "dist", None):
+                e_setup = sum(float(prob) for cand, prob in _b.dist if getattr(cand, "has_setup", False))
+                top_setup_threat_score += _sc * e_setup
+
+        priority_revenge_term = 0.0
+        if top_setup_threat_score > 0.4:
+            priority_users_alive = sum(
+                1 for p in state.my_team
+                if float(state.my_hp.get(id(p), 0.0)) > 0.2 and _mon_has_damaging_priority(p)
+            )
+            if priority_users_alive > 0:
+                priority_revenge_term = 0.04 * min(top_setup_threat_score, 1.0)
+
         # Setup-too-early penalty
         setup_early_pen = compute_setup_too_early_penalty(boost_term, uncertainty, opp_unseen)
 
@@ -1346,6 +1513,8 @@ def evaluate_state(state: Any) -> float:
         w_pivot    = 0.03
         w_threat   = 0.03
         w_status   = 0.06
+        w_coverage = 0.02
+        w_wincon   = 0.03
     else:
         w_team     = 0.32
         w_numbers  = 0.07
@@ -1358,11 +1527,24 @@ def evaluate_state(state: Any) -> float:
         w_pivot    = 0.05
         w_threat   = 0.04
         w_status   = 0.07
+        w_coverage = 0.03
+        w_wincon   = 0.04
 
     # Switch fully weighted when losing race, reduced when winning
     effective_w_switch = w_switch if race_term < 0.0 else w_switch * 0.30
 
-    # Core weighted sum 
+    # Phase-aware gating: flexibility matters more early (many unknowns), less late (execute)
+    opp_known_frac = float(opp_known) / float(max(1, opp_total))
+    if opp_known_frac < 0.40:
+        effective_w_switch *= 1.30   # early game: keep options open
+    elif opp_known_frac > 0.85:
+        effective_w_switch *= 0.80   # late game: stop pivoting, execute
+
+    # Dynamic threat weight boost when coverage deficit is severe
+    if coverage_term < -0.10:
+        w_threat = min(w_threat * 1.4, 0.07)
+
+    # Core weighted sum
     core = (
         w_team * team_term +
         w_numbers * numbers_term +
@@ -1374,15 +1556,17 @@ def evaluate_state(state: Any) -> float:
         w_field * field_term +
         w_status * status_term +
         w_pivot * pivot_term +
-        w_threat * threat_term
+        w_threat * threat_term +
+        w_coverage * coverage_term +
+        w_wincon * wincon_term
     )
 
     w_sum = (w_team + w_numbers + w_race + effective_w_switch + w_boost + w_active +
-            w_progress + w_field + w_status + w_pivot + w_threat)
+            w_progress + w_field + w_status + w_pivot + w_threat + w_coverage + w_wincon)
 
     core_norm = _safe_div(core, w_sum)
 
     # Apply penalties/bonuses after normalization (keeps them interpretable)
-    value = core_norm - tempo_penalty - sac_penalty + setup_early_pen + post_ko_pen
+    value = core_norm - tempo_penalty - sac_penalty + setup_early_pen + post_ko_pen + priority_revenge_term
 
     return max(-1.0, min(1.0, float(value)))

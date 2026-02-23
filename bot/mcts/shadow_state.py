@@ -9,7 +9,13 @@ import random
 from poke_env.battle import Status, MoveCategory, PokemonType, Weather, Field, SideCondition
 
 from bot.scoring.helpers import hp_frac, is_fainted
-from bot.model.opponent_model import determinize_opponent
+from bot.model.opponent_model import (
+    determinize_opponent,
+    sample_unseen_mon,
+    sample_unseen_mon_from_team_belief,
+    build_team_belief,
+    TeamBelief,
+)
 
 Action = Tuple[str, Any]  # ("move", Move) or ("switch", Pokemon)
 
@@ -258,7 +264,7 @@ def get_move_boosts(move: Any) -> Optional[Tuple[Optional[Dict[str, int]], Optio
     # 1. Status moves with direct boosts (Swords Dance, Dragon Dance, Charm, Screech, etc.)
     boosts = getattr(move, 'boosts', None)
     if boosts:
-        target_who = (getattr(move, 'target', None) or '').lower() if move else ''
+        target_who = str(getattr(move, 'target', None) or '').lower() if move else ''
         if target_who == 'self':
             return (boosts, None, 1.0)   # user (e.g. Swords Dance, Dragon Dance)
         # target is foe / normal / etc. → effect applies to the move's target (opponent when we use it)
@@ -436,9 +442,17 @@ class ShadowState:
 
     opp_beliefs: Optional[Dict[int, Any]] = None       # pokemon_id -> OpponentBelief
     opp_move_pools: Optional[Dict[int, Dict[str, Any]]] = None  # pokemon_id -> {move_id: Move}
+    opp_slots: List[Optional[Any]] = field(default_factory=lambda: [None] * 6)  # 6 slots, None = unseen
+    opp_active_idx: int = 0
+    team_belief: Optional[Any] = None  # TeamBelief over unseen species (without-replacement per branch)
     gen: int = 9
 
     ply: int = 0
+
+    # Set by step() when our active fainted this turn and the auto-switch already replaced them.
+    # evaluate_state() in eval.py returns this directly so MCTS correctly penalises the KO
+    # rather than seeing the deceptively-normal evaluation of the replacement Pokemon.
+    pre_autoswitch_eval: Optional[float] = None
 
     score_move_fn: Optional[ScoreMoveFn] = None
     score_switch_fn: Optional[ScoreSwitchFn] = None
@@ -484,6 +498,24 @@ class ShadowState:
         my_team = [p for p in getattr(battle, "team", {}).values() if p]
         opp_team = [p for p in getattr(battle, "opponent_team", {}).values() if p]
 
+        # Build opp_slots: 6 slots, known mons in 0..N-1, rest None
+        opp_slots: List[Optional[Any]] = [None] * 6
+        for i, p in enumerate(opp_team):
+            if i < 6:
+                opp_slots[i] = p
+        opp_active_idx = 0
+        for i, p in enumerate(opp_team):
+            if p is opp:
+                opp_active_idx = i
+                break
+
+        revealed_species = set()
+        for p in opp_team:
+            s = getattr(p, "species", None) or getattr(p, "base_species", None)
+            if s:
+                revealed_species.add(str(s).strip())
+        team_belief = build_team_belief(_safe_gen(battle), revealed_species)
+
         my_hp = {id(p): _clamp01(hp_frac(p)) for p in my_team}
         opp_hp = {id(p): _clamp01(hp_frac(p)) for p in opp_team}
 
@@ -524,6 +556,9 @@ class ShadowState:
             opp_active=opp,
             my_team=my_team,
             opp_team=opp_team,
+            opp_slots=opp_slots,
+            opp_active_idx=opp_active_idx,
+            team_belief=team_belief,
             my_hp=my_hp,
             opp_hp=opp_hp,
             my_status=my_status,
@@ -555,16 +590,20 @@ class ShadowState:
     @contextmanager
     def _patched_status(self):
         my_p, opp_p = self.my_active, self.opp_active
-        old_my = getattr(my_p, "status", None)
-        old_opp = getattr(opp_p, "status", None)
+        old_my = getattr(my_p, "status", None) if not isinstance(my_p, tuple) else None
+        old_opp = getattr(opp_p, "status", None) if not isinstance(opp_p, tuple) else None
 
         try:
-            my_p.status = self.my_status.get(id(my_p), old_my)
-            opp_p.status = self.opp_status.get(id(opp_p), old_opp)
+            if not isinstance(my_p, tuple) and hasattr(my_p, "status"):
+                my_p.status = self.my_status.get(id(my_p), old_my)
+            if not isinstance(opp_p, tuple) and hasattr(opp_p, "status"):
+                opp_p.status = self.opp_status.get(id(opp_p), old_opp)
             yield
         finally:
-            my_p.status = old_my
-            opp_p.status = old_opp
+            if not isinstance(my_p, tuple) and hasattr(my_p, "status"):
+                my_p.status = old_my
+            if not isinstance(opp_p, tuple) and hasattr(opp_p, "status"):
+                opp_p.status = old_opp
 
     @contextmanager
     def _patched_boosts(self):
@@ -837,6 +876,13 @@ class ShadowState:
                 if is_fainted(p) or self.opp_hp.get(id(p), 1.0) <= 0.0:
                     continue
                 actions.append(("switch", p))
+            opp_slots = getattr(self, "opp_slots", None) or [None] * 6
+            opp_active_idx = getattr(self, "opp_active_idx", 0)
+            tb = getattr(self, "team_belief", None)
+            if tb is not None and tb.has_mass():
+                for idx in range(min(6, len(opp_slots))):
+                    if opp_slots[idx] is None and idx != opp_active_idx:
+                        actions.append(("switch_unknown", idx))
             return actions or [("move", None)]
 
         for m in (getattr(self.opp_active, "moves", None) or {}).values():
@@ -871,6 +917,14 @@ class ShadowState:
                 continue
             actions.append(("switch", p))
 
+        opp_slots = getattr(self, "opp_slots", None) or [None] * 6
+        opp_active_idx = getattr(self, "opp_active_idx", 0)
+        tb = getattr(self, "team_belief", None)
+        if tb is not None and tb.has_mass():
+            for idx in range(min(6, len(opp_slots))):
+                if opp_slots[idx] is None and idx != opp_active_idx:
+                    actions.append(("switch_unknown", idx))
+
         return actions or [("move", None)]
 
     def choose_opp_action(self, rng: random.Random) -> Action:
@@ -883,11 +937,30 @@ class ShadowState:
         else:
             actions = self.legal_actions_opp()
 
+        # Peek-sample one unseen mon to score all switch_unknown actions (don't commit)
+        temp_unknown_mon: Optional[Any] = None
+        if any(k == "switch_unknown" for k, _ in actions):
+            tb = getattr(self, "team_belief", None)
+            if tb is not None and tb.has_mass():
+                temp_unknown_mon, _ = sample_unseen_mon_from_team_belief(tb, self.gen, rng)
+            if temp_unknown_mon is None:
+                known_ids = set()
+                for p in self.opp_team:
+                    s = getattr(p, "species", None) or getattr(p, "base_species", None)
+                    if s:
+                        known_ids.add(str(s).strip())
+                temp_unknown_mon = sample_unseen_mon(self.gen, known_ids, rng)
+
         scores: List[float] = []
         with self._patched_status(), self._patched_boosts():
             for k, o in actions:
                 if k == "move":
                     scores.append(float(self.score_move_fn(o, self.battle, self.ctx_opp)))
+                elif k == "switch_unknown":
+                    if temp_unknown_mon is not None:
+                        scores.append(float(self.score_switch_fn(temp_unknown_mon, self.battle, self.ctx_opp)))
+                    else:
+                        scores.append(0.0)
                 else:
                     scores.append(float(self.score_switch_fn(o, self.battle, self.ctx_opp)))
 
@@ -935,6 +1008,14 @@ class ShadowState:
             if is_fainted(p) or self.opp_hp.get(id(p), 1.0) <= 0.0:
                 continue
             actions.append(("switch", p))
+
+        opp_slots = getattr(self, "opp_slots", None) or [None] * 6
+        opp_active_idx = getattr(self, "opp_active_idx", 0)
+        tb = getattr(self, "team_belief", None)
+        if tb is not None and tb.has_mass():
+            for idx in range(min(6, len(opp_slots))):
+                if opp_slots[idx] is None and idx != opp_active_idx:
+                    actions.append(("switch_unknown", idx))
 
         return actions or [("move", None)]
 
@@ -1179,6 +1260,26 @@ class ShadowState:
         if not s.is_terminal() and s.my_hp.get(id(s.my_active), 1.0) <= 0.0:
             if s.debug:
                 print(f"[AUTO-SWITCH] My active {s.my_active.species} fainted (HP: {s.my_hp.get(id(s.my_active), 1.0):.1%})")
+
+            # Capture the KO penalty BEFORE the auto-switch.
+            # After switching, evaluate_state() sees my_active_hp > 0 and skips the -0.90
+            # faint branch entirely — masking most of the penalty for getting KO'd.
+            # Store it so evaluate_state() can return the correct value.
+            opp_hp_now = s.opp_hp.get(id(s.opp_active), 0.0)
+            faint_eval: Optional[float] = None
+            if opp_hp_now > 0.0:
+                my_sum = sum(max(0.0, min(1.0, v)) for v in s.my_hp.values())
+                opp_sum = sum(max(0.0, min(1.0, v)) for v in s.opp_hp.values())
+                lead_hint = math.tanh((my_sum - opp_sum) / 1.5)
+                # Simple bench quality proxy: highest alive bench-mon HP fraction
+                bench_hps = [v for pid, v in s.my_hp.items()
+                             if pid != id(s.my_active) and v > 0.0]
+                bench_qual = min(1.0, max(bench_hps)) if bench_hps else 0.0
+                # Mirror the terminal eval in evaluate_state():
+                #   base = -0.90 + 0.15 * lead_hint + 0.35 * bench_qual
+                # Cap at 0.0: we never want a faint-turn to score positively.
+                faint_eval = max(-1.0, min(0.0, -0.90 + 0.15 * lead_hint + 0.35 * bench_qual))
+
             target = s._best_my_switch()
             if target is not None:
                 if s.debug:
@@ -1188,14 +1289,22 @@ class ShadowState:
                 if s.debug:
                     print(f"[AUTO-SWITCH] → No valid switch target!")
 
+            if faint_eval is not None:
+                s = replace(s, pre_autoswitch_eval=faint_eval)
+
         if not s.is_terminal() and s.opp_hp.get(id(s.opp_active), 1.0) <= 0.0:
             if s.debug:
                 print(f"[AUTO-SWITCH] Opp active {s.opp_active.species} fainted (HP: {s.opp_hp.get(id(s.opp_active), 1.0):.1%})")
             target = s._best_opp_switch()
             if target is not None:
-                if s.debug:
-                    print(f"[AUTO-SWITCH] → Switching to {target.species} (HP: {s.opp_hp.get(id(target), 1.0):.1%})")
-                s = s._apply_opp_switch(target)
+                if isinstance(target, tuple) and target[0] == "switch_unknown":
+                    if s.debug:
+                        print(f"[AUTO-SWITCH] → Switching to unknown slot {target[1]}")
+                    s = s._apply_opp_switch_unknown(target[1], rng)
+                else:
+                    if s.debug:
+                        print(f"[AUTO-SWITCH] → Switching to {target.species} (HP: {s.opp_hp.get(id(target), 1.0):.1%})")
+                    s = s._apply_opp_switch(target)
             else:
                 if s.debug:
                     print(f"[AUTO-SWITCH] → No valid switch target!")
@@ -1206,7 +1315,11 @@ class ShadowState:
         return self._apply_my_switch(action[1]) if action[0] == "switch" else self._apply_my_move(action[1], rng)
 
     def _apply_opp_action(self, action: Action, rng: random.Random) -> "ShadowState":
-        return self._apply_opp_switch(action[1]) if action[0] == "switch" else self._apply_opp_move(action[1], rng)
+        if action[0] == "switch":
+            return self._apply_opp_switch(action[1])
+        if action[0] == "switch_unknown":
+            return self._apply_opp_switch_unknown(action[1], rng)
+        return self._apply_opp_move(action[1], rng)
 
     def _apply_field_effects(self, move: Any, side: str) -> "ShadowState":
         """Detect and apply weather/terrain/screen/tailwind/trick room setting from a move."""
@@ -1516,6 +1629,50 @@ class ShadowState:
         return s
 
 
+    def _apply_opp_switch_unknown(self, idx: int, rng: random.Random) -> "ShadowState":
+        """Materialize a Pokémon from team_belief (without replacement) and switch to it."""
+        team_belief = getattr(self, "team_belief", None)
+        if team_belief is not None and team_belief.has_mass():
+            new_mon, new_team_belief = sample_unseen_mon_from_team_belief(team_belief, self.gen, rng)
+        else:
+            known_ids = set()
+            for p in self.opp_team:
+                s = getattr(p, "species", None) or getattr(p, "base_species", None)
+                if s:
+                    known_ids.add(str(s).strip())
+            new_mon = sample_unseen_mon(self.gen, known_ids, rng)
+            new_team_belief = team_belief
+        if new_mon is None:
+            return self
+        opp_slots = list(getattr(self, "opp_slots", None) or [None] * 6)
+        while len(opp_slots) < 6:
+            opp_slots.append(None)
+        if idx < 0 or idx >= len(opp_slots):
+            return self
+        opp_slots[idx] = new_mon
+        new_opp_team = list(self.opp_team) + [new_mon]
+        new_opp_hp = dict(self.opp_hp)
+        new_opp_hp[id(new_mon)] = 1.0
+        new_opp_status = dict(self.opp_status)
+        new_opp_status[id(new_mon)] = None
+        new_opp_boosts = dict(self.opp_boosts)
+        new_opp_boosts[id(new_mon)] = {
+            "atk": 0, "def": 0, "spa": 0, "spd": 0, "spe": 0,
+            "accuracy": 0, "evasion": 0,
+        }
+        s = replace(
+            self,
+            opp_slots=opp_slots,
+            opp_team=new_opp_team,
+            opp_hp=new_opp_hp,
+            opp_status=new_opp_status,
+            opp_boosts=new_opp_boosts,
+            opp_active=new_mon,
+            opp_active_idx=idx,
+            team_belief=new_team_belief,
+        )
+        return s._apply_opp_switch(new_mon)
+
     def _apply_opp_switch(self, new_mon: Any) -> "ShadowState":
         if new_mon is None:
             return self
@@ -1548,7 +1705,12 @@ class ShadowState:
         # Reset toxic counter, choice lock, volatiles, and protect count on switch
         new_vol = dict(s.opp_volatiles)
         new_vol.pop(id(s.opp_active), None)  # Old mon's volatiles cleared
-        s = replace(s, opp_active=new_mon, ctx_opp=ctx_opp, ctx_me=ctx_me,
+        new_idx = s.opp_active_idx
+        for i, slot in enumerate(s.opp_slots):
+            if slot is new_mon:
+                new_idx = i
+                break
+        s = replace(s, opp_active=new_mon, opp_active_idx=new_idx, ctx_opp=ctx_opp, ctx_me=ctx_me,
                     opp_toxic_counter=0, opp_choice_lock=None,
                     opp_volatiles=new_vol, opp_protect_count=0)
 
@@ -1765,7 +1927,10 @@ class ShadowState:
         if is_pivot_move(move) and hit:
             target = s._best_opp_switch()
             if target is not None:
-                s = s._apply_opp_switch(target)
+                if isinstance(target, tuple) and target[0] == "switch_unknown":
+                    s = s._apply_opp_switch_unknown(target[1], rng)
+                else:
+                    s = s._apply_opp_switch(target)
 
         return s
 
@@ -1973,6 +2138,7 @@ class ShadowState:
         return best
 
     def _best_opp_switch(self) -> Optional[Any]:
+        """Returns best known switch target, or ('switch_unknown', idx) if only unknowns left."""
         best, val = None, -1e18
         with self._patched_status():
             for p in self.opp_team:
@@ -1981,7 +2147,16 @@ class ShadowState:
                 sc = float(self.score_switch_fn(p, self.battle, self.ctx_opp))
                 if sc > val:
                     best, val = p, sc
-        return best
+        if best is not None:
+            return best
+        tb = getattr(self, "team_belief", None)
+        if tb is None or not tb.has_mass():
+            return None
+        opp_slots = getattr(self, "opp_slots", None) or [None] * 6
+        for idx in range(min(6, len(opp_slots))):
+            if opp_slots[idx] is None:
+                return ("switch_unknown", idx)
+        return None
     
     def _log(self, msg: str) -> "ShadowState":
         """Append a debug event.

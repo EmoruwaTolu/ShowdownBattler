@@ -21,6 +21,12 @@ from bot.scoring.helpers import (
 )
 from bot.scoring.pressure import estimate_opponent_pressure
 
+try:
+    from poke_env.data import GenData
+    _TYPE_CHART = GenData.from_gen(9).type_chart
+except Exception:
+    _TYPE_CHART = {}
+
 def status_is_applicable(status: Status, move: Any, opp: Any) -> bool:
     """
     Check if status can be applied (type immunities).
@@ -77,86 +83,207 @@ def get_base_status_value(status: Status, me: Any, opp: Any, ctx: EvalContext) -
     
     return 20.0  # Default status value
 
-def calculate_miss_cost(status_value: float, accuracy: float, me: Any, opp: Any) -> float:
+def calculate_miss_cost(
+    status_value: float,
+    accuracy: float,
+    me: Any,
+    opp: Any,
+    pressure: Optional[Any] = None,
+) -> float:
     """
     Calculate cost of missing a status move.
-    
+
     Miss cost increases when:
     - Status is more valuable (higher opportunity cost)
-    - We're damaged (less time to waste turns)
-    - We're slower (opponent gets free hit)
-    - Move has lower accuracy (worse when you miss)
-    
+    - Opponent threatens a KO / near-KO (wasting a turn is fatal)
+    - We're slower (opponent gets free damage)
+    - Move has lower accuracy (bad when you miss)
+
+    Args:
+        pressure: OpponentPressure from estimate_opponent_pressure(); when supplied,
+                  replaces the old HP-only heuristic with threat-aware scaling.
+
     Returns:
-        Penalty points (typically 15-50)
+        Penalty points (typically 15-70)
     """
-    # Base cost
     cost = 15.0
-    
+
     # Scale with status value
-    # High-value status (55 pts) → higher miss cost
-    # Low-value status (20 pts) → lower miss cost
     cost += status_value * 0.2
-    
-    # Scale with miss chance
-    # 50% acc (50% miss) → 1.5x cost
+
+    # Scale with miss chance (50% acc → ×1.5 cost)
     miss_chance = 1.0 - accuracy
     cost *= (1.0 + miss_chance * 0.5)
-    
-    # Penalty when damaged (wasting turns is worse) NOTE: will probs upgrade this to look and see if the opp is threatening KO instead
+
+    # Threat-based urgency: how many turns can we survive?
+    # Using pressure.damage_to_me_frac (per-turn HP fraction we lose).
     my_hp = hp_frac(me)
-    if my_hp < 0.7:
-        cost += (1.0 - my_hp) * 15.0
-    
-    # Penalty when slower (opponent gets free damage)
+    if pressure is not None:
+        dmg = max(1e-6, float(pressure.damage_to_me_frac))
+        turns_to_ko = my_hp / dmg
+        if turns_to_ko <= 1.2:
+            # Very likely dying this turn / next — clicking status is almost certainly wrong
+            cost += 35.0
+        elif turns_to_ko <= 2.5:
+            # 2HKO range: still very dangerous to waste a turn
+            cost += 18.0
+        elif turns_to_ko <= 4.0:
+            # Moderate pressure: some urgency
+            cost += 6.0
+        # If turns_to_ko > 4: passive opponent, no extra penalty
+    else:
+        # Legacy fallback: HP-only
+        if my_hp < 0.7:
+            cost += (1.0 - my_hp) * 15.0
+
+    # Penalty when slower (opponent gets a free hit on the miss turn)
     if is_slower(me, opp):
         cost += 8.0
-    
+
     return cost
+
+def _absorber_multiplier(status: Status, move: Any, battle: Any, opp: Any, me: Any = None) -> float:
+    """
+    Returns a <1.0 multiplier when the opponent has an alive bench mon that is
+    type-immune to the status and can safely switch in to absorb it.
+
+    The multiplier scales with the absorber's *effective* HP:
+      - Effective HP = actual HP × 0.5 if our active threatens it SE (unsafe pivot)
+      - High effective HP (>=50%): 0.70 — safe, healthy absorber
+      - Mid  effective HP (25–50%): 0.82 — real but risky pivot
+      - Low  effective HP (<25%):   0.92 — barely alive or can't safely switch in
+    """
+    opp_team = getattr(battle, "opponent_team", {}) or {}
+    me_types = safe_types(me) if me is not None else set()
+
+    best_effective_hp = 0.0
+    for bench_mon in opp_team.values():
+        if bench_mon is opp:
+            continue
+        bench_hp = float(getattr(bench_mon, "current_hp_fraction", 0) or 0)
+        if bench_hp <= 0:
+            continue
+        if not status_is_applicable(status, move, bench_mon):
+            # Check if our active can threaten this absorber SE.
+            # If yes, the absorber can't safely pivot in — halve its effective weight.
+            effective_hp = bench_hp
+            if _TYPE_CHART and me_types:
+                bench_types = safe_types(bench_mon)
+                if bench_types:
+                    try:
+                        for mt in me_types:
+                            mult = 1.0
+                            for bt in bench_types:
+                                mult *= float(PokemonType.damage_multiplier(
+                                    mt, bt, type_chart=_TYPE_CHART))
+                            if mult >= 2.0:
+                                effective_hp *= 0.5  # SE threat: risky switch-in
+                                break
+                    except Exception:
+                        pass
+
+            if effective_hp > best_effective_hp:
+                best_effective_hp = effective_hp
+
+    if best_effective_hp <= 0:
+        return 1.0
+    if best_effective_hp >= 0.50:
+        return 0.70   # Safe, healthy absorber: very likely to pivot in
+    if best_effective_hp >= 0.25:
+        return 0.82   # Real but risky pivot option
+    return 0.92       # Barely viable; risky switch-in for the opponent
+
 
 def score_status_move(move: Any, battle: Any, ctx: EvalContext) -> float:
     """
     Main status move scoring function.
-    
+
     Components:
-    1. Base status value (includes near/long-term via consolidated functions)
-    2. Team synergy
-    3. Tempo risk
-    4. Race state modifier (scales with degree of winning/losing)
-    5. Miss cost (scales with status value and accuracy)
+    1. Base status value (type-adjusted for burn/para)
+    2. Pressure gate: drops score sharply when opponent threatens KO
+    3. Absorber penalty: reduces score if opponent bench can absorb status
+    4. Miss cost: threat-aware EV via calculate_miss_cost
     """
     opp = ctx.opp
     me = ctx.me
     if opp is None:
         return -100.0
 
-    # Check what status this move inflicts
     status = getattr(move, 'status', None)
 
     if getattr(opp, 'status', None) is not None:
         return -120.0
-    
+
     if not status_is_applicable(status, move, opp):
         return -80.0
 
     score = get_base_status_value(status, me, opp, ctx)
 
+    # Pressure gate: how many turns until the opponent KOs us? If we're about to be deleted, spending a turn on status is wrong.
+    pressure = None
+    try:
+        pressure = estimate_opponent_pressure(battle, ctx)
+    except Exception:
+        pass
+
+    turns_to_ko = float("inf")
+    if pressure is not None:
+        my_hp = hp_frac(me)
+        dmg = max(1e-6, float(pressure.damage_to_me_frac))
+        turns_to_ko = my_hp / dmg
+        if turns_to_ko <= 1.2:
+            # Opponent likely KOs us this very turn — status is almost certainly wrong
+            score *= 0.15
+        elif turns_to_ko <= 2.5:
+            # 2HKO: highly risky to give up a turn
+            score *= 0.50
+        elif turns_to_ko <= 4.0:
+            # Moderate pressure: modest discount
+            score *= 0.80
+        # > 4 turns: passive opponent, no penalty
+
+    # PAR clutch bump: paralysis can flip turn order and is worth more under pressure than the gate implies. 
+    # If we're slower, landing PAR removes the opponent's biggest advantage — partially recover the score the gate discounted.
+    if status == Status.PAR and is_slower(me, opp):
+        if turns_to_ko <= 2.5:
+            score *= 1.30   # Heavy pressure but PAR could save us
+        elif turns_to_ko <= 4.0:
+            score *= 1.15   # Moderate pressure, speed flip still very valuable
+
+    # Absorber penalty: reduce score if opponent bench can absorb status
+    # Floor at 0.65: even with a healthy absorber, status still has merit
+    score *= max(0.65, _absorber_multiplier(status, move, battle, opp, me=me))
+
+    # Expected value with threat-aware miss cost
     accuracy = getattr(move, 'accuracy', 1.0) or 1.0
-    
+
     if accuracy < 1.0:
-        # Miss cost scales with how valuable the status is
-        # Missing a powerful status move is worse than missing a weak one
-        miss_cost = calculate_miss_cost(score, accuracy, me, opp)
-        
-        # Expected value formula: EV = accuracy × value + (1-accuracy) × (-miss_cost)
+        miss_cost = calculate_miss_cost(score, accuracy, me, opp, pressure=pressure)
         score = accuracy * score + (1.0 - accuracy) * (-miss_cost)
-    
+
     return score
 
 def burn_immediate_value(me, opp):
-    """Calculate burn value from actual moves (or base stats fallback)."""
+    """
+    Calculate burn value from actual moves (or base stats fallback).
+
+    Extra value sources:
+    - Opponent revealed physical moves (move-list analysis)
+    - Opponent base stats skewed toward Atk (early-game fallback)
+    - Opponent has positive Atk boosts (Swords Dance etc.) — burn cancels them
+    """
     value = 20.0
-    
+
+    # Boost check: if opponent already has Atk stages, burn is worth even more
+    # (halving an already-boosted attack is a massive tempo swing)
+    try:
+        boosts = getattr(opp, "boosts", {}) or {}
+        atk_boost = int(boosts.get("atk", 0))
+        if atk_boost > 0:
+            value += min(15.0, 5.0 * atk_boost)
+    except Exception:
+        pass
+
     opp_moves = getattr(opp, 'moves', {})
     if not opp_moves:
         # Fallback to base stats
@@ -165,25 +292,25 @@ def burn_immediate_value(me, opp):
         if opp_atk > opp_spa * 1.15:
             value += 25.0
         return value
-    
+
     # Count physical power
     total_power = 0
     physical_power = 0
-    
+
     for move in opp_moves.values():
         power = getattr(move, 'base_power', 0) or 0
         if power == 0:
             continue
-        
+
         total_power += power
         if getattr(move, 'category', None) == MoveCategory.PHYSICAL:
             physical_power += power
-    
+
     # Scale bonus with physical percentage
     if total_power > 0:
         physical_pct = physical_power / total_power
         value += 40.0 * physical_pct
-    
+
     return value
 
 def para_immediate_value(me: Any, opp: Any) -> float:
@@ -262,158 +389,3 @@ def _get_pokemon_identifier(pokemon: Any, battle: Any) -> Optional[str]:
             return identifier
     
     return None
-
-
-def _estimate_damage_to_ally(ally: Any, opp: Any, battle: Any) -> float:
-    """
-    Estimate damage opponent deals to potential switch-in.
-    
-    If poke-env 0.10.0+ is available: Uses built-in damage calculator
-    Otherwise: Falls back to pressure estimation
-    
-    Returns: Fraction of ally HP opponent deals per turn (0.0 to 2.0+)
-    """
-    if ally is None or opp is None:
-        return 0.25
-    
-    # Try real damage calculator if available (poke-env 0.10.0+)
-    if HAS_DAMAGE_CALC:
-        try:
-            # Get identifiers for both Pokemon (e.g., "p1: Suicune", "p2: Salamence")
-            ally_identifier = _get_pokemon_identifier(ally, battle)
-            opp_identifier = _get_pokemon_identifier(opp, battle)
-            
-            if ally_identifier is None or opp_identifier is None:
-                # Couldn't get identifiers, fall back
-                return _estimate_damage_via_pressure(ally, opp, battle)
-            
-            # Find opponent's best move vs this ally
-            best_avg_damage = 0.0
-            
-            for move in opp.moves.values():
-                if move is None:
-                    continue
-                
-                # Skip status moves
-                if getattr(move, "category", None) == MoveCategory.STATUS:
-                    continue
-                
-                try:
-                    # Returns (min_damage, max_damage) as integers (HP lost)
-                    min_dmg, max_dmg = calculate_damage(
-                        attacker_identifier=opp_identifier,
-                        defender_identifier=ally_identifier,
-                        move=move,
-                        battle=battle,
-                        is_critical=False,
-                    )
-                    
-                    # Convert to fractions of max HP
-                    ally_max_hp = getattr(ally, 'max_hp', None)
-                    if ally_max_hp is None or ally_max_hp <= 0:
-                        ally_max_hp = getattr(ally, 'stats', {}).get('hp', 100)
-                    
-                    if ally_max_hp <= 0:
-                        continue
-                    
-                    min_frac = min_dmg / ally_max_hp
-                    max_frac = max_dmg / ally_max_hp
-                    
-                    # Average damage
-                    avg_dmg = (min_frac + max_frac) / 2.0
-                    
-                    if avg_dmg > best_avg_damage:
-                        best_avg_damage = avg_dmg
-                    
-                except Exception:
-                    # If calc fails for this move, continue to next
-                    continue
-            
-            if best_avg_damage > 0:
-                return best_avg_damage
-            else:
-                # No valid moves found, fall back
-                return _type_based_damage_estimate(ally, opp)
-        
-        except Exception:
-            # Any other error with damage calc, fall back to pressure
-            return _estimate_damage_via_pressure(ally, opp, battle)
-    
-    else:
-        # No damage calculator available, use pressure estimation
-        return _estimate_damage_via_pressure(ally, opp, battle)
-
-
-def _estimate_damage_via_pressure(ally: Any, opp: Any, battle: Any) -> float:
-    """
-    Estimate damage using pressure calculation (fallback for poke-env < 0.10.0).
-    
-    Returns: Fraction of ally HP opponent deals per turn (0.0 to 2.0+)
-    """
-    try:
-        # Create temporary context with ally as active Pokemon
-        temp_ctx = EvalContext(
-            me=ally,
-            opp=opp,
-            battle=battle, 
-            cache={},  # Fresh cache for this calculation
-        )
-        
-        # Run full pressure estimation
-        pressure = estimate_opponent_pressure(battle, temp_ctx)
-        
-        # Return the damage fraction
-        return pressure.damage_to_me_frac
-    
-    except Exception:
-        # Ultimate fallback to type-based heuristic
-        return _type_based_damage_estimate(ally, opp)
-
-
-def _type_based_damage_estimate(ally: Any, opp: Any) -> float:
-    """
-    Fallback damage estimate based on type matchups.
-    Used when full pressure calculation fails.
-    """
-    try:
-        opp_types = safe_types(opp)
-        ally_types = safe_types(ally)
-        
-        # Start with average
-        estimate = 0.25
-        
-        # Check for common walls
-        if PokemonType.STEEL in ally_types:
-            # Steel resists many types
-            estimate = 0.12
-            
-            # But weak to Fighting/Fire/Ground
-            if PokemonType.FIGHTING in opp_types:
-                estimate = 0.40
-            elif PokemonType.FIRE in opp_types:
-                estimate = 0.45
-            elif PokemonType.GROUND in opp_types:
-                estimate = 0.40
-        
-        elif PokemonType.FAIRY in ally_types:
-            # Fairy resists Fighting/Bug/Dark, immune to Dragon
-            estimate = 0.18
-            
-            if PokemonType.DRAGON in opp_types:
-                estimate = 0.05  # Immune to Dragon
-            elif PokemonType.STEEL in opp_types or PokemonType.POISON in opp_types:
-                estimate = 0.40  # Weak to Steel/Poison
-        
-        elif PokemonType.WATER in ally_types:
-            estimate = 0.22
-            
-            if PokemonType.ELECTRIC in opp_types or PokemonType.GRASS in opp_types:
-                estimate = 0.45
-        
-        # More type checks could be added here
-        
-        return min(2.0, max(0.05, estimate))
-    
-    except Exception:
-        # Ultimate fallback
-        return 0.25
