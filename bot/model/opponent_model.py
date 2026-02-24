@@ -290,13 +290,20 @@ def _species_id_from_opp(opp: Any) -> Optional[str]:
     return None
 
 
+# poke_env uses these strings when item/ability has not been revealed in battle
+_POKE_ENV_UNKNOWN_ITEM = {"unknownitem", "unknown_item", ""}
+_POKE_ENV_UNKNOWN_ABILITY = {"noability", "no_ability", ""}
+
+
 def _revealed_item_id(opp: Any) -> Optional[str]:
     # poke_env sometimes exposes item as opp.item or opp.item_id
     for attr in ("item", "item_id"):
         try:
             v = getattr(opp, attr, None)
             if isinstance(v, str) and v.strip():
-                return to_id_str(v)
+                iid = to_id_str(v)
+                if iid and iid not in _POKE_ENV_UNKNOWN_ITEM:
+                    return iid
         except Exception:
             pass
     return None
@@ -307,7 +314,9 @@ def _revealed_ability_id(opp: Any) -> Optional[str]:
         try:
             v = getattr(opp, attr, None)
             if isinstance(v, str) and v.strip():
-                return to_id_str(v)
+                aid = to_id_str(v)
+                if aid and aid not in _POKE_ENV_UNKNOWN_ABILITY:
+                    return aid
         except Exception:
             pass
     return None
@@ -491,9 +500,24 @@ def _default_candidates_from_seen(opp: Any, gen: int) -> List[SetCandidate]:
     ]
 
 
+def _consensus_value(sets: List[Set[str]]) -> Optional[str]:
+    """
+    Return the single string value if the intersection of all non-empty sets is a
+    singleton.  Used to infer certain item/ability when every remaining candidate
+    agrees on one value.
+    """
+    non_empty = [s for s in sets if s]
+    if not non_empty:
+        return None
+    intersection: Set[str] = set.intersection(*non_empty)
+    if len(intersection) == 1:
+        return next(iter(intersection))
+    return None
+
+
 def build_opponent_belief(opp: Any, gen: int) -> OpponentBelief:
     """
-    Build a belief object from the current opp snapshot (moves, maybe item/ability/tera). 
+    Build a belief object from the current opp snapshot (moves, maybe item/ability/tera).
     """
     species_id = _species_id_from_opp(opp)
     revealed_moves = set(_revealed_move_ids(opp))
@@ -522,7 +546,7 @@ def build_opponent_belief(opp: Any, gen: int) -> OpponentBelief:
         revealed_moves=set(),
     )
 
-    # Apply observations (hard filters)
+    # Apply observations from battle (hard filters)
     for m in revealed_moves:
         belief.observe_move(m)
 
@@ -530,7 +554,18 @@ def build_opponent_belief(opp: Any, gen: int) -> OpponentBelief:
     belief.observe_ability(_revealed_ability_id(opp))
     belief.observe_tera(_revealed_tera_type(opp))
 
-    # store the revealed moves (observe_move already inserted them)
+    # Auto-infer item/ability when all remaining candidates agree on a single value.
+    # e.g. if every role for Cacturne has only "Life Orb", we know it from turn 1.
+    if not belief.revealed_item:
+        inferred = _consensus_value([c.items for c, _ in belief.dist])
+        if inferred:
+            belief.revealed_item = inferred
+
+    if not belief.revealed_ability:
+        inferred = _consensus_value([c.abilities for c, _ in belief.dist])
+        if inferred:
+            belief.revealed_ability = inferred
+
     return belief
 
 

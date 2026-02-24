@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, replace, field
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, FrozenSet, List, Optional, Tuple
 from contextlib import contextmanager
 import math
 import random
@@ -53,17 +53,81 @@ def _get_item(pokemon: Any) -> Optional[str]:
     return None
 
 
+def _get_ability(pokemon: Any) -> Optional[str]:
+    """Get normalized ability id string from a Pokemon."""
+    ab = getattr(pokemon, 'ability', None)
+    if ab and isinstance(ab, str) and ab.strip():
+        return ab.lower().replace(' ', '').replace('-', '').replace("'", '')
+    return None
+
+
+def _is_mold_breaker(pokemon: Any) -> bool:
+    """True if the Pokemon ignores the target's ability (Mold Breaker / Teravolt / Turboblaze)."""
+    return _get_ability(pokemon) in MOLD_BREAKER_ABILITIES
+
+
+def _is_contact_move(move: Any) -> bool:
+    """True if the move makes contact (triggers Rocky Helmet, Rough Skin, etc.)."""
+    if move is None:
+        return False
+    flags = getattr(move, 'flags', None) or {}
+    if isinstance(flags, dict):
+        return bool(flags.get('contact'))
+    return 'contact' in str(flags)
+
+
+def _is_sound_move(move: Any) -> bool:
+    """True if the move is a sound-based move (blocked by Soundproof)."""
+    if move is None:
+        return False
+    flags = getattr(move, 'flags', None) or {}
+    if isinstance(flags, dict):
+        return bool(flags.get('sound'))
+    return 'sound' in str(flags)
+
+
+def _highest_base_stat(pokemon: Any) -> str:
+    """Return the key of the highest base stat (for Protosynthesis / Quark Drive)."""
+    base = getattr(pokemon, 'base_stats', None) or {}
+    stat_names = ['atk', 'def', 'spa', 'spd', 'spe']
+    return max(stat_names, key=lambda s: int(base.get(s, 0) or 0))
+
+
 CHOICE_ITEMS = frozenset({'choiceband', 'choicespecs', 'choicescarf'})
+
+MOLD_BREAKER_ABILITIES = frozenset({'moldbreaker', 'teravolt', 'turboblaze'})
+
+# Weather frozensets for ability speed checks
+RAIN_WEATHER  = frozenset({Weather.RAINDANCE, Weather.PRIMORDIALSEA})
+SUN_WEATHER   = frozenset({Weather.SUNNYDAY,   Weather.DESOLATELAND})
+SNOW_WEATHER  = frozenset({Weather.SNOWSCAPE,  Weather.HAIL})
+SAND_WEATHER  = frozenset({Weather.SANDSTORM})
 
 SPIKES_DAMAGE = {1: 1.0 / 8.0, 2: 1.0 / 6.0, 3: 1.0 / 4.0}
 
 
-def _is_grounded(pokemon: Any) -> bool:
-    """Check if a Pokemon is grounded (not Flying-type). Ignores Levitate for simplicity."""
+def _is_grounded(pokemon: Any, attacker: Any = None) -> bool:
+    """
+    Check if a Pokemon is grounded (affected by Spikes / Terrain / Ground moves).
+
+    Not grounded if:
+    - Flying type
+    - Levitate ability (unless attacker has Mold Breaker / Teravolt / Turboblaze)
+    - Holding Air Balloon (reads from real item; use _is_grounded_in_state for shadow-aware check)
+    """
     try:
         t1 = getattr(pokemon, 'type_1', None)
         t2 = getattr(pokemon, 'type_2', None)
-        return not (t1 == PokemonType.FLYING or t2 == PokemonType.FLYING)
+        if t1 == PokemonType.FLYING or t2 == PokemonType.FLYING:
+            return False
+        ability = _get_ability(pokemon)
+        if ability == 'levitate':
+            if attacker is None or not _is_mold_breaker(attacker):
+                return False
+        item = _get_item(pokemon)
+        if item == 'airballoon':
+            return False
+        return True
     except Exception:
         return True
 
@@ -91,26 +155,37 @@ def _rock_effectiveness(pokemon: Any) -> float:
         return 1.0
 
 
+_UNSET: Any = object()  # sentinel for "not provided" (distinct from None = "no item")
+
+
 def _apply_hazards_on_entry(
     pokemon: Any,
     side_conditions: Dict[str, int],
     current_status: Optional[Status],
+    effective_item: Any = _UNSET,
 ) -> Tuple[float, Optional[Status], Optional[Dict[str, int]], Dict[str, int]]:
     """
     Calculate hazard effects when a Pokemon switches in.
 
+    effective_item: if provided, overrides _get_item(pokemon). Pass None to indicate the
+        item was removed (e.g. knocked off). Defaults to reading from the pokemon object.
+
     Returns:
         (damage_frac, new_status_or_None, spe_boost_change_or_None, updated_side_conditions)
     """
+    if effective_item is _UNSET:
+        effective_item = _get_item(pokemon)
+
     # Heavy-Duty Boots negates all hazards
-    if _get_item(pokemon) == 'heavydutyboots':
+    if effective_item == 'heavydutyboots':
         return (0.0, None, None, side_conditions)
 
     dmg = 0.0
     inflict_status: Optional[Status] = None
     spe_change: Optional[Dict[str, int]] = None
     updated_sc = dict(side_conditions)
-    grounded = _is_grounded(pokemon)
+    # Air Balloon grants non-grounded status; if it was popped, effective_item is None
+    grounded = _is_grounded(pokemon) and effective_item != 'airballoon'
 
     # Stealth Rock: 1/8 * rock effectiveness
     if updated_sc.get('stealthrock', 0) > 0:
@@ -377,7 +452,7 @@ def apply_expected_damage(
         return float(defender_hp), False
 
     try:
-        with state._patched_status(), state._patched_boosts(), state._patched_fields():
+        with state._patched_status(), state._patched_boosts(), state._patched_fields(), state._patched_items():
             dmg_frac = float(state.dmg_fn(move, attacker, defender, state.battle))
     except Exception:
         dmg_frac = 0.0
@@ -449,6 +524,11 @@ class ShadowState:
 
     ply: int = 0
 
+    # Items removed mid-battle (Knock Off, Air Balloon popped).
+    # Stored as frozensets of id(pokemon) so the frozen dataclass can be replaced().
+    my_item_lost: FrozenSet[int] = field(default_factory=frozenset)
+    opp_item_lost: FrozenSet[int] = field(default_factory=frozenset)
+
     # Set by step() when our active fainted this turn and the auto-switch already replaced them.
     # evaluate_state() in eval.py returns this directly so MCTS correctly penalises the KO
     # rather than seeing the deceptively-normal evaluation of the replacement Pokemon.
@@ -494,6 +574,12 @@ class ShadowState:
     ) -> "ShadowState":
         me = ctx_me.me
         opp = ctx_me.opp
+
+        if me is None or opp is None:
+            raise ValueError(
+                f"Cannot build ShadowState: me={me}, opp={opp} — "
+                "poke_env lost battle tracking (opponent_active_pokemon is None)"
+            )
 
         my_team = [p for p in getattr(battle, "team", {}).values() if p]
         opp_team = [p for p in getattr(battle, "opponent_team", {}).values() if p]
@@ -647,6 +733,33 @@ class ShadowState:
                     p.boosts = original_opp[p_id]
     
     @contextmanager
+    def _patched_items(self):
+        """
+        Temporarily set pokemon.item = None for any Pokemon whose item was removed
+        this battle (Knock Off, Air Balloon pop).  This ensures the damage calculator
+        sees the correct item state: no 1.5x Knock Off boost on already-itemless targets,
+        no Life Orb boost after the orb was knocked off, etc.
+        """
+        patched: List[tuple] = []  # (pokemon, original_item)
+        all_lost = self.my_item_lost | self.opp_item_lost
+        if all_lost:
+            for p in list(self.my_team) + list(self.opp_team):
+                if id(p) in all_lost and hasattr(p, 'item'):
+                    patched.append((p, p.item))
+                    try:
+                        p.item = None
+                    except Exception:
+                        pass
+        try:
+            yield
+        finally:
+            for p, old_item in patched:
+                try:
+                    p.item = old_item
+                except Exception:
+                    pass
+
+    @contextmanager
     def _patched_fields(self):
         """Temporarily patch battle weather/fields/side_conditions from shadow state.
 
@@ -727,7 +840,40 @@ class ShadowState:
         return self.opp_status.get(id(self.opp_active))
 
     def is_terminal(self) -> bool:
-        return all(v <= 0.0 for v in self.my_hp.values()) or all(v <= 0.0 for v in self.opp_hp.values())
+        if all(v <= 0.0 for v in self.my_hp.values()):
+            return True
+        # Opponent side: only terminal if every slot is revealed AND all are fainted.
+        # When unseen slots (None) remain, the opponent still has live Pokemon.
+        if any(s is None for s in self.opp_slots):
+            return False
+        return bool(self.opp_hp) and all(v <= 0.0 for v in self.opp_hp.values())
+
+    def _item_of(self, pokemon: Any) -> Optional[str]:
+        """State-aware item lookup: returns None if the item was removed this battle."""
+        if id(pokemon) in self.my_item_lost or id(pokemon) in self.opp_item_lost:
+            return None
+        return _get_item(pokemon)
+
+    def _is_grounded_in_state(self, pokemon: Any, attacker: Any = None) -> bool:
+        """
+        State-aware grounded check.  Uses _item_of() so a popped Air Balloon is
+        correctly treated as gone.  Respects Levitate + Mold Breaker override.
+        """
+        try:
+            t1 = getattr(pokemon, 'type_1', None)
+            t2 = getattr(pokemon, 'type_2', None)
+            if t1 == PokemonType.FLYING or t2 == PokemonType.FLYING:
+                return False
+            ability = _get_ability(pokemon)
+            if ability == 'levitate':
+                if attacker is None or not _is_mold_breaker(attacker):
+                    return False
+            # Use state-aware item lookup for Air Balloon
+            if self._item_of(pokemon) == 'airballoon':
+                return False
+            return True
+        except Exception:
+            return True
 
     # Speed stage multipliers (same as game: 0->1, +1->1.5, -1->2/3, etc.)
     _SPEED_STAGE_MULT = {
@@ -736,12 +882,12 @@ class ShadowState:
     }
 
     def _effective_speed(self, p: Any, side: str) -> float:
-        """Effective speed for turn order: base stat, status, item, and simulated boost stages."""
-        s = float((p.stats or {}).get('spe', 100))
+        """Effective speed for turn order: base stat, status, item, abilities, simulated boosts."""
+        s = float((p.stats or {}).get('spe') or 100)
         st = (self.my_status if side == "me" else self.opp_status).get(id(p))
         if st == Status.PAR:
             s *= 0.5
-        item = _get_item(p)
+        item = self._item_of(p)
         if item == 'choicescarf':
             s *= 1.5
         # Apply speed boost from simulation state so turn order is correct after Dragon Dance etc.
@@ -751,6 +897,37 @@ class ShadowState:
         # Tailwind: 2x speed
         sc = self.my_side_conditions if side == "me" else self.opp_side_conditions
         if 'tailwind' in sc:
+            s *= 2.0
+        # Ability-based speed modifiers
+        ability = _get_ability(p)
+        if ability == 'swiftswim' and self.shadow_weather.keys() & RAIN_WEATHER:
+            s *= 2.0
+        elif ability == 'chlorophyll' and self.shadow_weather.keys() & SUN_WEATHER:
+            s *= 2.0
+        elif ability == 'slushrush' and self.shadow_weather.keys() & SNOW_WEATHER:
+            s *= 2.0
+        elif ability == 'sandrush' and self.shadow_weather.keys() & SAND_WEATHER:
+            s *= 2.0
+        elif ability == 'unburden':
+            item_lost = self.my_item_lost if side == "me" else self.opp_item_lost
+            if id(p) in item_lost:
+                s *= 2.0
+        elif ability in ('protosynthesis', 'orichalcumpulse'):
+            sun_up = bool(self.shadow_weather.keys() & SUN_WEATHER)
+            booster = item == 'boosterenergy'
+            if (sun_up or booster) and _highest_base_stat(p) == 'spe':
+                s *= 1.5
+        elif ability in ('quarkdrive', 'hadronengine'):
+            et_up = Field.ELECTRIC_TERRAIN in self.shadow_fields
+            booster = item == 'boosterenergy'
+            if (et_up or booster) and _highest_base_stat(p) == 'spe':
+                s *= 1.5
+        elif ability == 'slowstart':
+            # Halved speed for first 5 turns (approximate: just always apply while unknown)
+            vol = (self.my_volatiles if side == "me" else self.opp_volatiles).get(id(p), {})
+            if vol.get('slowstart_turns', 5) > 0:
+                s *= 0.5
+        elif ability == 'surgesurfer' and Field.ELECTRIC_TERRAIN in self.shadow_fields:
             s *= 2.0
         return s
 
@@ -830,7 +1007,7 @@ class ShadowState:
                 actions.append(("move", m))
 
         # Choice lock: if locked, only allow the locked move
-        if self.my_choice_lock and _get_item(self.my_active) in CHOICE_ITEMS:
+        if self.my_choice_lock and self._item_of(self.my_active) in CHOICE_ITEMS:
             locked = [a for a in actions if a[0] == "move"
                       and str(getattr(a[1], 'id', '')) == self.my_choice_lock]
             if locked:
@@ -889,7 +1066,7 @@ class ShadowState:
             actions.append(("move", m))
 
         # Choice lock: if locked, only allow the locked move
-        if self.opp_choice_lock and _get_item(self.opp_active) in CHOICE_ITEMS:
+        if self.opp_choice_lock and self._item_of(self.opp_active) in CHOICE_ITEMS:
             locked = [a for a in actions if a[0] == "move"
                       and str(getattr(a[1], 'id', '')) == self.opp_choice_lock]
             if locked:
@@ -995,7 +1172,7 @@ class ShadowState:
                 actions.append(("move", m))
 
         # Apply choice lock filter
-        if self.opp_choice_lock and _get_item(self.opp_active) in CHOICE_ITEMS:
+        if self.opp_choice_lock and self._item_of(self.opp_active) in CHOICE_ITEMS:
             locked = [a for a in actions if a[0] == "move"
                       and str(getattr(a[1], 'id', '')) == self.opp_choice_lock]
             if locked:
@@ -1047,37 +1224,65 @@ class ShadowState:
         CHIP_PSN = 1.0 / 8.0   # regular poison chip (approx)
         new_my_hp = dict(self.my_hp)
         new_opp_hp = dict(self.opp_hp)
+        new_my_vols = dict(self.my_volatiles)
+        new_opp_vols = dict(self.opp_volatiles)
 
         new_my_toxic_counter = self.my_toxic_counter
         new_opp_toxic_counter = self.opp_toxic_counter
 
+        my_ability  = _get_ability(self.my_active)
+        opp_ability = _get_ability(self.opp_active)
+        my_magic_guard  = my_ability  == 'magicguard'
+        opp_magic_guard = opp_ability == 'magicguard'
+
         # Active-only chip (good approximation for planning)
-        if self.my_status.get(id(self.my_active)) == Status.BRN:
+        if self.my_status.get(id(self.my_active)) == Status.BRN and not my_magic_guard:
             new_my_hp[id(self.my_active)] = max(0.0, new_my_hp.get(id(self.my_active), 0.0) - CHIP_BRN)
 
-        if self.opp_status.get(id(self.opp_active)) == Status.BRN:
+        if self.opp_status.get(id(self.opp_active)) == Status.BRN and not opp_magic_guard:
             new_opp_hp[id(self.opp_active)] = max(0.0, new_opp_hp.get(id(self.opp_active), 0.0) - CHIP_BRN)
 
-        # Poison / toxic (active-only chip approximation)
+        # Poison / toxic  —  Poison Heal inverts PSN chip into a heal
         my_st = self.my_status.get(id(self.my_active))
-        if my_st == Status.PSN:
-            new_my_hp[id(self.my_active)] = max(0.0, new_my_hp.get(id(self.my_active), 0.0) - CHIP_PSN)
-        elif my_st == Status.TOX:
-            # Increment toxic counter
-            new_my_toxic_counter += 1
-            # Toxic damage scales: 1/16, 2/16, 3/16, etc.
-            toxic_damage = new_my_toxic_counter / 16.0
-            new_my_hp[id(self.my_active)] = max(0.0, new_my_hp.get(id(self.my_active), 0.0) - toxic_damage)
+        if my_st in (Status.PSN, Status.TOX):
+            if my_ability == 'poisonheal':
+                new_my_hp[id(self.my_active)] = min(1.0, new_my_hp.get(id(self.my_active), 0.0) + 1.0 / 8.0)
+            elif not my_magic_guard:
+                if my_st == Status.PSN:
+                    new_my_hp[id(self.my_active)] = max(0.0, new_my_hp.get(id(self.my_active), 0.0) - CHIP_PSN)
+                else:  # TOX
+                    new_my_toxic_counter += 1
+                    new_my_hp[id(self.my_active)] = max(0.0, new_my_hp.get(id(self.my_active), 0.0) - new_my_toxic_counter / 16.0)
 
         opp_st = self.opp_status.get(id(self.opp_active))
-        if opp_st == Status.PSN:
-            new_opp_hp[id(self.opp_active)] = max(0.0, new_opp_hp.get(id(self.opp_active), 0.0) - CHIP_PSN)
-        elif opp_st == Status.TOX:
-            # Increment toxic counter
-            new_opp_toxic_counter += 1
-            # Toxic damage scales: 1/16, 2/16, 3/16, etc.
-            toxic_damage = new_opp_toxic_counter / 16.0
-            new_opp_hp[id(self.opp_active)] = max(0.0, new_opp_hp.get(id(self.opp_active), 0.0) - toxic_damage)
+        if opp_st in (Status.PSN, Status.TOX):
+            if opp_ability == 'poisonheal':
+                new_opp_hp[id(self.opp_active)] = min(1.0, new_opp_hp.get(id(self.opp_active), 0.0) + 1.0 / 8.0)
+            elif not opp_magic_guard:
+                if opp_st == Status.PSN:
+                    new_opp_hp[id(self.opp_active)] = max(0.0, new_opp_hp.get(id(self.opp_active), 0.0) - CHIP_PSN)
+                else:  # TOX
+                    new_opp_toxic_counter += 1
+                    new_opp_hp[id(self.opp_active)] = max(0.0, new_opp_hp.get(id(self.opp_active), 0.0) - new_opp_toxic_counter / 16.0)
+
+        # Shed Skin: 1/3 chance to cure status (deterministic threshold in sim)
+        if my_ability == 'shedskin' and my_st is not None:
+            if self.status_threshold <= 1.0 / 3.0:  # approximate: apply if threshold is relaxed
+                new_my_st = dict(self.my_status)
+                new_my_st[id(self.my_active)] = None
+                # We'll update later via replace; cache for now
+        if opp_ability == 'shedskin' and opp_st is not None:
+            pass  # handled below in status replace
+
+        # Speed Boost: +1 Spe stage per turn
+        for active, side, hp_map, vols in [
+            (self.my_active,  "me",  new_my_hp,  new_my_vols),
+            (self.opp_active, "opp", new_opp_hp, new_opp_vols),
+        ]:
+            ab = _get_ability(active)
+            if ab == 'speedboost' and hp_map.get(id(active), 0.0) > 0.0:
+                # apply +1 Spe via _apply_boost_changes later — accumulate here
+                pass  # done via a separate replace below
 
         # Leftovers / Black Sludge end-of-turn recovery
         for active, hp_map in [
@@ -1086,21 +1291,51 @@ class ShadowState:
         ]:
             if hp_map.get(id(active), 0.0) <= 0.0:
                 continue
-            item = _get_item(active)
+            ab = _get_ability(active)
+            # Magic Guard: immune to indirect damage (but still receives healing)
+            item = self._item_of(active)
             if item == 'leftovers':
                 hp_map[id(active)] = min(1.0, hp_map[id(active)] + 1.0 / 16.0)
             elif item == 'blacksludge':
                 is_poison = PokemonType.POISON in getattr(active, 'types', [])
                 if is_poison:
                     hp_map[id(active)] = min(1.0, hp_map[id(active)] + 1.0 / 16.0)
-                else:
+                elif ab != 'magicguard':
                     hp_map[id(active)] = max(0.0, hp_map[id(active)] - 1.0 / 16.0)
 
-        # Sandstorm chip: 1/16 to non-Rock/Steel/Ground actives
+            # Ice Body: heal 1/16 in Snow
+            if ab == 'icebody' and self.shadow_weather.keys() & SNOW_WEATHER:
+                hp_map[id(active)] = min(1.0, hp_map[id(active)] + 1.0 / 16.0)
+
+            # Dry Skin: heal 1/8 in Rain, lose 1/8 in Sun
+            if ab == 'dryskin':
+                if self.shadow_weather.keys() & RAIN_WEATHER:
+                    hp_map[id(active)] = min(1.0, hp_map[id(active)] + 1.0 / 8.0)
+                elif self.shadow_weather.keys() & SUN_WEATHER:
+                    if ab != 'magicguard':
+                        hp_map[id(active)] = max(0.0, hp_map[id(active)] - 1.0 / 8.0)
+
+            # Bad Dreams: inflict 1/8 damage on sleeping opponent
+            if ab == 'baddreams':
+                # find the other side's active and check if it's sleeping
+                other = self.opp_active if active is self.my_active else self.my_active
+                other_hp_map = new_opp_hp if active is self.my_active else new_my_hp
+                other_st = (self.opp_status if active is self.my_active else self.my_status).get(id(other))
+                other_ab = _get_ability(other)
+                if other_st == Status.SLP and other_ab != 'magicguard':
+                    other_hp_map[id(other)] = max(0.0, other_hp_map.get(id(other), 0.0) - 1.0 / 8.0)
+
+        # Sandstorm chip: 1/16 to non-Rock/Steel/Ground actives (Magic Guard immune)
         if Weather.SANDSTORM in self.shadow_weather:
-            for active, hp_map in [(self.my_active, new_my_hp), (self.opp_active, new_opp_hp)]:
-                if hp_map.get(id(active), 0.0) <= 0.0:
+            for active, hp_map, mg in [
+                (self.my_active, new_my_hp, my_magic_guard),
+                (self.opp_active, new_opp_hp, opp_magic_guard),
+            ]:
+                if hp_map.get(id(active), 0.0) <= 0.0 or mg:
                     continue
+                ability = _get_ability(active)
+                if ability in ('sandforce', 'sandrush', 'sandveil'):
+                    continue  # sand-immune abilities
                 types = getattr(active, 'types', [])
                 immune = any(t in (PokemonType.ROCK, PokemonType.STEEL, PokemonType.GROUND) for t in types)
                 if not immune:
@@ -1111,7 +1346,7 @@ class ShadowState:
             for active, hp_map in [(self.my_active, new_my_hp), (self.opp_active, new_opp_hp)]:
                 if hp_map.get(id(active), 0.0) <= 0.0:
                     continue
-                if _is_grounded(active):
+                if self._is_grounded_in_state(active):
                     hp_map[id(active)] = min(1.0, hp_map[id(active)] + 1.0 / 16.0)
 
         # Decrement weather counters
@@ -1143,10 +1378,44 @@ class ShadowState:
         new_my_sc = _dec_sc(self.my_side_conditions)
         new_opp_sc = _dec_sc(self.opp_side_conditions)
 
-        return replace(self, my_hp=new_my_hp, opp_hp=new_opp_hp,
-                      my_toxic_counter=new_my_toxic_counter, opp_toxic_counter=new_opp_toxic_counter,
-                      shadow_weather=new_weather, shadow_fields=new_fields,
-                      my_side_conditions=new_my_sc, opp_side_conditions=new_opp_sc)
+        s = replace(self, my_hp=new_my_hp, opp_hp=new_opp_hp,
+                    my_toxic_counter=new_my_toxic_counter, opp_toxic_counter=new_opp_toxic_counter,
+                    shadow_weather=new_weather, shadow_fields=new_fields,
+                    my_side_conditions=new_my_sc, opp_side_conditions=new_opp_sc,
+                    my_volatiles=new_my_vols, opp_volatiles=new_opp_vols)
+
+        # Speed Boost: +1 Spe stage per turn to active mons that survive
+        if my_ability == 'speedboost' and s.my_hp.get(id(s.my_active), 0.0) > 0.0:
+            s = s._apply_boost_changes({'spe': 1}, "me", s.my_active)
+        if opp_ability == 'speedboost' and s.opp_hp.get(id(s.opp_active), 0.0) > 0.0:
+            s = s._apply_boost_changes({'spe': 1}, "opp", s.opp_active)
+
+        # Shed Skin: 1/3 chance to cure status (use status_threshold as proxy)
+        if my_ability == 'shedskin' and s.my_status.get(id(s.my_active)) is not None:
+            if self.status_threshold <= 1.0 / 3.0:
+                new_st = dict(s.my_status)
+                new_st[id(s.my_active)] = None
+                s = replace(s, my_status=new_st)
+        if opp_ability == 'shedskin' and s.opp_status.get(id(s.opp_active)) is not None:
+            if self.status_threshold <= 1.0 / 3.0:
+                new_st = dict(s.opp_status)
+                new_st[id(s.opp_active)] = None
+                s = replace(s, opp_status=new_st)
+
+        # Slow Start: decrement counter
+        for active, side_vols, key in [
+            (s.my_active,  s.my_volatiles,  'my_volatiles'),
+            (s.opp_active, s.opp_volatiles, 'opp_volatiles'),
+        ]:
+            if _get_ability(active) == 'slowstart':
+                vol = side_vols.get(id(active), {})
+                turns = vol.get('slowstart_turns', 0)
+                if turns > 0:
+                    new_v = dict(side_vols)
+                    new_v[id(active)] = {**vol, 'slowstart_turns': turns - 1}
+                    s = replace(s, **{key: new_v})
+
+        return s
 
     def _sample_hit(self, move: Any, rng: random.Random) -> bool:
         # Check for forced outcome first (for hybrid expansion)
@@ -1375,6 +1644,21 @@ class ShadowState:
 
         s = self._log(f"We switch to {getattr(new_mon, 'species', getattr(new_mon, 'name', 'unknown'))}")
 
+        # Switch-OUT ability effects (apply to the mon leaving)
+        old_ability = _get_ability(s.my_active)
+        old_hp = s.my_hp.get(id(s.my_active), 0.0)
+        if old_hp > 0.0:
+            if old_ability == 'regenerator':
+                regen_hp = dict(s.my_hp)
+                regen_hp[id(s.my_active)] = min(1.0, old_hp + 1.0 / 3.0)
+                s = replace(s, my_hp=regen_hp)
+                s = s._log(f"REGENERATOR me:{s.my_active.species} +33%")
+            elif old_ability == 'naturalcure' and s.my_status.get(id(s.my_active)) is not None:
+                new_st = dict(s.my_status)
+                new_st[id(s.my_active)] = None
+                s = replace(s, my_status=new_st)
+                s = s._log(f"NATURAL-CURE me:{s.my_active.species} status cleared")
+
         # Keep contexts aligned (best-effort)
         try:
             ctx_me = replace(s.ctx_me, me=new_mon, opp=s.opp_active)
@@ -1404,7 +1688,8 @@ class ShadowState:
 
         # Apply entry hazards from OUR side conditions
         h_dmg, h_status, h_spe, updated_sc = _apply_hazards_on_entry(
-            new_mon, s.my_side_conditions, s.my_status.get(id(new_mon)))
+            new_mon, s.my_side_conditions, s.my_status.get(id(new_mon)),
+            effective_item=s._item_of(new_mon))
 
         if h_dmg > 0.0:
             new_hp = dict(s.my_hp)
@@ -1421,6 +1706,81 @@ class ShadowState:
 
         if updated_sc != s.my_side_conditions:
             s = replace(s, my_side_conditions=updated_sc)
+
+        # Switch-IN ability effects (apply to the mon arriving)
+        new_ability = _get_ability(new_mon)
+
+        # Weather/Terrain setters
+        if new_ability == 'drought' or new_ability == 'orichalcumpulse':
+            s = replace(s, shadow_weather={Weather.SUNNYDAY: 0})
+        elif new_ability == 'drizzle':
+            s = replace(s, shadow_weather={Weather.RAINDANCE: 0})
+        elif new_ability == 'sandstream':
+            s = replace(s, shadow_weather={Weather.SANDSTORM: 0})
+        elif new_ability == 'snowwarning':
+            s = replace(s, shadow_weather={Weather.SNOWSCAPE: 0})
+        elif new_ability in ('electricsurge', 'hadronengine'):
+            new_fields = dict(s.shadow_fields)
+            new_fields[Field.ELECTRIC_TERRAIN] = 0
+            s = replace(s, shadow_fields=new_fields)
+        elif new_ability == 'grassysurge':
+            new_fields = dict(s.shadow_fields)
+            new_fields[Field.GRASSY_TERRAIN] = 0
+            s = replace(s, shadow_fields=new_fields)
+        elif new_ability == 'mistysurge':
+            new_fields = dict(s.shadow_fields)
+            new_fields[Field.MISTY_TERRAIN] = 0
+            s = replace(s, shadow_fields=new_fields)
+        elif new_ability == 'psychicsurge':
+            new_fields = dict(s.shadow_fields)
+            new_fields[Field.PSYCHIC_TERRAIN] = 0
+            s = replace(s, shadow_fields=new_fields)
+
+        # Stat-boosting entry abilities
+        if new_ability == 'intimidate':
+            s = s._apply_boost_changes({'atk': -1}, "opp", s.opp_active)
+            s = s._log(f"INTIMIDATE opp:{s.opp_active.species} -1 Atk")
+            # Defiant / Competitive react to Intimidate
+            opp_ab = _get_ability(s.opp_active)
+            if opp_ab == 'defiant':
+                s = s._apply_boost_changes({'atk': 2}, "opp", s.opp_active)
+                s = s._log(f"DEFIANT opp:{s.opp_active.species} +2 Atk")
+            elif opp_ab == 'competitive':
+                s = s._apply_boost_changes({'spa': 2}, "opp", s.opp_active)
+                s = s._log(f"COMPETITIVE opp:{s.opp_active.species} +2 SpA")
+        elif new_ability == 'intrepidsword':
+            s = s._apply_boost_changes({'atk': 1}, "me", new_mon)
+            s = s._log(f"INTREPID-SWORD me:{new_mon.species} +1 Atk")
+        elif new_ability == 'dauntlessshield':
+            s = s._apply_boost_changes({'def': 1}, "me", new_mon)
+            s = s._log(f"DAUNTLESS-SHIELD me:{new_mon.species} +1 Def")
+        elif new_ability == 'download':
+            opp_bs = getattr(s.opp_active, 'base_stats', {}) or {}
+            if int(opp_bs.get('def', 70)) < int(opp_bs.get('spd', 70)):
+                s = s._apply_boost_changes({'atk': 1}, "me", new_mon)
+            else:
+                s = s._apply_boost_changes({'spa': 1}, "me", new_mon)
+
+        # Disguise: add volatile so first hit is absorbed
+        if new_ability == 'disguise':
+            new_vol = dict(s.my_volatiles)
+            new_vol[id(new_mon)] = {**new_vol.get(id(new_mon), {}), 'disguise_active': True}
+            s = replace(s, my_volatiles=new_vol)
+        # Ice Face: add volatile for physical hit absorption
+        elif new_ability == 'iceface':
+            new_vol = dict(s.my_volatiles)
+            new_vol[id(new_mon)] = {**new_vol.get(id(new_mon), {}), 'iceface_active': True}
+            s = replace(s, my_volatiles=new_vol)
+        # Truant: initialise the loafing counter
+        elif new_ability == 'truant':
+            new_vol = dict(s.my_volatiles)
+            new_vol[id(new_mon)] = {**new_vol.get(id(new_mon), {}), 'truant_loafing': False}
+            s = replace(s, my_volatiles=new_vol)
+        # Slow Start: 5-turn counter
+        elif new_ability == 'slowstart':
+            new_vol = dict(s.my_volatiles)
+            new_vol[id(new_mon)] = {**new_vol.get(id(new_mon), {}), 'slowstart_turns': 5}
+            s = replace(s, my_volatiles=new_vol)
 
         return s
 
@@ -1490,17 +1850,30 @@ class ShadowState:
                 s = s._log(f"CONFUSED-SELFHIT me:{s.my_active.species}")
                 return s
 
-        # Paralysis check 
+        # Paralysis check
         if my_status == Status.PAR:
             if rng.random() < 0.25:
                 s = s._log(f"FULL PARA me:{s.my_active.species}")
                 return s
 
+        # Truant: skip every other turn
+        my_vol_t = s.my_volatiles.get(id(s.my_active), {})
+        if my_vol_t.get('truant_loafing', False):
+            new_vol_t = dict(s.my_volatiles)
+            new_vol_t[id(s.my_active)] = {**my_vol_t, 'truant_loafing': False}
+            s = replace(s, my_volatiles=new_vol_t)
+            s = s._log(f"TRUANT me:{s.my_active.species} loafing")
+            return s
+        elif _get_ability(s.my_active) == 'truant':
+            new_vol_t = dict(s.my_volatiles)
+            new_vol_t[id(s.my_active)] = {**my_vol_t, 'truant_loafing': True}
+            s = replace(s, my_volatiles=new_vol_t)
+
         # Psychic Terrain: priority moves fail against grounded targets
         if (move is not None
                 and Field.PSYCHIC_TERRAIN in s.shadow_fields
                 and move_priority(move) > 0
-                and _is_grounded(s.opp_active)):
+                and s._is_grounded_in_state(s.opp_active, attacker=s.my_active)):
             s = s._log(f"PSYCHIC-TERRAIN-BLOCK me:{getattr(move,'id','move')}")
             return s
 
@@ -1547,25 +1920,123 @@ class ShadowState:
                 s = replace(s, my_hp=crash_hp)
                 s = s._log(f"CRASH me:{s.my_active.species} -50%")
 
+        # Type-immunity ability check (before damage calc)
+        move_type = getattr(move, 'type', None) if move is not None else None
+        move_bp   = float(getattr(move, 'base_power', 0) or 0)
+        opp_ability = _get_ability(s.opp_active)
+        type_absorbed = False
+        if hit and move_bp > 0 and move_type is not None and not _is_mold_breaker(s.my_active):
+            if opp_ability == 'waterabsorb' and move_type == PokemonType.WATER:
+                h = dict(s.opp_hp)
+                h[id(s.opp_active)] = min(1.0, h.get(id(s.opp_active), 1.0) + 0.25)
+                s = replace(s, opp_hp=h); type_absorbed = True
+            elif opp_ability == 'voltabsorb' and move_type == PokemonType.ELECTRIC:
+                h = dict(s.opp_hp)
+                h[id(s.opp_active)] = min(1.0, h.get(id(s.opp_active), 1.0) + 0.25)
+                s = replace(s, opp_hp=h); type_absorbed = True
+            elif opp_ability == 'eartheater' and move_type == PokemonType.GROUND:
+                h = dict(s.opp_hp)
+                h[id(s.opp_active)] = min(1.0, h.get(id(s.opp_active), 1.0) + 0.25)
+                s = replace(s, opp_hp=h); type_absorbed = True
+            elif opp_ability == 'sapsipper' and move_type == PokemonType.GRASS:
+                s = s._apply_boost_changes({'atk': 1}, "opp", s.opp_active); type_absorbed = True
+            elif opp_ability == 'stormdrain' and move_type == PokemonType.WATER:
+                s = s._apply_boost_changes({'spa': 1}, "opp", s.opp_active); type_absorbed = True
+            elif opp_ability == 'lightningrod' and move_type == PokemonType.ELECTRIC:
+                s = s._apply_boost_changes({'spa': 1}, "opp", s.opp_active); type_absorbed = True
+            elif opp_ability == 'motordrive' and move_type == PokemonType.ELECTRIC:
+                s = s._apply_boost_changes({'spe': 1}, "opp", s.opp_active); type_absorbed = True
+            elif opp_ability == 'wellbakedbody' and move_type == PokemonType.FIRE:
+                s = s._apply_boost_changes({'def': 2}, "opp", s.opp_active); type_absorbed = True
+            elif opp_ability == 'soundproof' and _is_sound_move(move):
+                type_absorbed = True
+            elif opp_ability == 'flashfire' and move_type == PokemonType.FIRE:
+                # Flash Fire: immune to Fire, marks volatile for Fire boost
+                vol = dict(s.opp_volatiles)
+                vol[id(s.opp_active)] = {**vol.get(id(s.opp_active), {}), 'flashfire': True}
+                s = replace(s, opp_volatiles=vol); type_absorbed = True
+
+        # Disguise absorbs the first hit (costs 1/8 max HP to the disguise)
+        opp_vol = s.opp_volatiles.get(id(s.opp_active), {})
+        if hit and move_bp > 0 and opp_vol.get('disguise_active') and not type_absorbed:
+            dh = dict(s.opp_hp)
+            dh[id(s.opp_active)] = max(0.0, dh.get(id(s.opp_active), 1.0) - 1.0 / 8.0)
+            new_ovol = dict(s.opp_volatiles)
+            new_ovol[id(s.opp_active)] = {**opp_vol, 'disguise_active': False}
+            s = replace(s, opp_hp=dh, opp_volatiles=new_ovol)
+            s = s._log(f"DISGUISE opp:{s.opp_active.species} broken (-12.5%)")
+            type_absorbed = True  # damage redirected to disguise
+
+        # Ice Face absorbs first physical hit (no HP cost in Gen 9)
+        if hit and move_bp > 0 and opp_vol.get('iceface_active') and not type_absorbed:
+            from poke_env.battle import MoveCategory as _MC
+            if getattr(move, 'category', None) == _MC.PHYSICAL:
+                new_ovol = dict(s.opp_volatiles)
+                new_ovol[id(s.opp_active)] = {**opp_vol, 'iceface_active': False}
+                s = replace(s, opp_volatiles=new_ovol)
+                s = s._log(f"ICE-FACE opp:{s.opp_active.species} broken")
+                type_absorbed = True
+
         opp_hp_before = s.opp_active_hp()
         new_hp = dict(s.opp_hp)
-        new_hp[id(s.opp_active)], did_crit = apply_expected_damage(
-            s, move, s.my_active, s.opp_active, opp_hp_before, rng=rng, hit=hit
-        )
+        if type_absorbed:
+            new_hp[id(s.opp_active)] = opp_hp_before
+            did_crit = False
+        else:
+            new_hp[id(s.opp_active)], did_crit = apply_expected_damage(
+                s, move, s.my_active, s.opp_active, opp_hp_before, rng=rng, hit=hit
+            )
         s = replace(s, opp_hp=new_hp)
         dmg_dealt = opp_hp_before - s.opp_active_hp()
+
+        # Sturdy: survive from full HP (not if already damaged)
+        if dmg_dealt > 0 and s.opp_active_hp() <= 0.0 and opp_hp_before >= 1.0:
+            if opp_ability == 'sturdy' and not _is_mold_breaker(s.my_active):
+                sturdy_hp = dict(s.opp_hp)
+                sturdy_hp[id(s.opp_active)] = 0.001
+                s = replace(s, opp_hp=sturdy_hp)
+                dmg_dealt = opp_hp_before - 0.001
+                s = s._log(f"STURDY opp:{s.opp_active.species} survived")
 
         if did_crit:
             s = s._log(f"CRIT me:{getattr(move,'id','move')}")
 
-        if hit:
-            s = s._maybe_apply_status(move, "opp", s.opp_active, rng)
+        # Magic Bounce: reflect status moves back at the user (before secondary effects)
+        magic_bounced = (
+            hit and move_bp == 0
+            and _get_ability(s.opp_active) == 'magicbounce'
+            and not _is_mold_breaker(s.my_active))
+        if magic_bounced:
+            s = s._log(f"MAGIC-BOUNCE opp:{s.opp_active.species} reflects {getattr(move,'id','move')}")
 
-        if hit:
-            s = s._maybe_apply_boosts_us(move, rng)
+        if hit and not type_absorbed:
+            if magic_bounced:
+                s = s._maybe_apply_status(move, "me", s.my_active, rng)
+            else:
+                s = s._maybe_apply_status(move, "opp", s.opp_active, rng)
 
-        if hit:
-            s = s._maybe_apply_confusion(move, "opp", rng)
+        if hit and not type_absorbed:
+            if magic_bounced:
+                # target_boosts (stat drops) bounce back to the user (me)
+                s = s._maybe_apply_boosts_opp(move, rng)
+            else:
+                s = s._maybe_apply_boosts_us(move, rng)
+
+        if hit and not type_absorbed:
+            if magic_bounced:
+                s = s._maybe_apply_confusion(move, "me", rng)
+            else:
+                s = s._maybe_apply_confusion(move, "opp", rng)
+
+        # Dancer: opponent copies dance moves, receiving the same self-boosts
+        if hit and not magic_bounced and not type_absorbed:
+            _mf = getattr(move, 'flags', None) or {}
+            _is_dance = bool(_mf.get('dance') if isinstance(_mf, dict) else 'dance' in str(_mf).lower())
+            if _is_dance and _get_ability(s.opp_active) == 'dancer':
+                _bd = get_move_boosts(move)
+                if _bd and _bd[0]:
+                    s = s._apply_boost_changes(_bd[0], "opp", s.opp_active)
+                    s = s._log(f"DANCER opp:{s.opp_active.species} copies {getattr(move,'id','move')}")
 
         # Drain healing (Giga Drain, Drain Punch, etc.)
         if hit and dmg_dealt > 0:
@@ -1587,7 +2058,7 @@ class ShadowState:
 
         # Life Orb recoil: 1/10 max HP after dealing damage
         if hit and float(getattr(move, 'base_power', 0) or 0) > 0:
-            if _get_item(s.my_active) == 'lifeorb':
+            if s._item_of(s.my_active) == 'lifeorb':
                 recoil_hp = dict(s.my_hp)
                 recoil_hp[id(s.my_active)] = max(0.0, recoil_hp[id(s.my_active)] - 1.0 / 10.0)
                 s = replace(s, my_hp=recoil_hp)
@@ -1606,11 +2077,72 @@ class ShadowState:
                 opp_cleared = {k: v for k, v in s.opp_side_conditions.items() if k not in HAZARD_KEYS}
                 s = replace(s, my_side_conditions=my_cleared, opp_side_conditions=opp_cleared)
 
+        # Item removal on hit
+        if hit and move is not None and not type_absorbed:
+            mid = str(getattr(move, 'id', '') or '').lower()
+            opp_item = s._item_of(s.opp_active)
+            if mid == 'knockoff' and opp_item is not None:
+                s = replace(s, opp_item_lost=s.opp_item_lost | frozenset({id(s.opp_active)}))
+                s = s._log(f"KNOCK-OFF opp:{s.opp_active.species} lost {opp_item}")
+            elif move_bp > 0 and opp_item == 'airballoon':
+                s = replace(s, opp_item_lost=s.opp_item_lost | frozenset({id(s.opp_active)}))
+                s = s._log(f"AIR-BALLOON opp:{s.opp_active.species} popped")
+
+        # Contact-triggered effects (Rough Skin, Flame Body, Static, Aftermath)
+        if hit and dmg_dealt > 0 and _is_contact_move(move) and not type_absorbed:
+            my_ab  = _get_ability(s.my_active)
+            if my_ab != 'magicguard':
+                if opp_ability in ('roughskin', 'ironbarbs'):
+                    rh = dict(s.my_hp)
+                    rh[id(s.my_active)] = max(0.0, rh.get(id(s.my_active), 1.0) - 1.0 / 8.0)
+                    s = replace(s, my_hp=rh)
+                    s = s._log(f"ROUGH-SKIN me:{s.my_active.species} -12.5%")
+                elif opp_ability == 'flamebody' and s.my_status.get(id(s.my_active)) is None:
+                    if rng.random() < 0.30:
+                        new_st = dict(s.my_status)
+                        new_st[id(s.my_active)] = Status.BRN
+                        s = replace(s, my_status=new_st)
+                        s = s._log(f"FLAME-BODY me:{s.my_active.species} burned")
+                elif opp_ability == 'static' and s.my_status.get(id(s.my_active)) is None:
+                    if rng.random() < 0.30:
+                        new_st = dict(s.my_status)
+                        new_st[id(s.my_active)] = Status.PAR
+                        s = replace(s, my_status=new_st)
+                        s = s._log(f"STATIC me:{s.my_active.species} paralyzed")
+                elif opp_ability == 'poisontouch' and s.my_status.get(id(s.my_active)) is None:
+                    if rng.random() < 0.30:
+                        new_st = dict(s.my_status)
+                        new_st[id(s.my_active)] = Status.PSN
+                        s = replace(s, my_status=new_st)
+                        s = s._log(f"POISON-TOUCH me:{s.my_active.species} poisoned")
+
+            # Aftermath: 1/4 damage to attacker when KO'd by contact move
+            if s.opp_active_hp() <= 0.0 and opp_ability == 'aftermath' and my_ab != 'magicguard':
+                ah = dict(s.my_hp)
+                ah[id(s.my_active)] = max(0.0, ah.get(id(s.my_active), 1.0) - 0.25)
+                s = replace(s, my_hp=ah)
+                s = s._log(f"AFTERMATH me:{s.my_active.species} -25%")
+
+        # KO-triggered stat boosts (Moxie, Grim Neigh, Chilling Neigh, Soul-Heart)
+        if dmg_dealt > 0 and s.opp_active_hp() <= 0.0:
+            my_ab = _get_ability(s.my_active)
+            if my_ab in ('moxie', 'chillingneigh'):
+                s = s._apply_boost_changes({'atk': 1}, "me", s.my_active)
+                s = s._log(f"MOXIE/CHILLING-NEIGH me:{s.my_active.species} +1 Atk")
+            elif my_ab in ('grimneigh', 'soulheart'):
+                s = s._apply_boost_changes({'spa': 1}, "me", s.my_active)
+                s = s._log(f"GRIM-NEIGH/SOUL-HEART me:{s.my_active.species} +1 SpA")
+            elif my_ab == 'beastboost':
+                stat = _highest_base_stat(s.my_active)
+                s = s._apply_boost_changes({stat: 1}, "me", s.my_active)
+                s = s._log(f"BEAST-BOOST me:{s.my_active.species} +1 {stat}")
+
         # Field effects: weather/terrain/screens/tailwind/trick room setting
-        s = s._apply_field_effects(move, "me")
+        # Magic Bounce reflects hazard/screen setting to the opposite side
+        s = s._apply_field_effects(move, "opp" if magic_bounced else "me")
 
         # Choice lock: lock into this move if holding a Choice item
-        if move is not None and _get_item(s.my_active) in CHOICE_ITEMS:
+        if move is not None and s._item_of(s.my_active) in CHOICE_ITEMS:
             move_id = str(getattr(move, 'id', '') or '')
             if move_id:
                 s = replace(s, my_choice_lock=move_id)
@@ -1702,6 +2234,21 @@ class ShadowState:
             except Exception:
                 pass
 
+        # Switch-OUT ability effects (apply to the mon leaving)
+        old_opp_ability = _get_ability(s.opp_active)
+        old_opp_hp = s.opp_hp.get(id(s.opp_active), 0.0)
+        if old_opp_hp > 0.0:
+            if old_opp_ability == 'regenerator':
+                regen_hp = dict(s.opp_hp)
+                regen_hp[id(s.opp_active)] = min(1.0, old_opp_hp + 1.0 / 3.0)
+                s = replace(s, opp_hp=regen_hp)
+                s = s._log(f"REGENERATOR opp:{s.opp_active.species} +33%")
+            elif old_opp_ability == 'naturalcure' and s.opp_status.get(id(s.opp_active)) is not None:
+                new_st = dict(s.opp_status)
+                new_st[id(s.opp_active)] = None
+                s = replace(s, opp_status=new_st)
+                s = s._log(f"NATURAL-CURE opp:{s.opp_active.species} status cleared")
+
         # Reset toxic counter, choice lock, volatiles, and protect count on switch
         new_vol = dict(s.opp_volatiles)
         new_vol.pop(id(s.opp_active), None)  # Old mon's volatiles cleared
@@ -1716,7 +2263,8 @@ class ShadowState:
 
         # Apply entry hazards from OPPONENT's side conditions
         h_dmg, h_status, h_spe, updated_sc = _apply_hazards_on_entry(
-            new_mon, s.opp_side_conditions, s.opp_status.get(id(new_mon)))
+            new_mon, s.opp_side_conditions, s.opp_status.get(id(new_mon)),
+            effective_item=s._item_of(new_mon))
 
         if h_dmg > 0.0:
             new_hp = dict(s.opp_hp)
@@ -1733,6 +2281,78 @@ class ShadowState:
 
         if updated_sc != s.opp_side_conditions:
             s = replace(s, opp_side_conditions=updated_sc)
+
+        # Switch-IN ability effects (apply to the arriving mon)
+        new_opp_ability = _get_ability(new_mon)
+
+        # Weather / Terrain setters
+        if new_opp_ability == 'drought' or new_opp_ability == 'orichalcumpulse':
+            s = replace(s, shadow_weather={Weather.SUNNYDAY: 0})
+        elif new_opp_ability == 'drizzle':
+            s = replace(s, shadow_weather={Weather.RAINDANCE: 0})
+        elif new_opp_ability == 'sandstream':
+            s = replace(s, shadow_weather={Weather.SANDSTORM: 0})
+        elif new_opp_ability == 'snowwarning':
+            s = replace(s, shadow_weather={Weather.SNOWSCAPE: 0})
+        elif new_opp_ability in ('electricsurge', 'hadronengine'):
+            new_fields = dict(s.shadow_fields)
+            new_fields[Field.ELECTRIC_TERRAIN] = 0
+            s = replace(s, shadow_fields=new_fields)
+        elif new_opp_ability == 'grassysurge':
+            new_fields = dict(s.shadow_fields)
+            new_fields[Field.GRASSY_TERRAIN] = 0
+            s = replace(s, shadow_fields=new_fields)
+        elif new_opp_ability == 'mistysurge':
+            new_fields = dict(s.shadow_fields)
+            new_fields[Field.MISTY_TERRAIN] = 0
+            s = replace(s, shadow_fields=new_fields)
+        elif new_opp_ability == 'psychicsurge':
+            new_fields = dict(s.shadow_fields)
+            new_fields[Field.PSYCHIC_TERRAIN] = 0
+            s = replace(s, shadow_fields=new_fields)
+
+        # Stat-boosting entry abilities
+        if new_opp_ability == 'intimidate':
+            s = s._apply_boost_changes({'atk': -1}, "me", s.my_active)
+            s = s._log(f"INTIMIDATE me:{s.my_active.species} -1 Atk")
+            # Defiant / Competitive react to Intimidate
+            my_ab = _get_ability(s.my_active)
+            if my_ab == 'defiant':
+                s = s._apply_boost_changes({'atk': 2}, "me", s.my_active)
+                s = s._log(f"DEFIANT me:{s.my_active.species} +2 Atk")
+            elif my_ab == 'competitive':
+                s = s._apply_boost_changes({'spa': 2}, "me", s.my_active)
+                s = s._log(f"COMPETITIVE me:{s.my_active.species} +2 SpA")
+        elif new_opp_ability == 'intrepidsword':
+            s = s._apply_boost_changes({'atk': 1}, "opp", new_mon)
+            s = s._log(f"INTREPID-SWORD opp:{new_mon.species} +1 Atk")
+        elif new_opp_ability == 'dauntlessshield':
+            s = s._apply_boost_changes({'def': 1}, "opp", new_mon)
+            s = s._log(f"DAUNTLESS-SHIELD opp:{new_mon.species} +1 Def")
+        elif new_opp_ability == 'download':
+            my_bs = getattr(s.my_active, 'base_stats', {}) or {}
+            if int(my_bs.get('def', 70)) < int(my_bs.get('spd', 70)):
+                s = s._apply_boost_changes({'atk': 1}, "opp", new_mon)
+            else:
+                s = s._apply_boost_changes({'spa': 1}, "opp", new_mon)
+
+        # One-time-shield volatiles
+        if new_opp_ability == 'disguise':
+            new_vol = dict(s.opp_volatiles)
+            new_vol[id(new_mon)] = {**new_vol.get(id(new_mon), {}), 'disguise_active': True}
+            s = replace(s, opp_volatiles=new_vol)
+        elif new_opp_ability == 'iceface':
+            new_vol = dict(s.opp_volatiles)
+            new_vol[id(new_mon)] = {**new_vol.get(id(new_mon), {}), 'iceface_active': True}
+            s = replace(s, opp_volatiles=new_vol)
+        elif new_opp_ability == 'truant':
+            new_vol = dict(s.opp_volatiles)
+            new_vol[id(new_mon)] = {**new_vol.get(id(new_mon), {}), 'truant_loafing': False}
+            s = replace(s, opp_volatiles=new_vol)
+        elif new_opp_ability == 'slowstart':
+            new_vol = dict(s.opp_volatiles)
+            new_vol[id(new_mon)] = {**new_vol.get(id(new_mon), {}), 'slowstart_turns': 5}
+            s = replace(s, opp_volatiles=new_vol)
 
         return s
 
@@ -1805,11 +2425,22 @@ class ShadowState:
                 s = s._log(f"FULL PARA opp:{s.opp_active.species}")
                 return s
 
+        # Truant: skip every other turn
+        opp_vol_t = s.opp_volatiles.get(id(s.opp_active), {})
+        if _get_ability(s.opp_active) == 'truant':
+            is_loafing = opp_vol_t.get('truant_loafing', False)
+            new_vol_t = dict(s.opp_volatiles)
+            new_vol_t[id(s.opp_active)] = {**opp_vol_t, 'truant_loafing': not is_loafing}
+            s = replace(s, opp_volatiles=new_vol_t)
+            if is_loafing:
+                s = s._log(f"TRUANT opp:{s.opp_active.species} loafing")
+                return s
+
         # Psychic Terrain: priority moves fail against grounded targets
         if (move is not None
                 and Field.PSYCHIC_TERRAIN in s.shadow_fields
                 and move_priority(move) > 0
-                and _is_grounded(s.my_active)):
+                and s._is_grounded_in_state(s.my_active)):
             s = s._log(f"PSYCHIC-TERRAIN-BLOCK opp:{getattr(move,'id','move')}")
             return s
 
@@ -1856,25 +2487,122 @@ class ShadowState:
                 s = replace(s, opp_hp=crash_hp)
                 s = s._log(f"CRASH opp:{s.opp_active.species} -50%")
 
+        # Type-immunity ability check (before damage calc)
+        move_type = getattr(move, 'type', None) if move is not None else None
+        move_bp   = float(getattr(move, 'base_power', 0) or 0)
+        my_ability = _get_ability(s.my_active)
+        type_absorbed = False
+        if hit and move_bp > 0 and move_type is not None and not _is_mold_breaker(s.opp_active):
+            if my_ability == 'waterabsorb' and move_type == PokemonType.WATER:
+                h = dict(s.my_hp)
+                h[id(s.my_active)] = min(1.0, h.get(id(s.my_active), 1.0) + 0.25)
+                s = replace(s, my_hp=h); type_absorbed = True
+            elif my_ability == 'voltabsorb' and move_type == PokemonType.ELECTRIC:
+                h = dict(s.my_hp)
+                h[id(s.my_active)] = min(1.0, h.get(id(s.my_active), 1.0) + 0.25)
+                s = replace(s, my_hp=h); type_absorbed = True
+            elif my_ability == 'eartheater' and move_type == PokemonType.GROUND:
+                h = dict(s.my_hp)
+                h[id(s.my_active)] = min(1.0, h.get(id(s.my_active), 1.0) + 0.25)
+                s = replace(s, my_hp=h); type_absorbed = True
+            elif my_ability == 'sapsipper' and move_type == PokemonType.GRASS:
+                s = s._apply_boost_changes({'atk': 1}, "me", s.my_active); type_absorbed = True
+            elif my_ability == 'stormdrain' and move_type == PokemonType.WATER:
+                s = s._apply_boost_changes({'spa': 1}, "me", s.my_active); type_absorbed = True
+            elif my_ability == 'lightningrod' and move_type == PokemonType.ELECTRIC:
+                s = s._apply_boost_changes({'spa': 1}, "me", s.my_active); type_absorbed = True
+            elif my_ability == 'motordrive' and move_type == PokemonType.ELECTRIC:
+                s = s._apply_boost_changes({'spe': 1}, "me", s.my_active); type_absorbed = True
+            elif my_ability == 'wellbakedbody' and move_type == PokemonType.FIRE:
+                s = s._apply_boost_changes({'def': 2}, "me", s.my_active); type_absorbed = True
+            elif my_ability == 'soundproof' and _is_sound_move(move):
+                type_absorbed = True
+            elif my_ability == 'flashfire' and move_type == PokemonType.FIRE:
+                vol = dict(s.my_volatiles)
+                vol[id(s.my_active)] = {**vol.get(id(s.my_active), {}), 'flashfire': True}
+                s = replace(s, my_volatiles=vol); type_absorbed = True
+
+        # Disguise absorbs the first hit (costs 1/8 max HP to the disguise)
+        my_vol = s.my_volatiles.get(id(s.my_active), {})
+        if hit and move_bp > 0 and my_vol.get('disguise_active') and not type_absorbed:
+            dh = dict(s.my_hp)
+            dh[id(s.my_active)] = max(0.0, dh.get(id(s.my_active), 1.0) - 1.0 / 8.0)
+            new_mvol = dict(s.my_volatiles)
+            new_mvol[id(s.my_active)] = {**my_vol, 'disguise_active': False}
+            s = replace(s, my_hp=dh, my_volatiles=new_mvol)
+            s = s._log(f"DISGUISE me:{s.my_active.species} broken (-12.5%)")
+            type_absorbed = True  # damage redirected to disguise
+
+        # Ice Face absorbs first physical hit (no HP cost in Gen 9)
+        if hit and move_bp > 0 and my_vol.get('iceface_active') and not type_absorbed:
+            from poke_env.battle import MoveCategory as _MC
+            if getattr(move, 'category', None) == _MC.PHYSICAL:
+                new_mvol = dict(s.my_volatiles)
+                new_mvol[id(s.my_active)] = {**my_vol, 'iceface_active': False}
+                s = replace(s, my_volatiles=new_mvol)
+                s = s._log(f"ICE-FACE me:{s.my_active.species} broken")
+                type_absorbed = True
+
         my_hp_before = s.my_active_hp()
         new_hp = dict(s.my_hp)
-        new_hp[id(s.my_active)], did_crit = apply_expected_damage(
-            s, move, s.opp_active, s.my_active, my_hp_before, rng=rng, hit=hit
-        )
+        if type_absorbed:
+            new_hp[id(s.my_active)] = my_hp_before
+            did_crit = False
+        else:
+            new_hp[id(s.my_active)], did_crit = apply_expected_damage(
+                s, move, s.opp_active, s.my_active, my_hp_before, rng=rng, hit=hit
+            )
         s = replace(s, my_hp=new_hp)
         dmg_dealt = my_hp_before - s.my_active_hp()
+
+        # Sturdy: survive from full HP (not if already damaged)
+        if dmg_dealt > 0 and s.my_active_hp() <= 0.0 and my_hp_before >= 1.0:
+            if my_ability == 'sturdy' and not _is_mold_breaker(s.opp_active):
+                sturdy_hp = dict(s.my_hp)
+                sturdy_hp[id(s.my_active)] = 0.001
+                s = replace(s, my_hp=sturdy_hp)
+                dmg_dealt = my_hp_before - 0.001
+                s = s._log(f"STURDY me:{s.my_active.species} survived")
 
         if did_crit:
             s = s._log(f"CRIT opp:{getattr(move,'id','move')}")
 
-        if hit:
-            s = s._maybe_apply_status(move, "me", s.my_active, rng)
+        # Magic Bounce: reflect status moves back at the opponent (before secondary effects)
+        magic_bounced = (
+            hit and move_bp == 0
+            and my_ability == 'magicbounce'
+            and not _is_mold_breaker(s.opp_active))
+        if magic_bounced:
+            s = s._log(f"MAGIC-BOUNCE me:{s.my_active.species} reflects {getattr(move,'id','move')}")
 
-        if hit:
-            s = s._maybe_apply_boosts_opp(move, rng)
+        if hit and not type_absorbed:
+            if magic_bounced:
+                s = s._maybe_apply_status(move, "opp", s.opp_active, rng)
+            else:
+                s = s._maybe_apply_status(move, "me", s.my_active, rng)
 
-        if hit:
-            s = s._maybe_apply_confusion(move, "me", rng)
+        if hit and not type_absorbed:
+            if magic_bounced:
+                # target_boosts (stat drops) bounce back to the user (opp)
+                s = s._maybe_apply_boosts_us(move, rng)
+            else:
+                s = s._maybe_apply_boosts_opp(move, rng)
+
+        if hit and not type_absorbed:
+            if magic_bounced:
+                s = s._maybe_apply_confusion(move, "opp", rng)
+            else:
+                s = s._maybe_apply_confusion(move, "me", rng)
+
+        # Dancer: my active copies opponent's dance moves, receiving the same self-boosts
+        if hit and not magic_bounced and not type_absorbed:
+            _mf = getattr(move, 'flags', None) or {}
+            _is_dance = bool(_mf.get('dance') if isinstance(_mf, dict) else 'dance' in str(_mf).lower())
+            if _is_dance and _get_ability(s.my_active) == 'dancer':
+                _bd = get_move_boosts(move)
+                if _bd and _bd[0]:
+                    s = s._apply_boost_changes(_bd[0], "me", s.my_active)
+                    s = s._log(f"DANCER me:{s.my_active.species} copies {getattr(move,'id','move')}")
 
         # Drain healing (Giga Drain, Drain Punch, etc.)
         if hit and dmg_dealt > 0:
@@ -1896,7 +2624,7 @@ class ShadowState:
 
         # Life Orb recoil: 1/10 max HP after dealing damage
         if hit and float(getattr(move, 'base_power', 0) or 0) > 0:
-            if _get_item(s.opp_active) == 'lifeorb':
+            if s._item_of(s.opp_active) == 'lifeorb':
                 recoil_hp = dict(s.opp_hp)
                 recoil_hp[id(s.opp_active)] = max(0.0, recoil_hp[id(s.opp_active)] - 1.0 / 10.0)
                 s = replace(s, opp_hp=recoil_hp)
@@ -1915,11 +2643,74 @@ class ShadowState:
                 opp_cleared = {k: v for k, v in s.opp_side_conditions.items() if k not in HAZARD_KEYS}
                 s = replace(s, my_side_conditions=my_cleared, opp_side_conditions=opp_cleared)
 
+        # Item removal on hit
+        if hit and move is not None and not type_absorbed:
+            mid = str(getattr(move, 'id', '') or '').lower()
+            my_item = s._item_of(s.my_active)
+            if mid == 'knockoff' and my_item is not None:
+                # Knock Off removes our active's item
+                s = replace(s, my_item_lost=s.my_item_lost | frozenset({id(s.my_active)}))
+                s = s._log(f"KNOCK-OFF me:{s.my_active.species} lost {my_item}")
+            elif float(getattr(move, 'base_power', 0) or 0) > 0 and my_item == 'airballoon':
+                # Any damaging move pops our Air Balloon
+                s = replace(s, my_item_lost=s.my_item_lost | frozenset({id(s.my_active)}))
+                s = s._log(f"AIR-BALLOON me:{s.my_active.species} popped")
+
+        # Contact-triggered effects (Rough Skin, Iron Barbs, Flame Body, Static, Poison Touch, Aftermath)
+        if hit and dmg_dealt > 0 and _is_contact_move(move) and not type_absorbed:
+            opp_ab = _get_ability(s.opp_active)  # attacker's ability
+            if opp_ab != 'magicguard':
+                if my_ability in ('roughskin', 'ironbarbs'):
+                    rh = dict(s.opp_hp)
+                    rh[id(s.opp_active)] = max(0.0, rh.get(id(s.opp_active), 1.0) - 1.0 / 8.0)
+                    s = replace(s, opp_hp=rh)
+                    s = s._log(f"ROUGH-SKIN opp:{s.opp_active.species} -12.5%")
+                elif my_ability == 'flamebody' and s.opp_status.get(id(s.opp_active)) is None:
+                    if rng.random() < 0.30:
+                        new_st = dict(s.opp_status)
+                        new_st[id(s.opp_active)] = Status.BRN
+                        s = replace(s, opp_status=new_st)
+                        s = s._log(f"FLAME-BODY opp:{s.opp_active.species} burned")
+                elif my_ability == 'static' and s.opp_status.get(id(s.opp_active)) is None:
+                    if rng.random() < 0.30:
+                        new_st = dict(s.opp_status)
+                        new_st[id(s.opp_active)] = Status.PAR
+                        s = replace(s, opp_status=new_st)
+                        s = s._log(f"STATIC opp:{s.opp_active.species} paralyzed")
+                elif my_ability == 'poisontouch' and s.opp_status.get(id(s.opp_active)) is None:
+                    if rng.random() < 0.30:
+                        new_st = dict(s.opp_status)
+                        new_st[id(s.opp_active)] = Status.PSN
+                        s = replace(s, opp_status=new_st)
+                        s = s._log(f"POISON-TOUCH opp:{s.opp_active.species} poisoned")
+
+            # Aftermath: 1/4 damage to attacker (opp_active) when my_active KO'd by contact move
+            if s.my_active_hp() <= 0.0 and my_ability == 'aftermath' and opp_ab != 'magicguard':
+                ah = dict(s.opp_hp)
+                ah[id(s.opp_active)] = max(0.0, ah.get(id(s.opp_active), 1.0) - 0.25)
+                s = replace(s, opp_hp=ah)
+                s = s._log(f"AFTERMATH opp:{s.opp_active.species} -25%")
+
+        # KO-triggered stat boosts (Moxie, Grim Neigh, Chilling Neigh, Soul-Heart, Beast Boost)
+        if dmg_dealt > 0 and s.my_active_hp() <= 0.0:
+            opp_ab = _get_ability(s.opp_active)
+            if opp_ab in ('moxie', 'chillingneigh'):
+                s = s._apply_boost_changes({'atk': 1}, "opp", s.opp_active)
+                s = s._log(f"MOXIE/CHILLING-NEIGH opp:{s.opp_active.species} +1 Atk")
+            elif opp_ab in ('grimneigh', 'soulheart'):
+                s = s._apply_boost_changes({'spa': 1}, "opp", s.opp_active)
+                s = s._log(f"GRIM-NEIGH/SOUL-HEART opp:{s.opp_active.species} +1 SpA")
+            elif opp_ab == 'beastboost':
+                stat = _highest_base_stat(s.opp_active)
+                s = s._apply_boost_changes({stat: 1}, "opp", s.opp_active)
+                s = s._log(f"BEAST-BOOST opp:{s.opp_active.species} +1 {stat}")
+
         # Field effects: weather/terrain/screens/tailwind/trick room setting
-        s = s._apply_field_effects(move, "opp")
+        # Magic Bounce reflects hazard/screen setting to the opposite side
+        s = s._apply_field_effects(move, "me" if magic_bounced else "opp")
 
         # Choice lock: lock into this move if holding a Choice item
-        if move is not None and _get_item(s.opp_active) in CHOICE_ITEMS:
+        if move is not None and s._item_of(s.opp_active) in CHOICE_ITEMS:
             move_id = str(getattr(move, 'id', '') or '')
             if move_id:
                 s = replace(s, opp_choice_lock=move_id)

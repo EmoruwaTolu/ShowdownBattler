@@ -194,6 +194,51 @@ def _absorber_multiplier(status: Status, move: Any, battle: Any, opp: Any, me: A
     return 0.92       # Barely viable; risky switch-in for the opponent
 
 
+def _status_ability_multiplier(status: Status, opp: Any) -> float:
+    """
+    Multiplier when the opponent's ability makes status infliction backfire.
+
+    Returns < 1.0 when status is less effective, negative when actively harmful.
+    """
+    raw = str(getattr(opp, 'ability', '') or '')
+    ab = raw.lower().replace(' ', '').replace('-', '').replace("'", '')
+    if not ab:
+        return 1.0
+
+    if ab == 'guts':
+        # Guts: 1.5x Atk when BRN/PSN/TOX/PAR (not SLP/FRZ).
+        # Burning or poisoning a Guts user actually buffs them — don't do it.
+        if status in (Status.BRN, Status.PSN, Status.TOX):
+            return -0.40   # net harmful to us; their Atk boost > our chip benefit
+        if status == Status.PAR:
+            return 0.35    # 25% full-para still useful, but Atk boost hurts
+    elif ab == 'quickfeet':
+        # Quick Feet: 1.5x Spe when statused.
+        # BRN/PSN gives them a FREE speed boost we weren't expecting.
+        if status in (Status.BRN, Status.PSN, Status.TOX):
+            return 0.15
+        # PAR: halves speed to 50% then QF gives 1.5× → net 75% — still slower, OK
+    elif ab == 'flareboost':
+        # 1.5x SpA while burned — don't burn them
+        if status == Status.BRN:
+            return -0.30
+    elif ab == 'toxicboost':
+        # 1.5x power while poisoned — don't poison them
+        if status in (Status.PSN, Status.TOX):
+            return -0.30
+    elif ab == 'marvelscale':
+        # 1.5x Def while statused — status is less punishing but still has chip value
+        return 0.65
+    elif ab == 'naturalcure':
+        # Cures status on switch — status is fleeting
+        return 0.60
+    elif ab == 'shedskin':
+        # ~1/3 cure per turn — status less reliable
+        return 0.70
+
+    return 1.0
+
+
 def score_status_move(move: Any, battle: Any, ctx: EvalContext) -> float:
     """
     Main status move scoring function.
@@ -253,6 +298,9 @@ def score_status_move(move: Any, battle: Any, ctx: EvalContext) -> float:
     # Absorber penalty: reduce score if opponent bench can absorb status
     # Floor at 0.65: even with a healthy absorber, status still has merit
     score *= max(0.65, _absorber_multiplier(status, move, battle, opp, me=me))
+
+    # Ability-backfire: opp's own ability may benefit FROM being statused
+    score *= _status_ability_multiplier(status, opp)
 
     # Expected value with threat-aware miss cost
     accuracy = getattr(move, 'accuracy', 1.0) or 1.0

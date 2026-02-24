@@ -1237,23 +1237,32 @@ def evaluate_sack_opportunity(state: Any, gen: int) -> float:
 
     return 0.12 * bench_advantage * dispensable_factor * danger_factor * setup_bonus
 
-def evaluate_state(state: Any) -> float:
+def evaluate_state(state: Any, _return_terms: bool = False):
     """
     Returns a scalar value for MCTS backup: higher is better for us.
     Range ~[-1, +1].
+
+    If _return_terms=True, returns (value, terms_dict) instead of just value.
+    Use evaluate_state_terms() as the public API for data collection.
     """
+    def _ret(v: float, terms=None):
+        v = max(-1.0, min(1.0, float(v)))
+        if _return_terms:
+            return v, (terms if terms is not None else {})
+        return v
+
     my_sum_raw = _team_hp_sum(state.my_hp)
     opp_sum_raw = _team_hp_sum(state.opp_hp)
 
     if my_sum_raw <= 1e-9:
-        return -1.0
+        return _ret(-1.0)
 
     opp_known = len(getattr(state, "opp_team", []) or [])
     opp_total = int(getattr(state, "opp_team_size", 6) or 6)
     battle_finished = bool(getattr(state.battle, "finished", False))
 
     if opp_sum_raw <= 1e-9 and (battle_finished or opp_known >= opp_total):
-        return +1.0
+        return _ret(1.0)
 
     my_active_hp = float(state.my_hp.get(id(state.my_active), 0.0))
     opp_active_hp = float(state.opp_hp.get(id(state.opp_active), 0.0))
@@ -1263,7 +1272,7 @@ def evaluate_state(state: Any) -> float:
     # branch below never fires — MCTS only sees a tiny material diff and undervalues switching.
     pre_eval = getattr(state, 'pre_autoswitch_eval', None)
     if pre_eval is not None:
-        return max(-1.0, min(1.0, float(pre_eval)))
+        return _ret(pre_eval)
 
     try:
         gen = int(getattr(state.battle, "gen", 9) or 9)
@@ -1276,7 +1285,7 @@ def evaluate_state(state: Any) -> float:
         base = -0.90 + 0.15 * lead_hint
         bench_qual = _sack_bench_quality(state, gen)
         base += 0.35 * bench_qual
-        return max(-1.0, min(1.0, float(base)))
+        return _ret(base)
 
     # Endgame detection
     my_alive_count = sum(1 for v in state.my_hp.values() if v > 0)
@@ -1299,21 +1308,29 @@ def evaluate_state(state: Any) -> float:
         elif opp_status_eg in (Status.PSN, Status.TOX) and my_status_eg not in (Status.PSN, Status.TOX):
             endgame_value += 0.12
 
-        return max(-1.0, min(1.0, endgame_value))
+        return _ret(endgame_value)
 
     elif my_alive_count == 1 and opp_alive_count >= 2:
         my_boosts_eg = state.my_boosts.get(id(state.my_active), {})
         max_boost = max((v for v in my_boosts_eg.values() if v > 0), default=0)
 
         if has_setup_potential_perfect(state.my_active) and my_active_hp > 0.7 and max_boost < 2:
-            return -0.30
+            return _ret(-0.30)
         elif max_boost >= 4:
-            return -0.10
+            return _ret(-0.10)
         else:
-            return -0.70
+            return _ret(-0.70)
 
     elif my_alive_count >= 2 and opp_alive_count == 1:
-        return +0.70
+        # We have a numbers advantage, but returning a constant here makes
+        # every rollout identical → MCTS can't distinguish moves.
+        # Blend a large baseline with active-matchup signal so simulations
+        # that chip / KO the opponent score higher than setup / utility turns.
+        hp_diff = my_active_hp - opp_active_hp
+        matchup = _tanh01(hp_diff / 0.4)          # 0 = losing 1v1, 1 = dominating
+        opp_chipped = 1.0 - opp_active_hp          # 0 = fresh, 1 = nearly KO'd
+        value = max(0.40, min(1.0, 0.50 + 0.25 * matchup + 0.20 * opp_chipped))
+        return _ret(value)
 
     with state._patched_status(), state._patched_boosts(), state._patched_fields():
         my_value = team_value(
@@ -1569,4 +1586,44 @@ def evaluate_state(state: Any) -> float:
     # Apply penalties/bonuses after normalization (keeps them interpretable)
     value = core_norm - tempo_penalty - sac_penalty + setup_early_pen + post_ko_pen + priority_revenge_term
 
+    if _return_terms:
+        terms = {
+            "team_term":             float(team_term),
+            "numbers_term":          float(numbers_term),
+            "race_term":             float(race_term),
+            "switch_term":           float(switch_term),
+            "boost_term":            float(boost_term),
+            "active_preserve":       float(active_preserve),
+            "progress_term":         float(progress_term),
+            "field_term":            float(field_term),
+            "status_term":           float(status_term),
+            "pivot_term":            float(pivot_term),
+            "threat_term":           float(threat_term),
+            "coverage_term":         float(coverage_term),
+            "wincon_term":           float(wincon_term),
+            "tempo_penalty":         float(tempo_penalty),
+            "sac_penalty":           float(sac_penalty),
+            "setup_early_pen":       float(setup_early_pen),
+            "post_ko_pen":           float(post_ko_pen),
+            "priority_revenge_term": float(priority_revenge_term),
+            "sack_bonus":            float(sack_bonus),
+            "hazard_pressure":       float(hazard_pressure),
+            "uncertainty":           float(uncertainty),
+            "ahead":                 int(ahead),
+            "opp_unseen":            int(opp_unseen),
+            "core_norm":             float(core_norm),
+        }
+        return _ret(value, terms)
     return max(-1.0, min(1.0, float(value)))
+
+
+def evaluate_state_terms(state: Any) -> tuple:
+    """
+    Public API for data collection: returns (value, terms_dict).
+
+    ``value``      — same scalar as evaluate_state(state)
+    ``terms_dict`` — maps each named eval component to its float value.
+                     Suitable as feature vector φ(s) for linear/logistic
+                     regression against battle outcome z ∈ {+1, -1}.
+    """
+    return evaluate_state(state, _return_terms=True)

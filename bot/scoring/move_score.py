@@ -19,6 +19,54 @@ from bot.mcts.shadow_state import get_move_boosts
 # These lock the user in for 2-3 turns with no choice; confusion at the end.
 _LOCK_MOVE_IDS: frozenset = frozenset({"outrage", "thrash", "petaldance", "ragingfury"})
 
+# Utility value of removing a specific item (on top of the damage already scored).
+# Scaled by (1 - ko_prob) since KO'd mons don't use their item anymore.
+_KNOCK_OFF_ITEM_VALUE: dict = {
+    'choiceband': 22.0,
+    'choicespecs': 22.0,
+    'choicescarf': 20.0,
+    'lifeorb': 18.0,
+    'eviolite': 18.0,
+    'heavydutyboots': 15.0,
+    'airballoon': 13.0,
+    'assaultvest': 12.0,
+    'leftovers': 10.0,
+    'blacksludge': 10.0,
+    'rockyhelmet': 8.0,
+    'throatspray': 10.0,
+    'boosterenergy': 12.0,
+}
+_KNOCK_OFF_ITEM_VALUE_DEFAULT = 8.0   # unknown or uncategorised item
+_KNOCK_OFF_NO_ITEM_VALUE = 5.0        # item not revealed — partial credit (~70% mons have items)
+
+
+def _score_knock_off_utility(move: Any, opp: Any, ko_prob: float) -> float:
+    """
+    Extra score for Knock Off's item removal utility (beyond the damage already scored).
+
+    The 1.5x damage boost when the target holds an item is already captured by the
+    damage calculator.  This adds the strategic value of the item being gone for the
+    rest of the battle: opponent loses Choice lock, Leftovers chip, Life Orb power, etc.
+
+    Scaled by (1 - ko_prob): if we KO them, the item disappearance doesn't matter.
+    """
+    move_id = str(getattr(move, 'id', '') or '').lower().replace(' ', '').replace('-', '')
+    if move_id != 'knockoff':
+        return 0.0
+    if ko_prob >= 0.95:
+        return 0.0
+
+    survive_prob = max(0.0, 1.0 - ko_prob)
+    opp_item = getattr(opp, 'item', None)
+
+    if opp_item is None:
+        # Item not yet revealed — most randbats mons have items, give partial credit
+        return _KNOCK_OFF_NO_ITEM_VALUE * survive_prob
+
+    item_norm = str(opp_item).lower().replace(' ', '').replace('-', '')
+    item_val = _KNOCK_OFF_ITEM_VALUE.get(item_norm, _KNOCK_OFF_ITEM_VALUE_DEFAULT)
+    return item_val * survive_prob
+
 
 def _is_lock_move(move: Any) -> bool:
     """
@@ -152,6 +200,8 @@ def score_move(move: Any, battle: Any, ctx: EvalContext) -> float:
 
     if ko_prob < 0.95:
         score += score_secondaries(move, battle, ctx, ko_prob, dmg_frac=dmg_frac)
+
+    score += _score_knock_off_utility(move, opp, ko_prob)
 
     priority = int(getattr(move, "priority", 0) or 0)
     if priority > 0:
@@ -348,6 +398,16 @@ def score_setup_move(move: Any, battle: Any, ctx: EvalContext) -> float:
     me = ctx.me
     opp = ctx.opp
     current_boosts = getattr(me, "boosts", {}) or {}
+
+    # Dancer check: if opponent has Dancer and this is a dance move, they get the
+    # same boosts for free — the setup advantage is fully negated.
+    opp_ab = str(getattr(opp, 'ability', '') or '').lower().replace(' ', '').replace('-', '').replace("'", '')
+    if opp_ab == 'dancer':
+        move_flags = getattr(move, 'flags', None) or {}
+        is_dance = (move_flags.get('dance') if isinstance(move_flags, dict)
+                    else 'dance' in str(move_flags).lower())
+        if is_dance:
+            return 0.0  # opponent copies our boosts — no setup advantage gained
 
     # Base value with diminishing returns
     boost_value = 0.0

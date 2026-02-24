@@ -539,8 +539,7 @@ def search(
                 return (picked, {"top": [], "sims": 0}) if return_stats else picked
 
     if not root.children:
-        picked = ("move", None)
-        return (picked, {"top": [], "sims": 0}) if return_stats else picked
+        return (None, {"top": [], "sims": 0}) if return_stats else None
 
     # Simulations
     for sim_i in range(int(cfg.num_simulations)):
@@ -648,7 +647,7 @@ def search(
         # Pick most-visited branch
         picked = max(base_action_map[best_base_action], key=lambda a: root.children[a].N)
 
-    payload = {"top": rows[:10], "sims": int(cfg.num_simulations)}
+    payload = {"top": rows, "sims": int(cfg.num_simulations)}
 
     if return_tree:
         payload["root"] = root

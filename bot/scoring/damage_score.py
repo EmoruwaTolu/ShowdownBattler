@@ -1,7 +1,93 @@
 from __future__ import annotations
-from typing import Any, Optional, Tuple
+import math
+from typing import Any, Optional
 from poke_env.calc.damage_calc_gen9 import calculate_damage
 from poke_env.battle import MoveCategory
+from poke_env.data import GenData
+
+_GEN9_TYPE_CHART = None
+
+def _get_type_chart():
+    global _GEN9_TYPE_CHART
+    if _GEN9_TYPE_CHART is None:
+        _GEN9_TYPE_CHART = GenData.from_gen(9).type_chart
+    return _GEN9_TYPE_CHART
+
+
+def _stat_estimate(base: int, evs: int = 0, ivs: int = 31, level: int = 100) -> int:
+    """Estimate a non-HP stat from base stat (Gen 9 formula)."""
+    return math.floor((2 * base + ivs + evs // 4) * level / 100) + 5
+
+
+def _hp_estimate(base: int, evs: int = 0, ivs: int = 31, level: int = 100) -> int:
+    """Estimate HP stat from base stat (Gen 9 formula)."""
+    return math.floor((2 * base + ivs + evs // 4) * level / 100) + level + 10
+
+
+def _smart_damage_fallback(move: Any, me: Any, opp: Any) -> float:
+    """
+    Estimate damage fraction using base stats + STAB + type effectiveness when
+    poke_env's calculate_damage fails (e.g. opponent stats not yet populated).
+
+    Uses the Gen 9 damage formula with:
+    - Attacker's actual stats if available (our Pokemon), else estimated from base stats
+    - Defender's stats estimated from base stats (conservative: 0 EVs)
+    - Defender's HP estimated from base stats for the denominator
+
+    This ensures STAB and type-effective moves score much higher than the flat
+    0.25 fallback, fixing move-ordering issues for moves like Hydropump.
+    """
+    bp = float(getattr(move, 'base_power', 0) or 0)
+    if bp <= 0:
+        return 0.0
+
+    is_physical = getattr(move, 'category', None) == MoveCategory.PHYSICAL
+    atk_key = 'atk' if is_physical else 'spa'
+    def_key = 'def' if is_physical else 'spd'
+
+    # Attacker offensive stat: use actual stat if available (our own Pokemon)
+    me_stats = getattr(me, 'stats', {}) or {}
+    attack = me_stats.get(atk_key)
+    if not isinstance(attack, (int, float)) or attack is None:
+        me_base = getattr(me, '_base_stats', {}) or {}
+        attack = _stat_estimate(int(me_base.get(atk_key, 100) or 100))
+
+    # Defender defensive stat: always estimate from base stats
+    opp_base = getattr(opp, '_base_stats', {}) or {}
+    defense = _stat_estimate(int(opp_base.get(def_key, 100) or 100))
+
+    # Defender max HP: use actual if it looks real (> 100), else estimate
+    opp_max_hp = float(getattr(opp, 'max_hp', 0) or 0)
+    if opp_max_hp <= 100:
+        opp_max_hp = float(_hp_estimate(int(opp_base.get('hp', 100) or 100)))
+
+    attack = max(1.0, float(attack))
+    defense = max(1.0, float(defense))
+
+    # Gen 9 damage formula (level 100)
+    base_dmg = math.floor(math.floor(22 * bp * attack / defense / 50) + 2)
+
+    # STAB multiplier
+    move_type = getattr(move, 'type', None)
+    me_types = getattr(me, 'types', []) or []
+    stab = 1.5 if (move_type is not None and move_type in me_types) else 1.0
+
+    # Type effectiveness
+    type_eff = 1.0
+    if move_type is not None:
+        try:
+            tc = _get_type_chart()
+            opp_types = getattr(opp, 'types', []) or []
+            t1 = opp_types[0] if len(opp_types) > 0 else None
+            t2 = opp_types[1] if len(opp_types) > 1 else None
+            if t1 is not None:
+                type_eff = move_type.damage_multiplier(t1, t2, type_chart=tc)
+        except Exception:
+            pass
+
+    # Average damage roll (92.5% of max = midpoint of 85%–100% range)
+    avg_dmg = base_dmg * stab * type_eff * 0.925
+    return avg_dmg / opp_max_hp
 
 def _safe_species(p: Any) -> str:
     s = str(getattr(p, "species", "") or "").strip().lower()
@@ -24,76 +110,31 @@ def _safe_hp_frac(p: Any) -> Optional[float]:
 
 def _get_pokemon_identifier(pokemon: Any, battle: Any) -> Optional[str]:
     """
-    Robustly get battle identifier for a Pokemon (e.g., "p1: Gengar", "p2: Zacian").
+    Get battle identifier for a Pokemon (e.g., "p1: Gengar", "p2: Zacian").
 
-    Strategy:
-      1) identity match (exact object)
-      2) species match within the same side (team / opponent_team), tie-break by HP fraction closeness
-      3) if still ambiguous, return the first species match on either side (rare; better than None)
+    Uses object-identity matching only.  A species-name fallback would silently
+    map sampled/unknown MCTS Pokemon to real team members on the wrong side, causing
+    poke_env’s calculate_damage to call battle.get_pokemon("p1: Bellibolt") for what
+    was actually our own bench Bellibolt — creating spurious entries in _opponent_team
+    that inflate the seen-count and break MCTS unseen-slot tracking.
     """
     if pokemon is None or battle is None:
         return None
 
-    # Build candidate pools
-    team_items = []
-    opp_items = []
     try:
-        team_items = list((getattr(battle, "team", None) or {}).items())
+        for identifier, pkmn in (getattr(battle, "team", None) or {}).items():
+            if pkmn is pokemon:
+                return identifier
     except Exception:
-        team_items = []
+        pass
+
     try:
-        opp_items = list((getattr(battle, "opponent_team", None) or {}).items())
+        for identifier, pkmn in (getattr(battle, "opponent_team", None) or {}).items():
+            if pkmn is pokemon:
+                return identifier
     except Exception:
-        opp_items = []
+        pass
 
-    # Exact identity match
-    for identifier, pkmn in team_items:
-        if pkmn is pokemon:
-            return identifier
-    for identifier, pkmn in opp_items:
-        if pkmn is pokemon:
-            return identifier
-
-    # Helper: choose best match by species + hp closeness
-    target_species = _safe_species(pokemon)
-    target_hp = _safe_hp_frac(pokemon)
-
-    def best_species_match(items: list[Tuple[str, Any]]) -> Optional[str]:
-        # Collect all same-species candidates
-        cands = [(ident, p) for ident, p in items if _safe_species(p) == target_species]
-        if not cands:
-            return None
-        if len(cands) == 1:
-            return cands[0][0]
-
-        # If we have hp info, choose closest hp fraction
-        if target_hp is not None:
-            scored = []
-            for ident, p in cands:
-                hp = _safe_hp_frac(p)
-                if hp is None:
-                    # unknown hp -> mild penalty so known hp wins
-                    scored.append((1.0, ident))
-                else:
-                    scored.append((abs(hp - target_hp), ident))
-            scored.sort(key=lambda t: t[0])
-            return scored[0][1]
-
-        # Otherwise, ambiguous: return first
-        return cands[0][0]
-
-    # Prefer same-side match (if we can infer side from identifier-style, we can’t here)
-    # But we can still try team then opponent (this is usually correct for switch-ins you evaluate)
-    if target_species:
-        ident = best_species_match(team_items)
-        if ident is not None:
-            return ident
-        ident = best_species_match(opp_items)
-        if ident is not None:
-            return ident
-
-    # As a final fallback, if species missing, try matching by name/id fields (rare)
-    # (If nothing works, return None)
     return None
 
 def estimate_damage_fraction(move: Any, me: Any, opp: Any, battle: Any) -> float:
@@ -157,23 +198,37 @@ def estimate_damage_fraction(move: Any, me: Any, opp: Any, battle: Any) -> float
             battle=battle,
             is_critical=False,
         )
-        
+
         # Get opponent's max HP
         opp_max_hp = getattr(opp, 'max_hp', None)
         if opp_max_hp is None or opp_max_hp <= 0:
             opp_max_hp = getattr(opp, 'stats', {}).get('hp', 100)
-        
-        if opp_max_hp <= 0:
-            return 0.25
-        
+
+        if opp_max_hp is None or opp_max_hp <= 0:
+            return _smart_damage_fallback(move, me, opp)
+
         # Return average damage as fraction of HP
         avg_dmg = (min_dmg + max_dmg) / 2.0
-        return avg_dmg / opp_max_hp
-        
-    except Exception as e:
-        # If damage calculator fails, return conservative estimate
-        # This should rarely happen in real battles
-        return 0.25
+        result = avg_dmg / opp_max_hp
+
+        # Sanity-check: if the poke-env calc gives a wildly inflated result
+        # (can happen when opp.max_hp is percentage-scale but damage is absolute),
+        # fall back to the smart estimate instead.
+        if result > 3.0:
+            return _smart_damage_fallback(move, me, opp)
+
+        return result
+
+    except Exception as _dmg_exc:
+        # calculate_damage failed (usually because opponent stats are not yet
+        # populated for random-battle opponents).  Use the smart fallback which
+        # estimates damage from base stats + STAB + type effectiveness.
+        import os
+        if os.environ.get('BATTLER_DEBUG_DMG'):
+            import traceback
+            print(f"[DMG_FALLBACK] {getattr(move,'id','?')} vs {getattr(opp,'species','?')}: {_dmg_exc}")
+            traceback.print_exc()
+        return _smart_damage_fallback(move, me, opp)
 
 
 def ko_probability_from_fraction(dmg_frac: float, opp_hp_frac: float) -> float:
