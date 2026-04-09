@@ -3,3 +3,8 @@ venv/
 venv_name/
 __pycache__/
 *.pyc
+*.pyo
+.DS_Store
+data/*.jsonl
+data/*.npz
+*.log
