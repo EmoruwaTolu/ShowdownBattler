@@ -1,12 +1,12 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace as _dc_replace
 from typing import Any, Dict, List, Optional, Tuple, Union
 import math
 import random
 
 from bot.mcts.shadow_state import ShadowState, Action
-from bot.mcts.eval import evaluate_state
+from bot.mcts.eval import evaluate_state, evaluate_state_terms
 
 
 @dataclass
@@ -43,11 +43,17 @@ class MCTSConfig:
 
     # Switch exploration
     switch_prior_boost: float = 1.5
-    prior_ceiling: float = 0.5  # Cap max prior per action; 1.0 = no cap
+    prior_ceiling: float = 0.3  # Cap max prior per action; 1.0 = no cap
+
+    # Learned-prior mixing weight at root: 0 = heuristic only, 1 = model only
+    policy_alpha: float = 0.3
+
+    # Learned value model for leaf evaluation (replaces evaluate_state when set)
+    value_model: Optional[Any] = None
 
 
 class Node:
-    __slots__ = ("state", "parent", "prior", "children", "N", "W")
+    __slots__ = ("state", "parent", "prior", "children", "N", "W", "base_priors")
 
     def __init__(self, state: ShadowState, parent: Optional["Node"] = None, prior: float = 1.0):
         self.state: ShadowState = state
@@ -56,6 +62,10 @@ class Node:
         self.children: Dict[Action, "Node"] = {}
         self.N: int = 0
         self.W: float = 0.0  # total value backed up
+        # For hybrid (branched) actions: base_action -> base prior before splitting.
+        # Branch priors are base_prior * prob and may not sum to base_prior if some
+        # branches are filtered by min_branch_probability; this stores the true value.
+        self.base_priors: Dict = {}
 
     @property
     def Q(self) -> float:
@@ -81,27 +91,60 @@ def action_priors(
     actions: List[Action],
     switch_prior_boost: float = 1.0,
     prior_ceiling: float = 1.0,
+    eval_terms: Optional[Dict[str, float]] = None,
+    policy_model: Optional[Any] = None,
+    policy_alpha: float = 0.3,
+    battle: Optional[Any] = None,
+    ctx_me: Optional[Any] = None,
 ) -> Dict[Action, float]:
     """
     Convert heuristic scores into priors P(a|s) for PUCT.
     switch_prior_boost: multiply switch priors by this, then renormalize (1.0 = no boost).
     prior_ceiling: cap max prior per action; redistribute excess (1.0 = no cap).
+    eval_terms + policy_model: if both provided (root only), α-mix heuristic and learned priors.
+    policy_alpha: mixing weight (0 = heuristic only, 1 = learned only).
     """
-    scores: List[float] = []
+    # Always compute heuristic scores
+    heuristic_scores: List[float] = []
     with state._patched_status(), state._patched_boosts():
         for kind, obj in actions:
             if kind == "move":
-                scores.append(float(state.score_move_fn(obj, state.battle, state.ctx_me)))
+                heuristic_scores.append(float(state.score_move_fn(obj, state.battle, state.ctx_me)))
             else:
-                scores.append(float(state.score_switch_fn(obj, state.battle, state.ctx_me)))
+                heuristic_scores.append(float(state.score_switch_fn(obj, state.battle, state.ctx_me)))
 
-    probs = softmax(scores, tau=12.0)
+    heuristic_probs = softmax(heuristic_scores, tau=12.0)
+
+    using_policy = policy_model is not None and eval_terms is not None
+    if using_policy:
+        # Compute learned logits with action-specific features + heuristic scores
+        base_actions = [(a[0], a[1]) for a in actions]
+        try:
+            learned_logits = policy_model.score_actions(
+                eval_terms, base_actions, battle=battle, ctx_me=ctx_me,
+                heuristic_scores=heuristic_scores,
+            )
+        except Exception:
+            learned_logits = [0.0] * len(actions)
+        learned_probs = softmax(learned_logits, tau=1.0)
+
+        # α-mix: blend heuristic and learned distributions
+        alpha = float(policy_alpha)
+        mixed = [(1.0 - alpha) * h + alpha * l
+                 for h, l in zip(heuristic_probs, learned_probs)]
+        total = sum(mixed) or 1.0
+        probs = [m / total for m in mixed]
+    else:
+        probs = heuristic_probs
 
     priors: Dict[Action, float] = {}
     for a, p in zip(actions, probs):
         kind = a[0]
         if kind == "switch" or kind == "switch_unknown":
-            priors[a] = float(p) * switch_prior_boost
+            if not using_policy:
+                priors[a] = float(p) * switch_prior_boost
+            else:
+                priors[a] = float(p)
         else:
             priors[a] = float(p)
     total = sum(priors.values())
@@ -188,21 +231,24 @@ def select_child(node: Node, c_puct: float) -> Tuple[Action, Node]:
                 best_child = child
         else:
             # Multiple outcomes (hybrid) - use EXPECTED Q across branches
-            # Calculate expected Q weighted by outcome probabilities
-            total_prior = sum(child.prior for _, child in action_children)
-            
+            # total_prior (from base_priors) is used for the exploration scale.
+            # sum_branch_prior is used for weighting — keeps the two concepts separate.
+            total_prior = node.base_priors.get(
+                base_action, sum(child.prior for _, child in action_children)
+            )
+            sum_branch_prior = sum(child.prior for _, child in action_children)
+
             if total_prior > 0:
-                # Expected Q = sum(probability * Q) for each outcome
+                # Expected Q = sum(weight * Q) for each visited outcome branch
                 expected_q = 0.0
                 total_n = 0
-                
+
                 for a, child in action_children:
                     if child.N > 0:
-                        # Weight by probability (stored in prior)
-                        probability = child.prior / total_prior
-                        expected_q += probability * child.Q
+                        weight = child.prior / sum_branch_prior if sum_branch_prior > 0 else 1.0 / len(action_children)
+                        expected_q += weight * child.Q
                         total_n += child.N
-                
+
                 # Use total visits across all branches for exploration term
                 if total_n > 0:
                     u = expected_q + c_puct * total_prior * (sqrt_N / (1 + total_n))
@@ -216,7 +262,7 @@ def select_child(node: Node, c_puct: float) -> Tuple[Action, Node]:
                     # to its probability share
                     best_deficit = -1e18
                     for a, child in action_children:
-                        target_frac = child.prior / total_prior if total_prior > 0 else 1.0 / len(action_children)
+                        target_frac = child.prior / sum_branch_prior if sum_branch_prior > 0 else 1.0 / len(action_children)
                         actual_frac = child.N / total_n if total_n > 0 else 0.0
                         deficit = target_frac - actual_frac
                         if deficit > best_deficit:
@@ -346,14 +392,32 @@ def create_move_branches(
         next_state = state_temp.step(("move", move), rng=rng_miss)
         branches.append((p_miss, next_state, "miss"))
 
+    # Renormalize so kept-branch probs sum to 1.0.
+    # Pruning by min_branch_probability can leave a probability mass < 1, which
+    # would make branch_prior * prob < base_prior and distort PUCT + expected-Q.
+    if branches:
+        total_p = sum(prob for prob, _, _ in branches)
+        if total_p > 0.0 and abs(total_p - 1.0) > 1e-9:
+            branches = [(prob / total_p, s, lbl) for prob, s, lbl in branches]
+
     return branches
 
 
-def expand(node: Node, rng: random.Random, cfg: MCTSConfig, is_root: bool) -> None:
+def expand(
+    node: Node,
+    rng: random.Random,
+    cfg: MCTSConfig,
+    is_root: bool,
+    eval_terms: Optional[Dict[str, float]] = None,
+    policy_model: Optional[Any] = None,
+    battle: Optional[Any] = None,
+    ctx_me: Optional[Any] = None,
+) -> None:
     """
     Expansion with hybrid approach:
     - Critical moves create multiple outcome branches
     - Routine moves use single-sample expansion
+    eval_terms + policy_model: passed through only at the root node.
     """
     if node.state.is_terminal():
         return
@@ -366,6 +430,11 @@ def expand(node: Node, rng: random.Random, cfg: MCTSConfig, is_root: bool) -> No
         node.state, actions,
         switch_prior_boost=cfg.switch_prior_boost,
         prior_ceiling=cfg.prior_ceiling,
+        eval_terms=eval_terms if (is_root and eval_terms) else None,
+        policy_model=policy_model if (is_root and eval_terms) else None,
+        policy_alpha=cfg.policy_alpha,
+        battle=battle if is_root else None,
+        ctx_me=ctx_me if is_root else None,
     )
     if is_root:
         priors = add_dirichlet_noise(priors, cfg.dirichlet_alpha, cfg.dirichlet_eps, rng)
@@ -388,9 +457,10 @@ def expand(node: Node, rng: random.Random, cfg: MCTSConfig, is_root: bool) -> No
         if cfg.use_hybrid_expansion and kind == "move" and should_branch_move(obj, node.state, cfg):
             # CRITICAL MOVE: Create multiple outcome branches
             branches = create_move_branches(node.state, obj, cfg, rng)
-            
+
             base_prior = priors.get(a, 1.0 / len(actions))
-            
+            node.base_priors[(kind, obj)] = base_prior  # explicit 2-tuple; rows-building uses same key
+
             for prob, next_state, outcome_label in branches:
                 # Create unique action key: (kind, obj, outcome_label)
                 branch_action = (kind, obj, outcome_label)
@@ -413,10 +483,18 @@ def expand(node: Node, rng: random.Random, cfg: MCTSConfig, is_root: bool) -> No
             )
 
 
-def evaluate_leaf(node: Node) -> float:
+def evaluate_leaf(node: Node, cfg: Optional["MCTSConfig"] = None) -> float:
     """
     Leaf evaluation from OUR perspective, bounded ~[-1,1].
+    If cfg.value_model is set, use the learned value function instead of the heuristic.
     """
+    if cfg is not None and cfg.value_model is not None:
+        try:
+            _, terms = evaluate_state_terms(node.state)
+            if terms:
+                return cfg.value_model.predict_value(terms)
+        except Exception:
+            pass  # fall through to heuristic
     return float(evaluate_state(node.state))
 
 
@@ -440,15 +518,15 @@ def get_action_expected_q(node: Node, base_action: Tuple) -> Tuple[float, int]:
         child = matching_children[0]
         return child.Q, child.N
     
-    # Multiple outcomes - compute expected value
-    total_prior = sum(child.prior for child in matching_children)
+    # Multiple outcomes - compute expected value weighted by branch priors.
+    sum_branch_prior = sum(child.prior for child in matching_children)
     total_visits = sum(child.N for child in matching_children)
-    
-    if total_prior <= 0 or total_visits == 0:
+
+    if sum_branch_prior <= 0 or total_visits == 0:
         return 0.0, total_visits
-    
+
     expected_q = sum(
-        (child.prior / total_prior) * child.Q 
+        (child.prior / sum_branch_prior) * child.Q
         for child in matching_children
         if child.N > 0
     )
@@ -498,12 +576,14 @@ def search(
     return_tree: bool = False,
     opp_beliefs: Optional[Dict[int, Any]] = None,
     opp_move_pools: Optional[Dict[int, Dict[str, Any]]] = None,
+    policy_model: Optional[Any] = None,
 ) -> Union[Action, Tuple[Action, Dict[str, Any]]]:
     """
     Runs PUCT MCTS and returns best root action.
     If return_stats=True, also returns a dict with root child visits/Q/prior.
 
     allow_switches=False => only expands root with moves (still allows pivot-triggered switches inside rollouts).
+    policy_model: if provided, used to compute learned priors at the root node.
     """
     master_rng = random.Random(cfg.seed)
 
@@ -525,9 +605,31 @@ def search(
         opp_move_pools=opp_move_pools,
     )
     root = Node(root_state, parent=None, prior=1.0)
+    root_n_legal = len(root_state.legal_actions())
+
+    # Always compute eval_terms at root (used for data collection and learned prior)
+    root_eval_terms: Optional[Dict[str, float]] = None
+    root_eval_value: float = 0.0
+    try:
+        root_eval_value, root_eval_terms = evaluate_state_terms(root_state)
+        # Force-switch fallback: active is fainted → early return gives no terms.
+        # Proxy with the healthiest bench pokemon so state features are meaningful.
+        if not root_eval_terms:
+            best_bench = max(
+                (p for p in root_state.my_team if p is not root_state.my_active),
+                key=lambda p: root_state.my_hp.get(id(p), 0.0),
+                default=None,
+            )
+            if best_bench is not None:
+                proxy = _dc_replace(root_state, my_active=best_bench)
+                root_eval_value, root_eval_terms = evaluate_state_terms(proxy)
+    except Exception:
+        root_eval_terms = None
 
     # Expand root once (using master_rng so it's reproducible)
-    expand(root, master_rng, cfg, is_root=True)
+    expand(root, master_rng, cfg, is_root=True,
+           eval_terms=root_eval_terms, policy_model=policy_model,
+           battle=battle, ctx_me=ctx_me)
 
     if not allow_switches and root.children:
         root.children = {a: n for a, n in root.children.items() if a[0] == "move"}
@@ -560,7 +662,7 @@ def search(
             expand(node, sim_rng, cfg, is_root=False)
 
         # Evaluation
-        value = evaluate_leaf(node)
+        value = evaluate_leaf(node, cfg)
 
         # Backup
         backup(node, value)
@@ -577,53 +679,93 @@ def search(
     rows: List[Dict[str, Any]] = []
     for base_action, action_list in base_action_map.items():
         if len(action_list) == 1:
-            # Single outcome - use directly
             a = action_list[0]
             child = root.children[a]
             kind, name = action_name(a)
             rows.append({
-                "kind": kind,
-                "name": name,
-                "visits": int(child.N),
-                "q": float(child.Q),
-                "prior": float(child.prior),
-                "action": a,  # Store for picking
+                "kind":      kind,
+                "name":      name,
+                "visits":    int(child.N),
+                "q":         float(child.Q),
+                "prior":     float(child.prior),
+                "is_hybrid": False,
+                "action":    a,
             })
         else:
-            # Multiple outcomes (hybrid) - compute expected Q
+            # Multiple outcomes (hybrid) - compute expected Q across branches
             expected_q, total_visits = get_action_expected_q(root, base_action)
-            total_prior = sum(root.children[a].prior for a in action_list)
-            
-            # Use the base action name (without outcome label)
+            # Use the stashed base_prior (pre-split); fall back to branch sum if unavailable
+            prior = root.base_priors.get(base_action,
+                        sum(root.children[a].prior for a in action_list))
             kind = base_action[0]
             obj = base_action[1]
             if kind == "move":
                 name = str(getattr(obj, "id", "") or getattr(obj, "name", "") or "move")
             else:
                 name = str(getattr(obj, "species", "") or getattr(obj, "name", "") or "switch")
-            
-            # Pick most-visited branch as representative
             best_branch = max(action_list, key=lambda a: root.children[a].N)
-            
             rows.append({
-                "kind": kind,
-                "name": name + " [expected]",  # Mark as expected value
-                "visits": int(total_visits),
-                "q": float(expected_q),
-                "prior": float(total_prior),
-                "action": best_branch,  # Store for picking
+                "kind":      kind,
+                "name":      name,
+                "visits":    int(total_visits),
+                "q":         float(expected_q),
+                "prior":     float(prior),
+                "is_hybrid": True,
+                "action":    best_branch,
             })
     
-    rows.sort(key=lambda d: (d["visits"], d["q"]), reverse=True)
+    rows.sort(key=lambda d: (d["q"], d["visits"]), reverse=True)
 
-    # Pick best action from root children (based on total visits for hybrid actions)
+    # Compute raw (pre-ceiling) priors for root actions — only for logging.
+    # Call action_priors again with prior_ceiling=1.0 so we can compare to
+    # what the heuristic/model actually wanted vs what the cap allowed.
+    root_base_actions = list(base_action_map.keys())
+    if root_base_actions:
+        try:
+            raw_prior_map = action_priors(
+                root_state, root_base_actions,
+                switch_prior_boost=cfg.switch_prior_boost,
+                prior_ceiling=1.0,  # no cap
+                eval_terms=root_eval_terms if root_eval_terms else None,
+                policy_model=policy_model,
+                policy_alpha=cfg.policy_alpha,
+                battle=root_state.battle,
+                ctx_me=root_state.ctx_me,
+            )
+        except Exception:
+            raw_prior_map = {}
+    else:
+        raw_prior_map = {}
+
+    for row in rows:
+        base_a = (row["action"][0], row["action"][1])
+        row["prior_raw"] = round(float(raw_prior_map.get(base_a, row["prior"])), 4)
+
+    # Search diagnostics
+    all_child_visits = [root.children[a].N for a in root.children]
+    root_visits_total = sum(all_child_visits) or 1
+    max_visits = max(all_child_visits) if all_child_visits else 0
+    q_values = [row["q"] for row in rows if row["visits"] > 0]
+    search_info = {
+        "root_visits_total": root_visits_total,
+        "max_visits_frac":   round(max_visits / root_visits_total, 4),
+        "q_range":           round(max(q_values) - min(q_values), 4) if len(q_values) >= 2 else 0.0,
+        "n_actions":         len(base_action_map),
+        "n_actions_legal":   root_n_legal,
+        "using_policy":      bool(policy_model is not None and root_eval_terms),
+    }
+
+    # Pick best action from root children (max-Q policy).
+    # Max-Q is preferred over max-N because visit counts can be hijacked by
+    # a large heuristic prior even when the search found a better Q elsewhere.
+    # Guard: require at least 1 visit so we never pick an unvisited child.
     if cfg.temperature and cfg.temperature > 1e-9:
-        # Temperature-based selection
+        # Temperature-based selection (still over visits — exploration phase)
         base_action_visits = {}
         for base_action, action_list in base_action_map.items():
             total_visits = sum(root.children[a].N for a in action_list)
             base_action_visits[base_action] = total_visits
-        
+
         actions_for_temp = list(base_action_visits.keys())
         visits = list(base_action_visits.values())
         m = max(visits)
@@ -637,17 +779,31 @@ def search(
             if acc >= r:
                 picked_base = ba
                 break
-        
-        # Pick most-visited branch of this base action
-        picked = max(base_action_map[picked_base], key=lambda a: root.children[a].N)
-    else:
-        # Argmax visits across all base actions
-        best_base_action = max(base_action_map.keys(), 
-                              key=lambda ba: sum(root.children[a].N for a in base_action_map[ba]))
-        # Pick most-visited branch
-        picked = max(base_action_map[best_base_action], key=lambda a: root.children[a].N)
 
-    payload = {"top": rows, "sims": int(cfg.num_simulations)}
+        # Within the chosen base action, pick highest-Q visited branch
+        visited = [a for a in base_action_map[picked_base] if root.children[a].N > 0]
+        pool = visited if visited else base_action_map[picked_base]
+        picked = max(pool, key=lambda a: root.children[a].Q)
+    else:
+        # Argmax expected-Q across all base actions (visited children only)
+        def _base_q(ba):
+            q, n = get_action_expected_q(root, ba)
+            return q if n > 0 else -1e9
+
+        best_base_action = max(base_action_map.keys(), key=_base_q)
+        # Within the best base action, pick highest-Q visited branch
+        visited = [a for a in base_action_map[best_base_action] if root.children[a].N > 0]
+        pool = visited if visited else base_action_map[best_base_action]
+        picked = max(pool, key=lambda a: root.children[a].Q)
+
+    payload = {
+        "top": rows,
+        "sims": int(cfg.num_simulations),
+        "root_state": root_state,
+        "eval_terms": root_eval_terms or {},
+        "eval_value": root_eval_value,
+        "search_info": search_info,
+    }
 
     if return_tree:
         payload["root"] = root
@@ -677,8 +833,11 @@ def mcts_pick_action(
     crit_multiplier: float = 1.5,
     opp_beliefs: Optional[Dict[int, Any]] = None,
     opp_move_pools: Optional[Dict[int, Dict[str, Any]]] = None,
+    policy_model: Optional[Any] = None,
+    policy_alpha: float = 0.3,
+    value_model: Optional[Any] = None,
 ) -> Tuple[Optional[Action], Optional[Dict[str, Any]]]:
-    
+
     cfg = MCTSConfig(
         num_simulations=int(iters),
         max_depth=int(max_depth),
@@ -691,6 +850,8 @@ def mcts_pick_action(
         model_crit=model_crit,
         crit_chance=crit_chance,
         crit_multiplier=crit_multiplier,
+        policy_alpha=float(policy_alpha),
+        value_model=value_model,
     )
 
     picked, stats = search(
@@ -707,6 +868,7 @@ def mcts_pick_action(
         return_stats=True,
         opp_beliefs=opp_beliefs,
         opp_move_pools=opp_move_pools,
+        policy_model=policy_model,
     )
     return picked, stats
 

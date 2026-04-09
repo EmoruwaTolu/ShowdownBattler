@@ -998,9 +998,11 @@ class ShadowState:
                 actions.append(("switch", p))
             return actions or [("move", None)]
 
-        # Moves (turn-0 can use battle.available_moves if present, else fall back)
-        if self.ply == 0 and getattr(self.battle, "available_moves", None):
-            for m in self.battle.available_moves:
+        # Moves: at ply 0 use exactly what the server reports as available.
+        # An empty list means a forced-switch request — add no moves.
+        # At ply > 0 we don't have a live request so fall back to the full moveset.
+        if self.ply == 0:
+            for m in (getattr(self.battle, "available_moves", None) or []):
                 actions.append(("move", m))
         else:
             for m in (getattr(self.my_active, "moves", None) or {}).values():

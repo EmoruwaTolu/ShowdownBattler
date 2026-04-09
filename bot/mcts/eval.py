@@ -390,6 +390,448 @@ def evaluate_threat_coverage(state: Any, top_threats: list) -> float:
     return max(-0.25, min(0.10, score))
 
 
+def compute_active_matchup(state: Any) -> float:
+    """
+    Broad measure of the current active-vs-active position in [-1, 1].
+    Combines HP differential, type advantage, and whether we can trade favorably.
+    Positive = we're in a better spot.
+    """
+    try:
+        me = getattr(state, "my_active", None)
+        opp = getattr(state, "opp_active", None)
+        if me is None or opp is None:
+            return 0.0
+
+        my_hp = float((getattr(state, "my_hp", {}) or {}).get(id(me), 0.0))
+        opp_hp = float((getattr(state, "opp_hp", {}) or {}).get(id(opp), 0.0))
+
+        # HP differential component
+        hp_diff = _tanh01((my_hp - opp_hp) / 0.5)
+
+        # Type advantage: best offensive multiplier we can get vs opp
+        my_types = _safe_mon_types(me)
+        opp_types = _safe_mon_types(opp)
+        best_our_mult = 1.0
+        best_opp_mult = 1.0
+        if _TYPE_CHART and my_types and opp_types:
+            for mt in my_types:
+                mult = 1.0
+                for ot in opp_types:
+                    mult *= float(PokemonType.damage_multiplier(mt, ot, type_chart=_TYPE_CHART))
+                if mult > best_our_mult:
+                    best_our_mult = mult
+            for ot in opp_types:
+                mult = 1.0
+                for mt in my_types:
+                    mult *= float(PokemonType.damage_multiplier(ot, mt, type_chart=_TYPE_CHART))
+                if mult > best_opp_mult:
+                    best_opp_mult = mult
+        type_adv = _tanh01((best_our_mult - best_opp_mult) / 2.0)
+
+        # Status burden on active — burn/par on us hurts matchup
+        my_status = (getattr(state, "my_status", {}) or {}).get(id(me))
+        opp_status = (getattr(state, "opp_status", {}) or {}).get(id(opp))
+        status_delta = 0.0
+        if my_status in (Status.BRN, Status.PAR):
+            status_delta -= 0.15
+        if opp_status in (Status.BRN, Status.PAR, Status.PSN, Status.TOX):
+            status_delta += 0.10
+
+        return max(-1.0, min(1.0, 0.5 * hp_diff + 0.3 * type_adv + status_delta))
+    except Exception:
+        return 0.0
+
+
+def compute_speed_control(state: Any) -> float:
+    """
+    Who controls move order, accounting for boosts, status, and items.
+    Returns a value in [-1, 1]: positive = we move first in most lines.
+    Uses _effective_speed if available, otherwise falls back to base speed.
+    """
+    try:
+        me = getattr(state, "my_active", None)
+        opp = getattr(state, "opp_active", None)
+        if me is None or opp is None:
+            return 0.0
+
+        # Use _effective_speed if it's callable on the state
+        _eff = getattr(state, "_effective_speed", None)
+        if _eff is not None and callable(_eff):
+            my_speed = float(_eff(me, "me"))
+            opp_speed = float(_eff(opp, "opp"))
+        else:
+            my_speed = float((getattr(me, "stats", None) or {}).get("spe", 100) or 100)
+            opp_speed = float((getattr(opp, "stats", None) or {}).get("spe", 100) or 100)
+
+        if opp_speed <= 0:
+            return 1.0
+        speed_ratio = my_speed / opp_speed
+        # Invert under Trick Room
+        fields = getattr(state, "shadow_fields", {}) or {}
+        if Field.TRICK_ROOM in fields:
+            speed_ratio = 1.0 / speed_ratio if speed_ratio > 0 else 1.0
+
+        return max(-1.0, min(1.0, _tanh01((speed_ratio - 1.0) / 0.5)))
+    except Exception:
+        return 0.0
+
+
+def _alive_ids(hp_map: dict[int, float]) -> list[int]:
+    return [pid for pid, hp in (hp_map or {}).items() if float(hp) > 0.0]
+
+
+def compute_hp_advantage(state: Any, alpha: float = 1.5) -> float:
+    """
+    Usable team HP advantage in [-1, 1].
+    Uses sum(hp^alpha) over alive mons on each side, then tanh.
+    """
+    try:
+        my_hp = getattr(state, "my_hp", {}) or {}
+        opp_hp = getattr(state, "opp_hp", {}) or {}
+        my_score = sum(float(hp) ** float(alpha) for hp in my_hp.values() if float(hp) > 0.0)
+        opp_score = sum(float(hp) ** float(alpha) for hp in opp_hp.values() if float(hp) > 0.0)
+        # Important for hidden-info formats: treat unseen opponent mons as alive at full HP.
+        opp_unseen = int(getattr(state, "opp_unseen", 0) or 0)
+        if opp_unseen > 0:
+            opp_score += float(opp_unseen) * (1.0 ** float(alpha))
+        return float(max(-1.0, min(1.0, math.tanh(0.8 * (my_score - opp_score)))))
+    except Exception:
+        return 0.0
+
+
+def compute_alive_advantage(state: Any) -> float:
+    """Alive-count advantage in [-1, 1]."""
+    try:
+        my_hp = getattr(state, "my_hp", {}) or {}
+        opp_hp = getattr(state, "opp_hp", {}) or {}
+        a_me = sum(1 for hp in my_hp.values() if float(hp) > 0.0)
+        a_opp = sum(1 for hp in opp_hp.values() if float(hp) > 0.0)
+        # Treat unseen opponent mons as alive to avoid early-game bias.
+        a_opp += max(0, int(getattr(state, "opp_unseen", 0) or 0))
+        return float(max(-1.0, min(1.0, math.tanh(0.9 * float(a_me - a_opp)))))
+    except Exception:
+        return 0.0
+
+
+def compute_status_burden(state: Any) -> float:
+    """
+    Status burden differential in [-1, 1].
+    Positive means opponent is more status-crippled than we are.
+    """
+    try:
+        # Simple v1 weights (role-aware refinements can come later).
+        W = {
+            Status.BRN: 0.85,
+            Status.PSN: 0.45,
+            Status.TOX: 0.75,
+            Status.PAR: 0.65,
+            Status.SLP: 1.00,
+            Status.FRZ: 1.00,
+        }
+        my_hp = getattr(state, "my_hp", {}) or {}
+        opp_hp = getattr(state, "opp_hp", {}) or {}
+        my_status = getattr(state, "my_status", {}) or {}
+        opp_status = getattr(state, "opp_status", {}) or {}
+
+        my_cost = 0.0
+        for pid, hp in my_hp.items():
+            if float(hp) <= 0.0:
+                continue
+            st = my_status.get(pid)
+            my_cost += float(W.get(st, 0.0))
+
+        opp_cost = 0.0
+        for pid, hp in opp_hp.items():
+            if float(hp) <= 0.0:
+                continue
+            st = opp_status.get(pid)
+            opp_cost += float(W.get(st, 0.0))
+
+        return float(max(-1.0, min(1.0, math.tanh(0.8 * (opp_cost - my_cost)))))
+    except Exception:
+        return 0.0
+
+
+def compute_hazard_burden(state: Any) -> float:
+    """
+    Expected switching tax differential in [-1, 1].
+    Positive means opponent is more punished by hazards than we are.
+    """
+    try:
+        my_sc = getattr(state, "my_side_conditions", {}) or {}
+        opp_sc = getattr(state, "opp_side_conditions", {}) or {}
+        opp_boots = avg_boots_prob_alive(state, "opp")
+        my_boots = my_boots_frac_alive(state)
+        opp_tax = compute_switch_tax(opp_sc, boots_prob=opp_boots)
+        my_tax = compute_switch_tax(my_sc, boots_prob=my_boots)
+        return float(max(-1.0, min(1.0, math.tanh(1.2 * (opp_tax - my_tax)))))
+    except Exception:
+        return 0.0
+
+
+def _boost_value(stages: dict) -> float:
+    """
+    Convert stat stages to a scalar.
+    Drops hurt slightly more than boosts (asymmetric slope).
+    """
+    if not stages:
+        return 0.0
+    total = 0.0
+    for k in ("atk", "spa", "spe", "def", "spd"):
+        s = int(stages.get(k, 0) or 0)
+        if s >= 0:
+            total += 0.5 * float(s)
+        else:
+            total += 0.7 * float(s)
+    return float(total)
+
+
+def compute_boost_advantage(state: Any) -> float:
+    """Active-boost advantage in [-1, 1]."""
+    try:
+        me = getattr(state, "my_active", None)
+        opp = getattr(state, "opp_active", None)
+        if me is None or opp is None:
+            return 0.0
+        my_boosts = (getattr(state, "my_boosts", {}) or {}).get(id(me), {}) or {}
+        opp_boosts = (getattr(state, "opp_boosts", {}) or {}).get(id(opp), {}) or {}
+        diff = _boost_value(my_boosts) - _boost_value(opp_boosts)
+        return float(max(-1.0, min(1.0, math.tanh(0.6 * diff))))
+    except Exception:
+        return 0.0
+
+
+def compute_wincon_readiness(state: Any, alpha: float = 1.5) -> float:
+    """
+    v1 approximation: compare best remaining "healthy mon" on each side.
+    Uses max(hp^alpha) over alive mons, then tanh.
+    """
+    try:
+        my_hp = getattr(state, "my_hp", {}) or {}
+        opp_hp = getattr(state, "opp_hp", {}) or {}
+        my_best = 0.0
+        for hp in my_hp.values():
+            hp = float(hp)
+            if hp > 0.0:
+                my_best = max(my_best, hp ** float(alpha))
+        opp_best = 0.0
+        for hp in opp_hp.values():
+            hp = float(hp)
+            if hp > 0.0:
+                opp_best = max(opp_best, hp ** float(alpha))
+        # Hidden-info formats: opponent may have unseen healthy mons.
+        opp_unseen = int(getattr(state, "opp_unseen", 0) or 0)
+        if opp_unseen > 0:
+            opp_best = max(opp_best, 1.0 ** float(alpha))
+        return float(max(-1.0, min(1.0, math.tanh(1.3 * (my_best - opp_best)))))
+    except Exception:
+        return 0.0
+
+
+def compute_defensive_cover(state: Any) -> float:
+    """
+    Bench coverage vs top opponent threats in [-1, 1].
+    Reuses evaluate_threat_coverage (already belief-aware) and expands its dynamic range.
+    """
+    try:
+        top_threats = compute_top_threats(state, k=2)
+        cover = float(evaluate_threat_coverage(state, top_threats))  # typically ~[-0.25, +0.10]
+        return float(max(-1.0, min(1.0, math.tanh(3.0 * cover))))
+    except Exception:
+        return 0.0
+
+
+def compute_switch_safety(state: Any) -> float:
+    """
+    How safe our exit options are. Distinct from switch_term (which scores switch quality).
+    Measures expected cost of switching: hazard tax + type disadvantage of switch-in vs opp.
+    Returns value in [-1, 1]: positive = safe exits available, negative = trapped/punished.
+    """
+    try:
+        my_sc = getattr(state, "my_side_conditions", {}) or {}
+        opp = getattr(state, "opp_active", None)
+        my_team = getattr(state, "my_team", []) or []
+        my_active = getattr(state, "my_active", None)
+        my_hp_map = getattr(state, "my_hp", {}) or {}
+
+        hazard_cost = 0.0
+        try:
+            norm_sc = {}
+            for k, v in my_sc.items():
+                key = getattr(k, "name", str(k)).lower().replace("_", "").replace(" ", "")
+                norm_sc[key] = int(v) if isinstance(v, int) else 1
+            # Respect Heavy-Duty Boots on our side when estimating switch punishment.
+            my_boots = my_boots_frac_alive(state)
+            hazard_cost = float(compute_switch_tax(norm_sc, boots_prob=my_boots))
+        except Exception:
+            pass
+
+        # Best available switch-in type safety vs current opponent
+        best_type_safety = -1.0
+        for p in my_team:
+            if p is my_active:
+                continue
+            if float(my_hp_map.get(id(p), 0.0)) <= 0.0:
+                continue
+            if opp is not None and _TYPE_CHART:
+                opp_types = _safe_mon_types(opp)
+                sw_types = _safe_mon_types(p)
+                if opp_types and sw_types:
+                    best_mult = max(
+                        (PokemonType.damage_multiplier(ot, st, type_chart=_TYPE_CHART)
+                         for ot in opp_types for st in sw_types),
+                        default=1.0
+                    )
+                    safety = _tanh01((1.5 - float(best_mult)) / 1.0)
+                    if safety > best_type_safety:
+                        best_type_safety = safety
+            else:
+                best_type_safety = max(best_type_safety, 0.5)
+
+        if best_type_safety < -0.5:
+            best_type_safety = 0.0  # no viable switch found
+
+        return max(-1.0, min(1.0, best_type_safety - hazard_cost))
+    except Exception:
+        return 0.0
+
+
+def compute_hidden_speed_risk(state: Any) -> float:
+    """
+    Probability that the opponent's active is actually faster than our current speed estimate.
+    Drawn from belief distribution over speed_mult.
+    Returns [0, 1]: 0 = no risk, 1 = very likely they outspeed us.
+    """
+    try:
+        opp = getattr(state, "opp_active", None)
+        if opp is None:
+            return 0.5  # maximum uncertainty when no info
+
+        beliefs = getattr(state, "opp_beliefs", {}) or {}
+        belief = beliefs.get(id(opp))
+        if belief is None or not getattr(belief, "dist", None):
+            return 0.5
+
+        # Estimate P(opp moves first) under candidate speed multipliers.
+        me = getattr(state, "my_active", None)
+        if me is None:
+            return 0.5
+
+        _eff = getattr(state, "_effective_speed", None)
+        if _eff is not None and callable(_eff):
+            my_speed = float(_eff(me, "me"))
+            opp_speed_base = float(_eff(opp, "opp"))
+        else:
+            my_speed = float((getattr(me, "stats", None) or {}).get("spe", 100) or 100)
+            opp_speed_base = float((getattr(opp, "stats", None) or {}).get("spe", 100) or 100)
+
+        if my_speed <= 0.0 or opp_speed_base <= 0.0:
+            return 0.5
+
+        fields = getattr(state, "shadow_fields", {}) or {}
+        trick_room = Field.TRICK_ROOM in fields
+
+        p_opp_first = 0.0
+        total_p = 0.0
+        for cand, prob in belief.dist:
+            pr = float(prob)
+            if pr <= 1e-9:
+                continue
+            sm = float(getattr(cand, "speed_mult", 1.0) or 1.0)
+            opp_speed = opp_speed_base * sm
+            # Under Trick Room, the slower mon moves first (within priority bracket).
+            if trick_room:
+                opp_first = opp_speed < my_speed
+            else:
+                opp_first = opp_speed > my_speed
+            p_opp_first += pr * (1.0 if opp_first else 0.0)
+            total_p += pr
+
+        if total_p <= 1e-9:
+            return 0.5
+        return max(0.0, min(1.0, p_opp_first / total_p))
+    except Exception:
+        return 0.0
+
+
+def _entropy01_from_dist(dist: Any) -> float:
+    """
+    Normalized Shannon entropy in [0, 1] for a belief.dist list of (cand, p).
+    Uses natural logs and normalizes by log(K).
+    """
+    try:
+        if not dist:
+            return 0.0
+        ps = [max(0.0, float(p)) for _, p in dist]
+        z = sum(ps)
+        if z <= 1e-12:
+            return 0.0
+        ps = [p / z for p in ps]
+        k = len(ps)
+        if k <= 1:
+            return 0.0
+        h = 0.0
+        for p in ps:
+            if p > 1e-12:
+                h -= p * math.log(p)
+        return float(max(0.0, min(1.0, h / max(1e-12, math.log(k)))))
+    except Exception:
+        return 0.0
+
+
+def compute_belief_entropy(state: Any) -> float:
+    """
+    Mean normalized entropy of opponent set beliefs in [0, 1].
+    0 = essentially known, 1 = highly ambiguous.
+    """
+    try:
+        beliefs = getattr(state, "opp_beliefs", {}) or {}
+        opp_team = getattr(state, "opp_team", []) or []
+        opp_hp = getattr(state, "opp_hp", {}) or {}
+
+        ents = []
+        for p in opp_team:
+            if float(opp_hp.get(id(p), 0.0)) <= 0.0:
+                continue
+            b = beliefs.get(id(p))
+            dist = getattr(b, "dist", None) if b is not None else None
+            if not dist:
+                # Conservative: if we have an alive revealed mon but no belief, treat as high uncertainty.
+                ents.append(1.0)
+            else:
+                ents.append(_entropy01_from_dist(dist))
+        if not ents:
+            return 0.0
+        return float(sum(ents) / len(ents))
+    except Exception:
+        return 0.0
+
+
+def compute_belief_weighted_threat(state: Any, threat_norm: float = 2.4) -> float:
+    """
+    Belief-weighted opponent threat pressure in [0, 1].
+    Uses the same per-mon threat proxy used elsewhere in eval.py.
+    """
+    try:
+        beliefs = getattr(state, "opp_beliefs", {}) or {}
+        opp_team = getattr(state, "opp_team", []) or []
+        opp_hp = getattr(state, "opp_hp", {}) or {}
+        opp_status = getattr(state, "opp_status", {}) or {}
+
+        total = 0.0
+        for p in opp_team:
+            hp = float(opp_hp.get(id(p), 0.0))
+            if hp <= 0.0:
+                continue
+            b = beliefs.get(id(p))
+            st = opp_status.get(id(p))
+            total += float(_per_mon_threat_score(b, hp, st))
+
+        return float(max(0.0, min(1.0, total / max(1e-9, float(threat_norm)))))
+    except Exception:
+        return 0.0
+
+
 def compute_setup_too_early_penalty(boost_term: float, uncertainty: float, opp_unseen: int) -> float:
     """
     Penalize relying on boosts when opponent is unknown (randbats counters / ditto risk).
@@ -1287,50 +1729,52 @@ def evaluate_state(state: Any, _return_terms: bool = False):
         base += 0.35 * bench_qual
         return _ret(base)
 
-    # Endgame detection
+    # Endgame detection — skip shortcuts when collecting terms so the full
+    # term breakdown is always computed (used by data collection & learned prior).
     my_alive_count = sum(1 for v in state.my_hp.values() if v > 0)
     opp_alive_count = sum(1 for v in state.opp_hp.values() if v > 0)
 
-    if my_alive_count == 1 and opp_alive_count == 1:
-        endgame_value = 0.0
-        hp_diff = my_active_hp - opp_active_hp
-        endgame_value += _tanh01(hp_diff / 0.4)
+    if not _return_terms:
+        if my_alive_count == 1 and opp_alive_count == 1:
+            endgame_value = 0.0
+            hp_diff = my_active_hp - opp_active_hp
+            endgame_value += _tanh01(hp_diff / 0.4)
 
-        if has_priority_move_perfect(state.my_active) and not has_priority_move_perfect(state.opp_active):
-            endgame_value += 0.10
-        elif has_priority_move_perfect(state.opp_active) and not has_priority_move_perfect(state.my_active):
-            endgame_value -= 0.10
+            if has_priority_move_perfect(state.my_active) and not has_priority_move_perfect(state.opp_active):
+                endgame_value += 0.10
+            elif has_priority_move_perfect(state.opp_active) and not has_priority_move_perfect(state.my_active):
+                endgame_value -= 0.10
 
-        my_status_eg = state.my_status.get(id(state.my_active))
-        opp_status_eg = state.opp_status.get(id(state.opp_active))
-        if my_status_eg in (Status.PSN, Status.TOX) and opp_status_eg not in (Status.PSN, Status.TOX):
-            endgame_value -= 0.12
-        elif opp_status_eg in (Status.PSN, Status.TOX) and my_status_eg not in (Status.PSN, Status.TOX):
-            endgame_value += 0.12
+            my_status_eg = state.my_status.get(id(state.my_active))
+            opp_status_eg = state.opp_status.get(id(state.opp_active))
+            if my_status_eg in (Status.PSN, Status.TOX) and opp_status_eg not in (Status.PSN, Status.TOX):
+                endgame_value -= 0.12
+            elif opp_status_eg in (Status.PSN, Status.TOX) and my_status_eg not in (Status.PSN, Status.TOX):
+                endgame_value += 0.12
 
-        return _ret(endgame_value)
+            return _ret(endgame_value)
 
-    elif my_alive_count == 1 and opp_alive_count >= 2:
-        my_boosts_eg = state.my_boosts.get(id(state.my_active), {})
-        max_boost = max((v for v in my_boosts_eg.values() if v > 0), default=0)
+        elif my_alive_count == 1 and opp_alive_count >= 2:
+            my_boosts_eg = state.my_boosts.get(id(state.my_active), {})
+            max_boost = max((v for v in my_boosts_eg.values() if v > 0), default=0)
 
-        if has_setup_potential_perfect(state.my_active) and my_active_hp > 0.7 and max_boost < 2:
-            return _ret(-0.30)
-        elif max_boost >= 4:
-            return _ret(-0.10)
-        else:
-            return _ret(-0.70)
+            if has_setup_potential_perfect(state.my_active) and my_active_hp > 0.7 and max_boost < 2:
+                return _ret(-0.30)
+            elif max_boost >= 4:
+                return _ret(-0.10)
+            else:
+                return _ret(-0.70)
 
-    elif my_alive_count >= 2 and opp_alive_count == 1:
-        # We have a numbers advantage, but returning a constant here makes
-        # every rollout identical → MCTS can't distinguish moves.
-        # Blend a large baseline with active-matchup signal so simulations
-        # that chip / KO the opponent score higher than setup / utility turns.
-        hp_diff = my_active_hp - opp_active_hp
-        matchup = _tanh01(hp_diff / 0.4)          # 0 = losing 1v1, 1 = dominating
-        opp_chipped = 1.0 - opp_active_hp          # 0 = fresh, 1 = nearly KO'd
-        value = max(0.40, min(1.0, 0.50 + 0.25 * matchup + 0.20 * opp_chipped))
-        return _ret(value)
+        elif my_alive_count >= 2 and opp_alive_count == 1:
+            # We have a numbers advantage, but returning a constant here makes
+            # every rollout identical → MCTS can't distinguish moves.
+            # Blend a large baseline with active-matchup signal so simulations
+            # that chip / KO the opponent score higher than setup / utility turns.
+            hp_diff = my_active_hp - opp_active_hp
+            matchup = _tanh01(hp_diff / 0.4)          # 0 = losing 1v1, 1 = dominating
+            opp_chipped = 1.0 - opp_active_hp          # 0 = fresh, 1 = nearly KO'd
+            value = max(0.40, min(1.0, 0.50 + 0.25 * matchup + 0.20 * opp_chipped))
+            return _ret(value)
 
     with state._patched_status(), state._patched_boosts(), state._patched_fields():
         my_value = team_value(
@@ -1347,6 +1791,12 @@ def evaluate_state(state: Any, _return_terms: bool = False):
         )
 
         opp_unseen = max(0, opp_total - opp_known)
+        # Make unseen count available to downstream feature helpers.
+        # (Several value-model features read state.opp_unseen for hidden-info correction.)
+        try:
+            setattr(state, "opp_unseen", int(opp_unseen))
+        except Exception:
+            pass
         opp_value = opp_value_known + opp_unseen_value(opp_known, opp_total)
         team_term = _tanh01((my_value - opp_value) / 1.2)
 
@@ -1612,6 +2062,26 @@ def evaluate_state(state: Any, _return_terms: bool = False):
             "ahead":                 int(ahead),
             "opp_unseen":            int(opp_unseen),
             "core_norm":             float(core_norm),
+            # New features
+            "my_active_hp":          float(my_active_hp),
+            "opp_active_hp":         float(opp_active_hp),
+            "my_alive_count":        int(my_alive_count),
+            "opp_alive_count":       int(opp_alive_count),
+            "active_matchup":        float(compute_active_matchup(state)),
+            "speed_control":         float(compute_speed_control(state)),
+            "switch_safety":         float(compute_switch_safety(state)),
+            "hidden_speed_risk":     float(compute_hidden_speed_risk(state)),
+            # Clean value-model feature set (v1)
+            "hp_advantage":          float(compute_hp_advantage(state)),
+            "alive_advantage":       float(compute_alive_advantage(state)),
+            "status_burden":         float(compute_status_burden(state)),
+            "hazard_burden":         float(compute_hazard_burden(state)),
+            "boost_advantage":       float(compute_boost_advantage(state)),
+            "wincon_readiness":      float(compute_wincon_readiness(state)),
+            "defensive_cover":       float(compute_defensive_cover(state)),
+            # Belief features (v1)
+            "belief_entropy":        float(compute_belief_entropy(state)),
+            "belief_weighted_threat": float(compute_belief_weighted_threat(state)),
         }
         return _ret(value, terms)
     return max(-1.0, min(1.0, float(value)))

@@ -122,6 +122,89 @@ class OpponentBelief:
                     adjusted.append((c, w))
             self._filter_and_renorm(adjusted)
 
+    def observe_speed_comparison(
+        self,
+        our_speed: int,
+        moved_first: bool,
+        trick_room_active: bool = False,
+    ) -> None:
+        """
+        Update belief based on observed turn order.
+
+        our_speed         : our active Pokemon's effective speed (accounting for
+                            boosts, paralysis, Choice Scarf, etc.)
+        moved_first       : True if the opponent moved *before* us this turn.
+        trick_room_active : if True, slower Pokemon move first (invert comparison).
+
+        Candidates whose computed effective speed contradicts the observed order
+        are down-weighted by a factor of 0.15. A ±2 speed tolerance prevents
+        over-penalising near-ties.
+
+        The caller should only invoke this when confident the speed order was
+        determined by speed, not by priority moves.
+        """
+        # In Trick Room, moving first means the Pokemon is SLOWER.
+        expected_faster = moved_first != trick_room_active
+
+        _PENALTY     = 0.15
+        _TIE_THRESH  = 2   # speeds within 2 treated as a possible tie → no penalty
+
+        adjusted = []
+        for c, w in self.dist:
+            cand_speed = _candidate_effective_speed(c, self.gen)
+            diff = cand_speed - our_speed
+            if abs(diff) <= _TIE_THRESH:
+                adjusted.append((c, w))           # speed-tie possible; no signal
+            elif expected_faster and diff < 0:
+                adjusted.append((c, w * _PENALTY))  # should be faster but isn't
+            elif not expected_faster and diff > 0:
+                adjusted.append((c, w * _PENALTY))  # should be slower but isn't
+            else:
+                adjusted.append((c, w))
+        self._filter_and_renorm(adjusted)
+
+    def observe_damage_taken(
+        self,
+        base_power: int,
+        is_special: bool,
+        attacker_stat: int,
+        damage_fraction: float,
+    ) -> None:
+        """
+        Update belief based on the observed damage fraction dealt to the opponent.
+
+        base_power       : base power of the move used
+        is_special       : True for special moves, False for physical
+        attacker_stat    : our SpA (if special) or Atk (if physical)
+        damage_fraction  : fraction of opponent's max HP that was dealt (0–1)
+
+        Candidates whose expected damage fraction is more than 2× away from the
+        observed value in either direction are down-weighted by 0.20.  This
+        penalises e.g. a frail Wallbreaker candidate when the opponent clearly
+        absorbed a hit that should have been devastating.
+        """
+        if base_power <= 0 or attacker_stat <= 0 or damage_fraction <= 0:
+            return
+
+        _PENALTY   = 0.20
+        _RATIO_HI  = 2.0   # expected / observed > 2 → candidate is much frailer
+        _RATIO_LO  = 0.5   # expected / observed < 0.5 → candidate is much bulkier
+
+        adjusted = []
+        for c, w in self.dist:
+            expected = _candidate_expected_damage_frac(
+                c, self.gen, base_power, is_special, attacker_stat
+            )
+            if expected <= 0:
+                adjusted.append((c, w))
+                continue
+            ratio = expected / max(float(damage_fraction), 0.01)
+            if ratio > _RATIO_HI or ratio < _RATIO_LO:
+                adjusted.append((c, w * _PENALTY))
+            else:
+                adjusted.append((c, w))
+        self._filter_and_renorm(adjusted)
+
     def observe_tera(self, tera_type: Optional[str]) -> None:
         if not tera_type:
             return
@@ -575,6 +658,89 @@ def get_opponent_set_distribution(opp: Any, gen: int) -> List[Tuple[SetCandidate
     Uses build_opponent_belief and returns its distribution.
     """
     return build_opponent_belief(opp, gen).as_distribution()
+
+
+def _candidate_effective_speed(cand: SetCandidate, gen: int) -> float:
+    """
+    Compute the expected effective speed stat for a SetCandidate.
+    Uses the same simplified stat formula as _create_pokemon_proxy.
+    Accounts for Choice Scarf (×1.5) but not in-battle boosts.
+    """
+    try:
+        gd = GenData.from_gen(gen)
+    except Exception:
+        return 80.0
+
+    idx = _species_key_index(gen)
+    species_key = idx.get(cand.species_id, cand.species_id)
+
+    data = _load_randbats_json(gen)
+    level_entry = (data or {}).get(species_key, {})
+    level = int(level_entry.get("level", 50) if isinstance(level_entry, dict) else 50)
+
+    dex_entry = ((gd.pokedex or {}).get(species_key)
+                 or (gd.pokedex or {}).get(cand.species_id)
+                 or {})
+    base_spe = int((dex_entry.get("baseStats") or {}).get("spe", 80))
+    spe_stat = int(2 * base_spe * level / 100 + 5)
+
+    if "choicescarf" in cand.items:
+        spe_stat = int(spe_stat * 1.5)
+
+    return float(spe_stat)
+
+
+def _candidate_expected_damage_frac(
+    cand: SetCandidate,
+    gen: int,
+    base_power: int,
+    is_special: bool,
+    attacker_stat: int,
+) -> float:
+    """
+    Estimate the fraction of HP that a move deals to this candidate.
+    Uses simplified damage formula at attacker level 50 (Gen9 randbats default).
+    Accounts for Assault Vest (×1.5 SpD) on special moves.
+    Returns 0.0 if stats cannot be determined.
+    """
+    try:
+        gd = GenData.from_gen(gen)
+    except Exception:
+        return 0.0
+
+    idx = _species_key_index(gen)
+    species_key = idx.get(cand.species_id, cand.species_id)
+
+    data = _load_randbats_json(gen)
+    level_entry = (data or {}).get(species_key, {})
+    level = int(level_entry.get("level", 50) if isinstance(level_entry, dict) else 50)
+
+    dex_entry = ((gd.pokedex or {}).get(species_key)
+                 or (gd.pokedex or {}).get(cand.species_id)
+                 or {})
+    bs = dex_entry.get("baseStats") or {}
+
+    base_hp = int(bs.get("hp", 90))
+    hp_stat = int(2 * base_hp * level / 100 + level + 10)
+    if hp_stat <= 0:
+        return 0.0
+
+    if is_special:
+        base_def = int(bs.get("spd", 70))
+        def_stat = int(2 * base_def * level / 100 + 5)
+        if "assaultvest" in cand.items:
+            def_stat = int(def_stat * 1.5)
+    else:
+        base_def = int(bs.get("def", 70))
+        def_stat = int(2 * base_def * level / 100 + 5)
+
+    if def_stat <= 0 or attacker_stat <= 0 or base_power <= 0:
+        return 0.0
+
+    # Standard simplified damage formula (level-50 attacker)
+    level_factor = 50 * 2 / 5 + 2  # = 22
+    damage = (level_factor * base_power * attacker_stat) / (def_stat * 50) + 2
+    return float(damage) / float(hp_stat)
 
 
 def physical_prob(dist: List[Tuple[SetCandidate, float]]) -> float:

@@ -9,6 +9,9 @@ from bot.scoring.helpers import hp_frac
 from bot.model.opponent_model import build_opponent_belief, build_move_pool
 from bot.mcts.search import mcts_pick_action
 from bot.scoring.damage_score import estimate_damage_fraction
+from bot.learning.collect import DataCollector
+from bot.learning.policy_model import PolicyModel
+from bot.learning.value_model import ValueModel
 
 
 class AdvancedHeuristicPlayer(Player):
@@ -25,8 +28,36 @@ class AdvancedHeuristicPlayer(Player):
         self.mcts_threshold = 150  # Don't use MCTS for obvious KOs
         self.verbose = True
 
-    def choose_move(self, battle: Battle):
+        # Data collection for offline learning
+        self._collector = DataCollector("data/turns.jsonl")
+
+        # Learned policy model (optional — loaded if weights file exists)
+        import os
+        policy_path = "data/policy_weights.npz"
+        self._policy = PolicyModel.load(policy_path) if os.path.exists(policy_path) else None
+        if self._policy is not None and self.verbose:
+            print(f"  [policy] Loaded learned priors from {policy_path}")
+
+        # Learned value model (optional — loaded if weights file exists)
+        value_path = "data/value_weights.npz"
+        self._value = ValueModel.load(value_path) if os.path.exists(value_path) else None
+        if self._value is not None and self.verbose:
+            print(f"  [value]  Loaded learned value fn from {value_path}")
+
+        # Mixing weight for learned prior; overridable via selfplay.py --policy-alpha
+        self.policy_alpha: float = 0.3
+
+    MAX_BATTLE_TURNS = 80
+
+    async def choose_move(self, battle: Battle):
         self.turn_count += 1
+
+        if battle.turn > self.MAX_BATTLE_TURNS:
+            if self.verbose:
+                print(f"  [selfplay] Turn {battle.turn} exceeds MAX_BATTLE_TURNS={self.MAX_BATTLE_TURNS} — forfeiting")
+            await self.ps_client.send_message("/forfeit", battle.battle_tag)
+            return self.choose_random_move(battle)
+
         ctx = EvalContext.from_battle(battle)
 
         actions = [("move", mv) for mv in battle.available_moves] + \
@@ -51,6 +82,9 @@ class AdvancedHeuristicPlayer(Player):
                 belief = build_opponent_belief(p, gen)
                 opp_beliefs[id(p)] = belief
                 opp_move_pools[id(p)] = build_move_pool(belief, gen)
+
+        # Update beliefs from last turn's outcome
+        self._apply_belief_observations(battle, opp_beliefs)
 
         ctx_opp = EvalContext(
             battle=battle,
@@ -79,7 +113,7 @@ class AdvancedHeuristicPlayer(Player):
                 return self.create_order(best_move)
 
         # Adaptive iterations
-        base_iters = 120
+        base_iters = 300
         if self.turn_count <= 3:
             iters = base_iters // 2
         elif self.is_endgame(battle):
@@ -95,7 +129,6 @@ class AdvancedHeuristicPlayer(Player):
         picked = None
         stats = None
         try:
-
             picked, stats = mcts_pick_action(
                 battle=battle,
                 ctx=ctx,
@@ -108,6 +141,9 @@ class AdvancedHeuristicPlayer(Player):
                 include_switches=include_switches,
                 opp_beliefs=opp_beliefs,
                 opp_move_pools=opp_move_pools,
+                policy_model=self._policy,
+                policy_alpha=self.policy_alpha,
+                value_model=self._value,
             )
 
             if picked:
@@ -134,23 +170,187 @@ class AdvancedHeuristicPlayer(Player):
             chosen_name = getattr(obj, "id", None) or getattr(obj, "species", str(obj))
             print(f"  >> MCTS chose: {kind.upper()} {chosen_name}\n")
 
+        # Record decision for offline learning
+        try:
+            eval_terms = stats.get("eval_terms", {}) if stats else {}
+            eval_value = float(stats.get("eval_value", 0.0)) if stats else 0.0
+            self._collector.record_turn(
+                battle_id=battle.battle_tag,
+                turn=battle.turn,
+                eval_terms=eval_terms,
+                eval_value=eval_value,
+                mcts_stats=stats,
+                opp_beliefs=opp_beliefs,
+                opp_active=battle.opponent_active_pokemon,
+                ctx_me=ctx,
+                battle=battle,
+                picked=picked,
+                shadow_state=stats.get("root_state") if stats else None,
+            )
+        except Exception as _rec_err:
+            if self.verbose:
+                print(f"  [collect] record_turn failed: {_rec_err}")
+
         self._store_prev_state(battle, picked[0], picked[1])
         return self.create_order(picked[1])
 
 
     def _store_prev_state(self, battle, kind, obj):
-        """Store end-of-turn state so next turn can log the outcome."""
+        """Store end-of-turn state so next turn can log the outcome and update beliefs."""
         me = battle.active_pokemon
         opp = battle.opponent_active_pokemon
         name = getattr(obj, "id", None) or getattr(obj, "species", str(obj))
+
+        # Capture move info for observe_damage_taken next turn
+        move_bp, move_is_special, atk_stat = None, None, None
+        if kind == "move":
+            try:
+                move_bp = int(getattr(obj, "base_power", 0) or 0)
+                cat = getattr(getattr(obj, "type", None), "name", None)
+                # category: PHYSICAL/SPECIAL/STATUS
+                cat_str = str(getattr(obj, "category", "")).upper()
+                move_is_special = (cat_str == "SPECIAL")
+                if me and move_bp > 0:
+                    bs = getattr(me, "stats", {}) or {}
+                    atk_stat = int(bs.get("spa" if move_is_special else "atk", 100))
+                    # Apply stat boosts
+                    boosts = getattr(me, "boosts", {}) or {}
+                    stage = int(boosts.get("spa" if move_is_special else "atk", 0))
+                    if stage >= 0:
+                        atk_stat = int(atk_stat * (2 + stage) / 2)
+                    else:
+                        atk_stat = int(atk_stat * 2 / (2 - stage))
+            except Exception:
+                move_bp, move_is_special, atk_stat = None, None, None
+
         self._prev_state = {
             "turn": self.turn_count,
             "action_str": f"{kind.upper()} {name}",
+            "kind": kind,
             "my_species": getattr(me, "species", "?") if me else "?",
             "my_hp": hp_frac(me) if me else 1.0,
             "opp_species": getattr(opp, "species", "?") if opp else "?",
             "opp_hp": hp_frac(opp) if opp else 1.0,
+            "opp_id": id(opp) if opp else None,
+            # Move info for observe_damage_taken
+            "move_bp": move_bp,
+            "move_is_special": move_is_special,
+            "atk_stat": atk_stat,
         }
+
+    def _apply_belief_observations(self, battle, opp_beliefs: dict) -> None:
+        """
+        After each turn, update the active opponent's belief based on:
+
+        1. observe_damage_taken — if we used a damaging move last turn and the same
+           opponent is still active, the HP delta gives us a damage fraction signal.
+
+        2. observe_speed_comparison — if we can determine who moved first from the
+           previous turn's event log, penalise candidates whose speed contradicts it.
+
+        Both calls are best-effort and silently skip on any exception.
+        """
+        prev = self._prev_state
+        if prev is None:
+            return
+
+        opp = battle.opponent_active_pokemon
+        if opp is None:
+            return
+
+        # Only update the belief for the same Pokemon that was active last turn
+        if getattr(opp, "species", None) != prev.get("opp_species"):
+            return
+
+        belief = opp_beliefs.get(id(opp))
+        if belief is None:
+            return
+
+        # 1. observe_damage_taken
+        if (prev.get("kind") == "move"
+                and prev.get("move_bp") and prev["move_bp"] > 0
+                and prev.get("atk_stat") and prev["atk_stat"] > 0
+                and prev.get("move_is_special") is not None):
+            opp_hp_now = hp_frac(opp)
+            opp_hp_then = float(prev.get("opp_hp", 1.0))
+            damage_frac = opp_hp_then - opp_hp_now
+            # Only call when damage is plausibly from our attack (>1% and <100%)
+            if 0.01 < damage_frac < 1.0:
+                try:
+                    belief.observe_damage_taken(
+                        base_power=int(prev["move_bp"]),
+                        is_special=bool(prev["move_is_special"]),
+                        attacker_stat=int(prev["atk_stat"]),
+                        damage_fraction=float(damage_frac),
+                    )
+                except Exception:
+                    pass
+
+        # 2. observe_speed_comparison
+        moved_first = self._who_moved_first(battle)
+        if moved_first != 0:
+            try:
+                me = battle.active_pokemon
+                my_spe = 0
+                if me is not None:
+                    bs = getattr(me, "stats", {}) or {}
+                    my_spe = int(bs.get("spe", 80))
+                    # Apply speed boosts
+                    boosts = getattr(me, "boosts", {}) or {}
+                    stage = int(boosts.get("spe", 0))
+                    if stage >= 0:
+                        my_spe = int(my_spe * (2 + stage) / 2)
+                    else:
+                        my_spe = int(my_spe * 2 / (2 - stage))
+                    # Paralysis halves speed
+                    from poke_env.battle import Status
+                    if getattr(me, "status", None) == Status.PAR:
+                        my_spe = my_spe // 2
+                    # Choice Scarf
+                    item = str(getattr(me, "item", "") or "").lower().replace(" ", "").replace("-", "")
+                    if item == "choicescarf":
+                        my_spe = int(my_spe * 1.5)
+
+                if my_spe > 0:
+                    from poke_env.battle import Field
+                    trick_room = Field.TRICK_ROOM in (getattr(battle, "fields", {}) or {})
+                    belief.observe_speed_comparison(
+                        our_speed=my_spe,
+                        moved_first=(moved_first == 1),
+                        trick_room_active=trick_room,
+                    )
+            except Exception:
+                pass
+
+    @staticmethod
+    def _who_moved_first(battle) -> int:
+        """
+        Parse the previous turn's event log to determine who moved first.
+
+        Returns:
+          +1  if we moved first (our |move| appeared before the opponent's)
+          -1  if the opponent moved first
+           0  if undetermined (switch, no events, force-switch, etc.)
+        """
+        prev_turn = battle.turn - 1
+        if prev_turn < 1:
+            return 0
+        obs = battle.observations.get(prev_turn)
+        if obs is None:
+            return 0
+
+        my_role = getattr(battle, "_player_role", None)  # "p1" or "p2"
+        if my_role is None:
+            return 0
+
+        for event in obs.events:
+            if len(event) >= 3 and event[1] == "move":
+                actor = event[2]  # e.g. "p1a: Gardevoir"
+                if actor.startswith(my_role):
+                    return +1
+                else:
+                    return -1
+        return 0  # no |move| events this turn (both switched, or force-switch)
 
     @staticmethod
     def _status_str(pkmn):
@@ -458,8 +658,7 @@ class AdvancedHeuristicPlayer(Player):
         total_visits = 1
         if stats:
             for row in stats.get("top", []):
-                name = row["name"].replace(" [expected]", "")
-                mcts[(row["kind"], name)] = row
+                mcts[(row["kind"], row["name"])] = row
             v = sum(r["visits"] for r in stats["top"])
             if v > 0:
                 total_visits = v
@@ -569,7 +768,7 @@ class AdvancedHeuristicPlayer(Player):
         self._store_prev_state(battle, kind, obj)
         return self.create_order(obj)
 
-    def battle_finished(self, battle: Battle):
+    def _battle_finished_callback(self, battle: Battle):
         """Called by poke_env when a battle ends."""
         total = len(self.mcts_decisions) + len(self.heuristic_decisions)
         mcts_pct = len(self.mcts_decisions) / total * 100 if total > 0 else 0
@@ -580,3 +779,10 @@ class AdvancedHeuristicPlayer(Player):
         print(f"  Heuristic       : {len(self.heuristic_decisions)}")
         print(f"  MCTS failures   : {self.mcts_failures}")
         print(f"{'='*72}\n")
+
+        # Stamp win/loss onto all buffered records for this battle and flush to disk
+        try:
+            self._collector.finish_battle(battle.battle_tag, won=battle.won)
+            print(f"  [collect] wrote {battle.battle_tag} → {self._collector._path}")
+        except Exception as _flush_err:
+            print(f"  [collect] finish_battle failed: {_flush_err}")
